@@ -1,0 +1,41 @@
+{
+  "name": "tokenstatus",
+  "version": "0.1.0",
+  "description": "TokenStatus — tray-based token usage monitor for Claude Code, Codex, and Gemini CLIs",
+  "type": "module",
+  "main": "out/main/index.js",
+  "author": "",
+  "license": "MIT",
+  "scripts": {
+    "dev": "electron-vite dev",
+    "build": "electron-vite build",
+    "start": "electron-vite preview",
+    "test:parsers": "node scripts/test-parsers.mjs",
+    "test:db": "node scripts/test-db.mjs",
+    "package": "electron-vite build && electron-builder --win"
+  },
+  "dependencies": {
+    "chokidar": "^4.0.3",
+    "sql.js": "^1.14.1"
+  },
+  "devDependencies": {
+    "@vitejs/plugin-react": "^4.3.4",
+    "electron": "^33.3.1",
+    "electron-builder": "^25.1.8",
+    "electron-vite": "^2.3.0",
+    "react": "^18.3.1",
+    "react-dom": "^18.3.1",
+    "vite": "^5.4.11"
+  },
+  "build": {
+    "appId": "com.tokenstatus.app",
+    "productName": "TokenStatus",
+    "files": [
+      "out/**/*",
+      "resources/**/*"
+    ],
+    "win": {
+      "target": "nsis"
+    }
+  }
+}

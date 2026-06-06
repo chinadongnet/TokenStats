@@ -1,0 +1,24 @@
+# Dependencies / build output
+node_modules/
+out/
+dist/
+
+# Logs & crash dumps
+*.log
+*.stackdump
+.DS_Store
+
+# Local CLI session data captured into the project.
+# NEVER commit: these are REAL transcripts and may contain secrets / private info.
+AISessions/
+**/.claude/
+**/.codex/
+**/.gemini/
+
+# Local databases / generated artifacts
+*.sqlite
+*.sqlite-journal
+report-preview.png
+
+# User config (lives in ~/.tokenstatus, but guard against copies landing here)
+config.json
