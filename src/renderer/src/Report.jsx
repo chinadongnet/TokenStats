@@ -4,8 +4,9 @@ const CLI = {
   claude: { label: 'Claude Code', color: '#d97757' },
   codex: { label: 'Codex', color: '#10a37f' },
   gemini: { label: 'Gemini', color: '#4285f4' },
+  agy: { label: 'Antigravity', color: '#a142f4' },
 }
-const ORDER = ['claude', 'codex', 'gemini']
+const ORDER = ['claude', 'codex', 'gemini', 'agy']
 
 const DAY = 86400000
 const floorDay = (ms) => { const d = new Date(ms); d.setHours(0, 0, 0, 0); return d.getTime() }
@@ -21,6 +22,7 @@ const dayLabel = (ms) => new Date(ms).toLocaleDateString(undefined, { month: 'sh
 
 export default function Report() {
   const [range, setRange] = useState('30d') // 7d | 30d | all
+  const [brands, setBrands] = useState(() => new Set(ORDER)) // active CLIs
   const [day, setDay] = useState(floorDay(Date.now()))
   const [span, setSpan] = useState({ min: null, max: null })
   const [hourly, setHourly] = useState([])
@@ -52,21 +54,33 @@ export default function Report() {
   useEffect(() => { load() }, [day, fromMs, toMs])
   useEffect(() => window.api.onReportUpdated(() => load()), [day, fromMs, toMs])
 
-  // ---- shape data for charts ----
+  function toggleBrand(c) {
+    setBrands((prev) => {
+      const next = new Set(prev)
+      if (next.has(c)) next.delete(c)
+      else next.add(c)
+      // never allow an empty selection — reset to all instead of a blank report
+      return next.size ? next : new Set(ORDER)
+    })
+  }
+
+  // ---- shape data for charts (filtered by active brands) ----
   const hourData = useMemo(() => {
-    const arr = Array.from({ length: 24 }, (_, h) => ({ label: h, segs: { claude: 0, codex: 0, gemini: 0 }, total: 0 }))
+    const arr = Array.from({ length: 24 }, (_, h) => ({ label: h, segs: { claude: 0, codex: 0, gemini: 0, agy: 0 }, total: 0 }))
     for (const r of hourly) {
+      if (!brands.has(r.cli)) continue
       const h = new Date(r.hour).getHours()
       arr[h].segs[r.cli] = (arr[h].segs[r.cli] || 0) + r.total
       arr[h].total += r.total
     }
     return arr
-  }, [hourly])
+  }, [hourly, brands])
 
   const dayData = useMemo(() => {
     const map = new Map()
-    for (let t = fromMs; t < toMs; t += DAY) map.set(floorDay(t), { label: floorDay(t), segs: { claude: 0, codex: 0, gemini: 0 }, total: 0 })
+    for (let t = fromMs; t < toMs; t += DAY) map.set(floorDay(t), { label: floorDay(t), segs: { claude: 0, codex: 0, gemini: 0, agy: 0 }, total: 0 })
     for (const r of daily) {
+      if (!brands.has(r.cli)) continue
       const k = floorDay(r.day)
       const b = map.get(k)
       if (!b) continue
@@ -74,16 +88,18 @@ export default function Report() {
       b.total += r.total
     }
     return [...map.values()].sort((a, b) => a.label - b.label)
-  }, [daily, fromMs, toMs])
+  }, [daily, fromMs, toMs, brands])
+
+  const shownModels = useMemo(() => models.filter((m) => brands.has(m.cli)), [models, brands])
 
   const summary = useMemo(() => {
     let total = 0, cost = 0, turns = 0
-    for (const m of models) { total += m.total; cost += m.cost; turns += m.turns }
+    for (const m of shownModels) { total += m.total; cost += m.cost; turns += m.turns }
     const activeDays = dayData.filter((d) => d.total > 0).length
     return { total, cost, turns, activeDays }
-  }, [models, dayData])
+  }, [shownModels, dayData])
 
-  const maxModel = Math.max(1, ...models.map((m) => m.total))
+  const maxModel = Math.max(1, ...shownModels.map((m) => m.total))
 
   async function doExport() {
     setExporting(true)
@@ -115,7 +131,7 @@ export default function Report() {
         <Tile label="Active days" value={String(summary.activeDays)} sub="with usage" />
       </div>
 
-      <Legend />
+      <Legend brands={brands} onToggle={toggleBrand} />
 
       <section className="card">
         <div className="card-head">
@@ -141,8 +157,8 @@ export default function Report() {
       <section className="card">
         <div className="card-head"><h3>By model</h3></div>
         <div className="models">
-          {models.length === 0 && <div className="empty">No usage in this range.</div>}
-          {models.slice(0, 12).map((m) => (
+          {shownModels.length === 0 && <div className="empty">No usage in this range.</div>}
+          {shownModels.slice(0, 12).map((m) => (
             <div className="mrow" key={m.cli + m.model}>
               <span className="dot" style={{ background: CLI[m.cli]?.color }} />
               <span className="mname" title={m.model}>{m.model}</span>
@@ -155,7 +171,7 @@ export default function Report() {
       </section>
 
       <footer className="rep-foot">
-        SQLite · {span.min ? 'data since ' + new Date(span.min).toLocaleDateString() : 'no data yet'} · ~/.tokenstatus/usage.sqlite
+        TokenStatus v{__APP_VERSION__} · built {__BUILD_TIME__} · SQLite {span.min ? 'since ' + new Date(span.min).toLocaleDateString() : '(empty)'} · ~/.tokenstatus/usage.sqlite
       </footer>
     </div>
   )
@@ -171,12 +187,23 @@ function Tile({ label, value, sub, accent }) {
   )
 }
 
-function Legend() {
+function Legend({ brands, onToggle }) {
   return (
     <div className="legend">
-      {ORDER.map((c) => (
-        <span key={c} className="leg"><span className="dot" style={{ background: CLI[c].color }} />{CLI[c].label}</span>
-      ))}
+      {ORDER.map((c) => {
+        const on = brands.has(c)
+        return (
+          <button
+            key={c}
+            type="button"
+            className={'leg' + (on ? '' : ' off')}
+            onClick={() => onToggle(c)}
+            title={on ? 'Click to hide ' + CLI[c].label : 'Click to show ' + CLI[c].label}
+          >
+            <span className="dot" style={{ background: CLI[c].color }} />{CLI[c].label}
+          </button>
+        )
+      })}
     </div>
   )
 }
