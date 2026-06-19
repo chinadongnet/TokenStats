@@ -112,8 +112,13 @@ footer {
 .tile-value { font-size: 26px; font-weight: 700; margin: 4px 0 2px; letter-spacing: -.5px; }
 .tile-sub { color: var(--muted); font-size: 11px; }
 
-.legend { display: flex; gap: 16px; margin: 2px 2px 12px; }
-.leg { display: flex; align-items: center; gap: 6px; color: var(--muted); font-size: 12px; }
+.legend { display: flex; gap: 8px; margin: 2px 2px 12px; }
+.leg { display: flex; align-items: center; gap: 6px; color: var(--muted); font-size: 12px;
+  background: transparent; border: 1px solid var(--line); border-radius: 999px;
+  padding: 4px 10px; cursor: pointer; user-select: none; transition: opacity .12s, border-color .12s; }
+.leg:hover { border-color: var(--muted); }
+.leg.off { opacity: .4; }
+.leg.off .dot { background: var(--muted) !important; }
 
 .card { background: var(--panel); border: 1px solid var(--line); border-radius: 12px; padding: 14px 16px; margin-bottom: 14px; }
 .card-head { display: flex; align-items: center; justify-content: space-between; margin-bottom: 8px; }
