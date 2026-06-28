@@ -22,3 +22,6 @@ report-preview.png
 
 # User config (lives in ~/.tokenstatus, but guard against copies landing here)
 config.json
+
+# Stray local resume helper (personal session pointer)
+resume.txt

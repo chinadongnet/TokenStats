@@ -18,6 +18,8 @@ contextBridge.exposeInMainWorld('api', {
   reportHourly: (dayStartMs) => ipcRenderer.invoke('report:hourly', dayStartMs),
   reportDaily: (fromMs, toMs) => ipcRenderer.invoke('report:daily', fromMs, toMs),
   reportModels: (fromMs, toMs) => ipcRenderer.invoke('report:models', fromMs, toMs),
+  reportRequests: (opts) => ipcRenderer.invoke('report:requests', opts),
+  reportProjects: (fromMs, toMs) => ipcRenderer.invoke('report:projects', fromMs, toMs),
   reportSpan: () => ipcRenderer.invoke('report:span'),
   exportPng: () => ipcRenderer.invoke('export-png'),
   onReportUpdated: (cb) => {

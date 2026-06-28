@@ -1,7 +1,7 @@
 {
-  "name": "tokenstatus",
+  "name": "tokenstats",
   "version": "0.1.0",
-  "description": "TokenStatus — tray-based token usage monitor for Claude Code, Codex, and Gemini CLIs",
+  "description": "TokenStats — tray-based token usage monitor for Claude Code, Codex, and Gemini CLIs",
   "type": "module",
   "main": "out/main/index.js",
   "author": "",
@@ -12,7 +12,9 @@
     "start": "electron-vite preview",
     "test:parsers": "node scripts/test-parsers.mjs",
     "test:db": "node scripts/test-db.mjs",
-    "package": "electron-vite build && electron-builder --win"
+    "package": "electron-vite build && electron-builder --dir",
+    "package:nsis": "electron-vite build && electron-builder --win",
+    "release": "powershell -ExecutionPolicy Bypass -File scripts/release.ps1"
   },
   "dependencies": {
     "chokidar": "^4.0.3",
@@ -28,14 +30,23 @@
     "vite": "^5.4.11"
   },
   "build": {
-    "appId": "com.tokenstatus.app",
-    "productName": "TokenStatus",
+    "appId": "com.tokenstats.app",
+    "productName": "TokenStats",
     "files": [
       "out/**/*",
       "resources/**/*"
     ],
+    "asarUnpack": [
+      "node_modules/sql.js/dist/*.wasm"
+    ],
     "win": {
       "target": "nsis"
+    },
+    "nsis": {
+      "oneClick": true,
+      "perMachine": false,
+      "allowToChangeInstallationDirectory": false,
+      "runAfterFinish": true
     }
   }
 }

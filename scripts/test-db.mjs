@@ -11,7 +11,7 @@ fs.rmSync(dbPath, { force: true })
 
 const store = new Store()
 await store.scanAll()
-const records = store.allRecords()
+const records = store.dedupedRecords()
 
 const db = new UsageDb({ dbPath })
 await db.open()

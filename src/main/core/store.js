@@ -5,10 +5,11 @@ import { EventEmitter } from 'node:events'
 import { claude } from './parsers/claude.js'
 import { codex } from './parsers/codex.js'
 import { geminiJsonl, geminiJson } from './parsers/gemini.js'
+import { antigravity } from './parsers/antigravity.js'
 import { costFor } from './pricing.js'
 import { CLIS } from './paths.js'
 
-const PARSERS = [claude, codex, geminiJsonl, geminiJson]
+const PARSERS = [claude, codex, geminiJsonl, geminiJson, antigravity]
 
 // In-memory index of every parsed file:
 //   path -> { parser, size, mtimeMs, state, records[] }
@@ -49,6 +50,10 @@ export class Store extends EventEmitter {
     if (parser.kind === 'json') {
       const text = await fsp.readFile(file, 'utf8')
       entry.records = parser.parseFile(text, file)
+    } else if (parser.kind === 'binary') {
+      // whole-file binary formats (Antigravity SQLite): re-parse on change
+      const buf = await fsp.readFile(file)
+      entry.records = await parser.parseFile(buf, file)
     } else {
       // jsonl: if the file shrank/rotated, restart from scratch
       let start = entry.size
@@ -82,16 +87,79 @@ export class Store extends EventEmitter {
     }
   }
 
-  // All normalized records across every file, newest last.
+  // All normalized records across every file, newest last. Includes the
+  // on-disk duplicates (Claude content-block lines, Gemini re-appends); use
+  // dedupedRecords() for anything that aggregates token counts.
   allRecords() {
     const out = []
     for (const entry of this.files.values()) out.push(...entry.records)
     return out
   }
 
+  // Records with the per-message duplicates collapsed. Records that carry a
+  // `dedupKey` are counted once per key (first occurrence wins; the duplicates
+  // are byte-identical so the choice is immaterial); records without a key
+  // (Codex, Antigravity) always pass through.
+  dedupedRecords() {
+    return dedupe(this.allRecords())
+  }
+
+  // Per-request rows for the report's request log. One deduped record per
+  // request (exactly what feeds the totals), optionally filtered to a single
+  // local day and/or CLI, newest first. Returns { rows, count } where `count`
+  // is the unclamped total so the UI can show "showing N of M".
+  requestLog({ dayStartMs = null, cli = null, limit = 2000 } = {}) {
+    const dayEnd = dayStartMs != null ? dayStartMs + 24 * 3600 * 1000 : null
+    const out = []
+    for (const r of this.dedupedRecords()) {
+      if (cli && r.cli !== cli) continue
+      if (dayStartMs != null && (r.ts < dayStartMs || r.ts >= dayEnd)) continue
+      out.push({
+        ts: r.ts,
+        cli: r.cli,
+        model: r.model,
+        sessionId: r.sessionId,
+        project: r.project,
+        input: r.input,
+        output: r.output,
+        cacheRead: r.cacheRead,
+        cacheCreate: r.cacheCreate,
+        reasoning: r.reasoning,
+        total: r.total,
+        cost: costFor(r),
+      })
+    }
+    out.sort((a, b) => b.ts - a.ts)
+    return { rows: out.slice(0, limit), count: out.length }
+  }
+
+  // Per-project (directory) token totals over an optional time range / CLI.
+  // Served live from the deduped records (the DB only buckets by cli/model, so
+  // it can't answer this). One row per (cli, project), biggest first.
+  projectStats({ fromMs = null, toMs = null, cli = null } = {}) {
+    const map = new Map() // key: cli|project
+    for (const r of this.dedupedRecords()) {
+      if (cli && r.cli !== cli) continue
+      if (fromMs != null && r.ts < fromMs) continue
+      if (toMs != null && r.ts >= toMs) continue
+      const project = r.project || '(unknown)'
+      const key = r.cli + '|' + project
+      let p = map.get(key)
+      if (!p) {
+        p = { cli: r.cli, project, total: 0, cost: 0, turns: 0, lastTs: 0 }
+        map.set(key, p)
+      }
+      p.total += r.total
+      p.cost += costFor(r)
+      p.turns += 1
+      if (r.ts > p.lastTs) p.lastTs = r.ts
+    }
+    return [...map.values()].sort((a, b) => b.total - a.total)
+  }
+
   // Build the snapshot consumed by the UI.
   snapshot() {
-    const records = this.allRecords()
+    const records = this.dedupedRecords()
     const now = new Date()
     const todayKey = dayKey(now.getTime())
 
@@ -111,7 +179,7 @@ export class Store extends EventEmitter {
       if (!perModel.has(r.model)) perModel.set(r.model, { model: r.model, cli: r.cli, ...blank() })
       add(perModel.get(r.model), r, cost)
 
-      if (!perDay.has(dk)) perDay.set(dk, { day: dk, claude: 0, codex: 0, gemini: 0, total: 0 })
+      if (!perDay.has(dk)) perDay.set(dk, { day: dk, total: 0, ...Object.fromEntries(CLIS.map((c) => [c, 0])) })
       const d = perDay.get(dk)
       d[r.cli] += r.total
       d.total += r.total
@@ -179,6 +247,23 @@ export class Store extends EventEmitter {
     for (const w of this.watchers) await w.close()
     this.watchers = []
   }
+}
+
+// Collapse records that share a `dedupKey` to a single occurrence. Parsers set
+// the key on formats that write the same usage row to disk more than once
+// (Claude per-content-block lines + resume copies, Gemini re-appended logs).
+// Keyless records (Codex deltas, Antigravity turns) are always kept.
+function dedupe(records) {
+  const seen = new Set()
+  const out = []
+  for (const r of records) {
+    if (r.dedupKey) {
+      if (seen.has(r.dedupKey)) continue
+      seen.add(r.dedupKey)
+    }
+    out.push(r)
+  }
+  return out
 }
 
 function add(acc, r, cost) {
