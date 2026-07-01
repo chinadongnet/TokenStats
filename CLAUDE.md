@@ -4,8 +4,8 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## What this is
 
-TokenStatus is a Windows system-tray app that tracks token usage across three local
-AI coding CLIs — **Claude Code**, **Codex**, and **Gemini** — by parsing the
+TokenStatus is a Windows system-tray app that tracks token usage across four local
+AI coding CLIs — **Claude Code**, **Codex**, **Gemini**, and **Antigravity** (`agy`) — by parsing the
 transcript/log files each CLI writes to disk. It watches those files live and shows
 per-CLI / per-model / per-day token counts and rough cost estimates in a tray popup.
 
@@ -39,10 +39,12 @@ testable via `npm run test:parsers`.
 
 ### Parsing engine — `src/main/core/`
 
-- **`parsers/{claude,codex,gemini}.js`** — one module per CLI. Each declares its
-  `roots` array (from `CLI_ROOTS`), a `kind` (`'jsonl'` append-only, or `'json'`
-  whole-file), a `match(file)` predicate, and either `parseLine(line, state, file)`
-  (jsonl) or `parseFile(text, file)` (json). Each returns *normalized records* (below).
+- **`parsers/{claude,codex,gemini,antigravity}.js`** — one module per CLI. Each
+  declares its `roots` array (from `CLI_ROOTS`), a `kind` (`'jsonl'` append-only,
+  `'json'` whole-file text, or `'binary'` whole-file buffer), a `match(file)`
+  predicate, and either `parseLine(line, state, file)` (jsonl) or
+  `parseFile(textOrBuffer, file)` (json/binary, may be async). Each returns
+  *normalized records* (below).
   Gemini ships two parser objects (`geminiJsonl` + `geminiJson`) sharing one root.
 - **`store.js`** — the engine core. Walks each root, reads files, and holds an
   in-memory index `Map<path, {parser, size, mtimeMs, state, records[]}>`.
@@ -52,6 +54,12 @@ testable via `npm run test:parsers`.
   - Gemini ships **two** chat formats: current `chats/session-*.jsonl` (append-only,
     tailed like the others) and older `chats/session-*.json` (whole-file, re-parsed on
     change). Both are registered as separate parsers sharing the Gemini root.
+  - Antigravity (`agy`, Google's newer agentic CLI) logs conversations as **SQLite
+    databases** at `~/.gemini/antigravity-cli/conversations/<uuid>.db`. The parser
+    opens each db with sql.js and decodes per-turn token usage from protobuf blobs
+    in the `gen_metadata` table (field map documented in `parsers/antigravity.js` —
+    reverse-engineered, so re-validate after Antigravity updates). Whole-file
+    re-parse on change.
   - `snapshot()` aggregates all records into per-CLI / per-model / per-day buckets,
     today-vs-all-time, recent sessions, and the current "live" model. This is the only
     object the UI consumes.
@@ -85,11 +93,14 @@ Every parser emits records of this exact shape so aggregation is CLI-agnostic:
 
 `total` is the headline token count and is computed per-CLI to be comparable:
 - Claude: `input + output + cache_creation + cache_read`
-- Codex: the event's `total_tokens` (already includes cached input + reasoning)
+- Codex: the per-turn **delta** of the cumulative `total_token_usage.total_tokens`
+  (already includes cached input + reasoning)
 - Gemini: the message's `tokens.total`
 
 `input` is stored as the *non-cached* portion for Codex/Gemini so the components don't
 double-count `cacheRead`.
+
+Records may also carry an optional **`dedupKey`** — see de-duplication below.
 
 ### Electron shell — `src/main/`
 
@@ -132,9 +143,24 @@ No router, no state library.
   `ORDER`, and a pricing row. Nothing else needs to change.
 - **Data formats are version-specific**: these parsers were written against observed
   on-disk shapes (Claude `message.usage`, Codex `event_msg`/`token_count`
-  `last_token_usage`, Gemini `gemini`-type messages' `tokens`). A CLI update can change
+  `total_token_usage`, Gemini `gemini`-type messages' `tokens`). A CLI update can change
   them — e.g. Gemini switched chat logs from `.json` to `.jsonl`, which is why both are
   parsed. Validate with `npm run test:parsers` against real data after any CLI update.
-- Codex token math uses `last_token_usage` (per-turn delta), **not**
-  `total_token_usage` (cumulative), to avoid double-counting across the session's events.
+- **De-duplication (accuracy-critical)**: two CLIs write the *same* usage row to disk
+  multiple times, which would massively inflate totals if counted naively:
+  - **Claude** emits one JSONL line per assistant *content block* (thinking / text /
+    each tool_use), all sharing one `message.usage`; the same `(message.id, requestId)`
+    also reappears across files on session resume. Measured inflation ≈ **1.8×**.
+  - **Gemini** re-writes the running conversation on each save, re-appending earlier
+    messages (identical `id` + `tokens`) to the `.jsonl`. Measured inflation ≈ **1.8×**.
+  Both parsers therefore set a **`dedupKey`** on each record; `store.dedupedRecords()`
+  (used by `snapshot()` and the DB ingest) keeps one record per key. Keyless records
+  (Codex, Antigravity) always pass through. `allRecords()` stays raw — never aggregate
+  token counts off it directly.
+- **Codex token math** uses the per-turn **delta of the cumulative
+  `total_token_usage`**, *not* the sum of `last_token_usage`. `total_token_usage` is
+  monotonic and authoritative; summing `last_token_usage` over-counts in practice
+  (a measured 31-turn session summed to 347k vs a true cumulative of 183k). `state.cum`
+  carries the previous cumulative per file; a counter reset (compaction) is treated as a
+  fresh zero baseline.
 - "Today" uses the **local** calendar day so it matches the user's wall clock.

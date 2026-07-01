@@ -4,8 +4,9 @@ const CLI = {
   claude: { label: 'Claude Code', color: '#d97757' },
   codex: { label: 'Codex', color: '#10a37f' },
   gemini: { label: 'Gemini', color: '#4285f4' },
+  agy: { label: 'Antigravity', color: '#a142f4' },
 }
-const ORDER = ['claude', 'codex', 'gemini']
+const ORDER = ['claude', 'codex', 'gemini', 'agy']
 
 const compact = (n) => {
   if (!n) return '0'
@@ -118,6 +119,7 @@ export default function App() {
         ) : (
           <span className="muted">No activity yet</span>
         )}
+        <span className="muted small build" title={`built ${__BUILD_TIME__}`}>v{__APP_VERSION__}</span>
         <button className="ghost" onClick={() => window.api.quit()} title="Quit">⏻</button>
       </footer>
     </div>

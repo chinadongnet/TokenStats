@@ -64,11 +64,18 @@ async function init() {
   ipcMain.handle('report:daily', (_e, fromMs, toMs) => db?.daily(fromMs, toMs) ?? [])
   ipcMain.handle('report:models', (_e, fromMs, toMs) => db?.models(fromMs, toMs) ?? [])
   ipcMain.handle('report:span', () => db?.span() ?? { min: null, max: null })
+  // Per-request log is served live from the store (not the hourly DB) so it
+  // reflects the exact deduplicated records that drive the totals.
+  ipcMain.handle('report:requests', (_e, opts) => store?.requestLog(opts) ?? { rows: [], count: 0 })
+  // Per-project totals are also served live from the store (the hourly DB has
+  // no project dimension).
+  ipcMain.handle('report:projects', (_e, fromMs, toMs) => store?.projectStats({ fromMs, toMs }) ?? [])
   ipcMain.handle('export-png', () => exportReportPng())
 
   await store.start()
   ingestNow() // first full ingest after the initial scan
   if (process.env.AIMON_AUTO_REPORT) openReport() // dev/test convenience
+  if ('AIMON_SET_AUTOLAUNCH' in process.env) setAutoLaunch(process.env.AIMON_SET_AUTOLAUNCH === '1') // headless toggle
 }
 
 // Throttle DB ingests: at most once every 4s, with a trailing run.
@@ -83,7 +90,7 @@ function ingestNow() {
   if (!db || !store) return
   lastIngest = Date.now()
   try {
-    db.ingest(store.allRecords())
+    db.ingest(store.dedupedRecords())
     if (reportWin && !reportWin.isDestroyed()) reportWin.webContents.send('report-updated')
   } catch (e) {
     console.error('ingest failed:', e)
@@ -207,16 +214,33 @@ function createTray() {
       { label: 'Refresh now', click: async () => { await store.scanAll(); const s = store.snapshot(); lastSnapshot = s; win?.webContents.send('snapshot', s); updateTray(s); ingestNow() } },
       { label: 'Edit data sources… (other devices)', click: () => { ensureConfigFile(); shell.openPath(CONFIG_FILE) } },
       { type: 'separator' },
+      { label: 'Start at login', type: 'checkbox', checked: isAutoLaunch(), click: (item) => setAutoLaunch(item.checked) },
+      { type: 'separator' },
       { label: 'Quit', click: () => { app.isQuitting = true; app.quit() } },
     ])
     tray.popUpContextMenu(menu)
   })
 }
 
+function isAutoLaunch() {
+  return app.getLoginItemSettings().openAtLogin
+}
+
+// Toggle "start with Windows" — writes/removes an HKCU\...\Run registry entry.
+function setAutoLaunch(enabled) {
+  const opts = { openAtLogin: enabled }
+  if (!app.isPackaged) {
+    // Dev: point the login item at electron + this project so it launches the app.
+    opts.path = process.execPath
+    opts.args = [path.resolve(process.argv[1] || '.')]
+  }
+  app.setLoginItemSettings(opts)
+}
+
 function updateTray(snap) {
   if (!tray) return
   const today = snap?.totals?.today?.total || 0
-  tray.setToolTip(`TokenStatus — today ${compact(today)} tokens`)
+  tray.setToolTip(`TokenStatus v${app.getVersion()} — today ${compact(today)} tokens`)
   // Recolour by the most recently active CLI.
   const cli = snap?.live?.cli
   const meta = cli && CLI_META[cli]
