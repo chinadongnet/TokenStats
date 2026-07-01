@@ -9,6 +9,11 @@ import { makeTrayIcon } from './trayIcon.js'
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url))
 
+// Fixed logical (DIP) size of the tray popup's content area. Re-applied on every
+// show and on display changes so a resolution/DPI switch can't shrink it.
+const POPUP_W = 380
+const POPUP_H = 600
+
 let tray = null
 let win = null
 let reportWin = null
@@ -32,6 +37,14 @@ async function init() {
 
   createWindow()
   createTray()
+
+  // A resolution/DPI change can rescale the popup's physical size and clip its
+  // content. Re-assert the fixed content size (and reposition if it's showing).
+  screen.on('display-metrics-changed', () => {
+    if (!win || win.isDestroyed()) return
+    sizeWindow()
+    if (win.isVisible()) positionWindow()
+  })
 
   // Open the hourly-usage SQLite database (best-effort; app still works without).
   try {
@@ -99,8 +112,9 @@ function ingestNow() {
 
 function createWindow() {
   win = new BrowserWindow({
-    width: 380,
-    height: 600,
+    width: POPUP_W,
+    height: POPUP_H,
+    useContentSize: true, // size the web content area, not the outer frame
     show: false,
     frame: false,
     resizable: false,
@@ -253,9 +267,19 @@ function toggleWindow() {
 }
 
 function showWindow() {
+  sizeWindow()
   positionWindow()
   win.show()
   win.focus()
+}
+
+// Re-assert the fixed content size, but cap the height to the current display's
+// work area so a low-resolution / high-DPI screen can't push the window off-screen
+// (the renderer scrolls internally when the content is taller than this).
+function sizeWindow() {
+  const display = screen.getDisplayMatching(tray ? tray.getBounds() : win.getBounds())
+  const maxH = Math.max(240, display.workArea.height - 8)
+  win.setContentSize(POPUP_W, Math.min(POPUP_H, maxH))
 }
 
 // Anchor the popup to the tray / bottom-right work area.
@@ -263,7 +287,7 @@ function positionWindow() {
   const tb = tray.getBounds()
   const display = screen.getDisplayMatching(tb)
   const area = display.workArea
-  const [w, h] = win.getSize()
+  const [w, h] = win.getContentSize()
   let x = Math.round(tb.x + tb.width / 2 - w / 2)
   let y = Math.round(tb.y - h - 8)
   // Keep on-screen; if taskbar is at the bottom, place above it.

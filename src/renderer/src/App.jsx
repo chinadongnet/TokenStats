@@ -60,6 +60,7 @@ export default function App() {
         <button className={scope === 'all' ? 'on' : ''} onClick={() => setScope('all')}>All time</button>
       </div>
 
+      <div className="scroll">
       <div className="hero">
         <div className="hero-num">{compact(totalTok)}</div>
         <div className="hero-sub">tokens · <span className="cost">{usd(totalCost)}</span> est.</div>
@@ -109,6 +110,7 @@ export default function App() {
           </div>
         ))}
       </section>
+      </div>
 
       <footer>
         {snap.live ? (
