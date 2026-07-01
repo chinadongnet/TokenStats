@@ -109,6 +109,12 @@ Records may also carry an optional **`dedupKey`** — see de-duplication below.
   and wires `store` `'update'` events to `webContents.send('snapshot', …)` and tray
   tooltip/color. IPC handlers are registered **before** `store.start()` so the renderer
   never races a missing `get-snapshot` handler during the initial scan.
+  The popup targets a fixed `POPUP_W × POPUP_H` (380×600) **content** size (`useContentSize`),
+  but `sizeWindow()` **caps the height to the current display's work area** so a
+  low-resolution / high-DPI screen can never push the window off-screen; the renderer
+  scrolls internally when content is taller (see `App.jsx`). `sizeWindow()` +
+  `positionWindow()` run on every `showWindow()` and on `screen`'s
+  `'display-metrics-changed'`, so a live resolution/DPI switch re-fits the popup.
 - **`trayIcon.js`** — renders the tray icon at runtime as a raw BGRA bitmap
   (`nativeImage.createFromBitmap`) so no image asset files are needed; recolored by the
   most recently active CLI.
@@ -127,7 +133,10 @@ Records may also carry an optional **`dedupKey`** — see de-duplication below.
 React + Vite, two views selected by URL hash in `main.jsx`:
 - **`App.jsx`** — the tray popup. Reads the snapshot via `window.api`, subscribes to live
   updates, renders the hero total, per-CLI bars, top models, recent sessions, live
-  indicator. Header has a Report button (`window.api.openReport()`).
+  indicator. Header has a Report button (`window.api.openReport()`). Header, tabs and
+  footer are pinned; the middle sits in a `.scroll` region (`flex:1; min-height:0;
+  overflow-y:auto`) so the content is never clipped when the window is shorter than the
+  content — which is what makes the height-capping in `index.js` safe.
 - **`Report.jsx`** (`#report`) — the usage report window. Pulls hourly/daily/model data
   from the SQLite DB via IPC and draws hand-rolled **SVG stacked-bar charts** (no chart
   lib): by-hour for a chosen day, daily trend over a range (7d/30d/all), per-model
