@@ -37,6 +37,7 @@ export default function App() {
   if (!snap) return <div className="loading">Scanning CLI logs…</div>
 
   const per = scope === 'today' ? snap.todayPerCli : snap.perCli
+  const models = (scope === 'today' ? snap.todayPerModel : snap.perModel) || []
   const totalTok = ORDER.reduce((a, c) => a + (per[c]?.total || 0), 0)
   const totalCost = ORDER.reduce((a, c) => a + (per[c]?.cost || 0), 0)
   const maxTok = Math.max(1, ...ORDER.map((c) => per[c]?.total || 0))
@@ -90,7 +91,7 @@ export default function App() {
 
       <section className="block">
         <h3>Top models</h3>
-        {snap.perModel.slice(0, 5).map((m) => (
+        {models.slice(0, 5).map((m) => (
           <div className="line" key={m.model}>
             <span className="dot sm" style={{ background: CLI[m.cli]?.color }} />
             <span className="ellipsis">{m.model}</span>
