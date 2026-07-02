@@ -207,6 +207,7 @@ export class Store extends EventEmitter {
       todayPerModel: [...todayPerModel.values()].sort((a, b) => b.total - a.total),
       perDay: [...perDay.values()].sort((a, b) => a.day.localeCompare(b.day)).slice(-30),
       recentSessions: sessions.slice(0, 12),
+      recentProjects: projectSummary(records).slice(0, 12),
       sessionCount: sessions.length,
       live: latest
         ? { cli: latest.cli, model: latest.model, project: latest.project, ts: latest.ts }
@@ -312,6 +313,25 @@ function sessionSummary(records) {
     }
   }
   return [...map.values()].sort((a, b) => b.lastTs - a.lastTs)
+}
+
+// Like sessionSummary but merges all sessions of the same project (cli|project)
+// so the All-time view shows one row per project with its total token count.
+function projectSummary(records) {
+  const map = new Map()
+  for (const r of records) {
+    const project = r.project || '(unknown)'
+    const key = r.cli + '|' + project
+    let p = map.get(key)
+    if (!p) {
+      p = { cli: r.cli, sessionId: key, project, total: 0, cost: 0, lastTs: 0 }
+      map.set(key, p)
+    }
+    p.total += r.total
+    p.cost += costFor(r)
+    if (r.ts > p.lastTs) p.lastTs = r.ts
+  }
+  return [...map.values()].sort((a, b) => b.total - a.total)
 }
 
 // Local-day key (YYYY-MM-DD) so "today" matches the user's wall clock.
