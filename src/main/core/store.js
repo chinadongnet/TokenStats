@@ -167,6 +167,7 @@ export class Store extends EventEmitter {
     const perCli = Object.fromEntries(CLIS.map((c) => [c, blank()]))
     const todayPerCli = Object.fromEntries(CLIS.map((c) => [c, blank()]))
     const perModel = new Map()
+    const todayPerModel = new Map()
     const perDay = new Map() // dayKey -> { [cli]: total }
     let latest = null
 
@@ -178,6 +179,11 @@ export class Store extends EventEmitter {
 
       if (!perModel.has(r.model)) perModel.set(r.model, { model: r.model, cli: r.cli, ...blank() })
       add(perModel.get(r.model), r, cost)
+
+      if (dk === todayKey) {
+        if (!todayPerModel.has(r.model)) todayPerModel.set(r.model, { model: r.model, cli: r.cli, ...blank() })
+        add(todayPerModel.get(r.model), r, cost)
+      }
 
       if (!perDay.has(dk)) perDay.set(dk, { day: dk, total: 0, ...Object.fromEntries(CLIS.map((c) => [c, 0])) })
       const d = perDay.get(dk)
@@ -198,6 +204,7 @@ export class Store extends EventEmitter {
       perCli,
       todayPerCli,
       perModel: [...perModel.values()].sort((a, b) => b.total - a.total),
+      todayPerModel: [...todayPerModel.values()].sort((a, b) => b.total - a.total),
       perDay: [...perDay.values()].sort((a, b) => a.day.localeCompare(b.day)).slice(-30),
       recentSessions: sessions.slice(0, 12),
       sessionCount: sessions.length,

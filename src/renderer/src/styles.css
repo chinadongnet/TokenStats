@@ -21,6 +21,12 @@ body {
 .loading { display: grid; place-items: center; height: 100%; color: var(--muted); }
 
 .app { display: flex; flex-direction: column; height: 100vh; }
+/* Scrollable middle so content is never clipped when the window is shorter
+   than the content (small screens / high DPI). Header, tabs and footer stay put. */
+.scroll { flex: 1 1 auto; min-height: 0; overflow-y: auto; overflow-x: hidden; }
+.scroll::-webkit-scrollbar { width: 8px; }
+.scroll::-webkit-scrollbar-thumb { background: var(--panel2); border-radius: 4px; }
+header, .tabs, footer { flex: none; }
 
 header {
   display: flex; align-items: center; justify-content: space-between;
