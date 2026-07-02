@@ -38,6 +38,9 @@ export default function App() {
 
   const per = scope === 'today' ? snap.todayPerCli : snap.perCli
   const models = (scope === 'today' ? snap.todayPerModel : snap.perModel) || []
+  // All-time groups recent activity by project (tokens summed across sessions);
+  // Today keeps per-session rows.
+  const recent = scope === 'all' ? (snap.recentProjects || []) : snap.recentSessions
   const totalTok = ORDER.reduce((a, c) => a + (per[c]?.total || 0), 0)
   const totalCost = ORDER.reduce((a, c) => a + (per[c]?.cost || 0), 0)
   const maxTok = Math.max(1, ...ORDER.map((c) => per[c]?.total || 0))
@@ -101,8 +104,8 @@ export default function App() {
       </section>
 
       <section className="block">
-        <h3>Recent sessions</h3>
-        {snap.recentSessions.slice(0, 6).map((s) => (
+        <h3>{scope === 'all' ? 'Top projects' : 'Recent sessions'}</h3>
+        {recent.slice(0, 6).map((s) => (
           <div className="line" key={s.cli + s.sessionId}>
             <span className="dot sm" style={{ background: CLI[s.cli]?.color }} />
             <span className="ellipsis">{s.project}</span>
