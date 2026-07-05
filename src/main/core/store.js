@@ -6,10 +6,11 @@ import { claude } from './parsers/claude.js'
 import { codex } from './parsers/codex.js'
 import { geminiJsonl, geminiJson } from './parsers/gemini.js'
 import { antigravity } from './parsers/antigravity.js'
+import { cursor } from './parsers/cursor.js'
 import { costFor } from './pricing.js'
 import { CLIS } from './paths.js'
 
-const PARSERS = [claude, codex, geminiJsonl, geminiJson, antigravity]
+const PARSERS = [claude, codex, geminiJsonl, geminiJson, antigravity, cursor]
 
 // In-memory index of every parsed file:
 //   path -> { parser, size, mtimeMs, state, records[] }
@@ -193,7 +194,9 @@ export class Store extends EventEmitter {
       if (!latest || r.ts > latest.ts) latest = r
     }
 
+    const todayRecords = records.filter((r) => dayKey(r.ts) === todayKey)
     const sessions = sessionSummary(records)
+    const todaySessions = sessionSummary(todayRecords)
 
     return {
       generatedAt: now.getTime(),
@@ -207,6 +210,7 @@ export class Store extends EventEmitter {
       todayPerModel: [...todayPerModel.values()].sort((a, b) => b.total - a.total),
       perDay: [...perDay.values()].sort((a, b) => a.day.localeCompare(b.day)).slice(-30),
       recentSessions: sessions.slice(0, 12),
+      todayRecentSessions: todaySessions.slice(0, 12),
       recentProjects: projectSummary(records).slice(0, 12),
       sessionCount: sessions.length,
       live: latest

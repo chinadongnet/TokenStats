@@ -4,12 +4,16 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## What this is
 
-TokenStatus is a Windows system-tray app that tracks token usage across four local
-AI coding CLIs — **Claude Code**, **Codex**, **Gemini**, and **Antigravity** (`agy`) — by parsing the
-transcript/log files each CLI writes to disk. It watches those files live and shows
+TokenStatus is a Windows system-tray app that tracks token usage across five local
+AI coding tools — **Claude Code**, **Codex**, **Gemini**, **Antigravity** (`agy`), and the
+**Cursor** IDE — by parsing the transcript/log files each one writes to disk. It watches those files live and shows
 per-CLI / per-model / per-day token counts and rough cost estimates in a tray popup.
 
-There is no network, account, or API involved: all data comes from reading local files.
+All data comes from reading local files, with **one exception**: Cursor's local files
+carry no real token counts (see below), so `parsers/cursor.js` calls an undocumented
+cursor.com dashboard endpoint using the session token the Cursor IDE already stores
+locally. This was added at the user's explicit request/approval after confirming the
+local-only approach returns no data; every other CLI stays fully offline.
 
 ## Commands
 
@@ -39,7 +43,7 @@ testable via `npm run test:parsers`.
 
 ### Parsing engine — `src/main/core/`
 
-- **`parsers/{claude,codex,gemini,antigravity}.js`** — one module per CLI. Each
+- **`parsers/{claude,codex,gemini,antigravity,cursor}.js`** — one module per CLI. Each
   declares its `roots` array (from `CLI_ROOTS`), a `kind` (`'jsonl'` append-only,
   `'json'` whole-file text, or `'binary'` whole-file buffer), a `match(file)`
   predicate, and either `parseLine(line, state, file)` (jsonl) or
@@ -60,6 +64,22 @@ testable via `npm run test:parsers`.
     in the `gen_metadata` table (field map documented in `parsers/antigravity.js` —
     reverse-engineered, so re-validate after Antigravity updates). Whole-file
     re-parse on change.
+  - Cursor's local chat db (`%APPDATA%/Cursor/User/globalStorage/state.vscdb`)
+    writes every message's `tokenCount` as zeros in current Cursor versions —
+    confirmed by raw-scanning the whole db + WAL, real usage is server-side only.
+    So `parsers/cursor.js` only reads that db to extract the `cursorAuth/accessToken`
+    JWT the IDE already stores after login, then calls the **undocumented** CSV
+    export the cursor.com dashboard's Usage tab uses
+    (`GET cursor.com/api/dashboard/export-usage-events-csv?startDate=0&endDate=<now>&strategy=tokens`,
+    with a forged `WorkosCursorSessionToken` cookie) to get real per-request token
+    counts. No conversationId is included, so all Cursor records land in one
+    synthetic `cursor`/`cloud` project/session rather than per-conversation.
+    Fetches are cached per-account and throttled to once per 15 minutes — the
+    endpoint 403'd after a handful of rapid calls to a sibling JSON endpoint during
+    testing. This is reverse-engineered and **can break or disappear without
+    notice**; re-validate the endpoint and CSV column names (looked up by header
+    name, not position) after Cursor updates. Full investigation and rationale are
+    in the header comment of `parsers/cursor.js`.
   - `snapshot()` aggregates all records into per-CLI / per-model / per-day buckets,
     today-vs-all-time, recent sessions, and the current "live" model. This is the only
     object the UI consumes.

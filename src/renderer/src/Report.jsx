@@ -5,8 +5,9 @@ const CLI = {
   codex: { label: 'Codex', color: '#10a37f' },
   gemini: { label: 'Gemini', color: '#4285f4' },
   agy: { label: 'Antigravity', color: '#a142f4' },
+  cursor: { label: 'Cursor', color: '#6366f1' },
 }
-const ORDER = ['claude', 'codex', 'gemini', 'agy']
+const ORDER = ['claude', 'codex', 'gemini', 'agy', 'cursor']
 
 const DAY = 86400000
 const floorDay = (ms) => { const d = new Date(ms); d.setHours(0, 0, 0, 0); return d.getTime() }
@@ -87,7 +88,7 @@ export default function Report() {
 
   // ---- shape data for charts (filtered by active brands) ----
   const hourData = useMemo(() => {
-    const arr = Array.from({ length: 24 }, (_, h) => ({ label: h, segs: { claude: 0, codex: 0, gemini: 0, agy: 0 }, total: 0 }))
+    const arr = Array.from({ length: 24 }, (_, h) => ({ label: h, segs: { claude: 0, codex: 0, gemini: 0, agy: 0, cursor: 0 }, total: 0 }))
     for (const r of hourly) {
       if (!brands.has(r.cli)) continue
       const h = new Date(r.hour).getHours()
@@ -99,7 +100,7 @@ export default function Report() {
 
   const dayData = useMemo(() => {
     const map = new Map()
-    for (let t = fromMs; t < toMs; t += DAY) map.set(floorDay(t), { label: floorDay(t), segs: { claude: 0, codex: 0, gemini: 0, agy: 0 }, total: 0 })
+    for (let t = fromMs; t < toMs; t += DAY) map.set(floorDay(t), { label: floorDay(t), segs: { claude: 0, codex: 0, gemini: 0, agy: 0, cursor: 0 }, total: 0 })
     for (const r of daily) {
       if (!brands.has(r.cli)) continue
       const k = floorDay(r.day)
