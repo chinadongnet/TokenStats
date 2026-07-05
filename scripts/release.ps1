@@ -39,7 +39,7 @@ Start-Sleep -Milliseconds 500
 Write-Host 'Installing (silent)…' -ForegroundColor Cyan
 Start-Process -FilePath (Join-Path $root "dist\$dated") -ArgumentList '/S' -Wait
 
-$installed = Join-Path $env:LOCALAPPDATA 'Programs\TokenStatus\TokenStatus.exe'
+$installed = Join-Path $env:LOCALAPPDATA 'Programs\tokenstats\TokenStats.exe'
 if (Test-Path $installed) {
   Start-Process $installed
   Write-Host "Launched: $installed" -ForegroundColor Green
