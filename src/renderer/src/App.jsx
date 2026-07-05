@@ -6,8 +6,9 @@ const CLI = {
   gemini: { label: 'Gemini', color: '#4285f4' },
   agy: { label: 'Antigravity', color: '#a142f4' },
   cursor: { label: 'Cursor', color: '#6366f1' },
+  litellm: { label: 'LiteLLM', color: '#f59e0b' },
 }
-const ORDER = ['claude', 'codex', 'gemini', 'agy', 'cursor']
+const ORDER = ['claude', 'codex', 'gemini', 'agy', 'cursor', 'litellm']
 const DETAIL_TABS = [
   { id: 'today-models', label: 'Today Models', scope: 'today', detail: 'models', title: 'Today models' },
   { id: 'today-sessions', label: 'Today Sessions', scope: 'today', detail: 'sessions', title: 'Today sessions' },
@@ -22,7 +23,7 @@ const compact = (n) => {
   if (n >= 1e3) return (n / 1e3).toFixed(1) + 'K'
   return String(Math.round(n))
 }
-const usd = (n) => '$' + (n || 0).toFixed(2)
+const usd = (n) => (n || 0).toFixed(2)
 const ago = (ts) => {
   if (!ts) return ''
   const s = Math.round((Date.now() - ts) / 1000)

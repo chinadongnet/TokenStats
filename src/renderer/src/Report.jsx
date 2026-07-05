@@ -6,8 +6,9 @@ const CLI = {
   gemini: { label: 'Gemini', color: '#4285f4' },
   agy: { label: 'Antigravity', color: '#a142f4' },
   cursor: { label: 'Cursor', color: '#6366f1' },
+  litellm: { label: 'LiteLLM', color: '#f59e0b' },
 }
-const ORDER = ['claude', 'codex', 'gemini', 'agy', 'cursor']
+const ORDER = ['claude', 'codex', 'gemini', 'agy', 'cursor', 'litellm']
 
 const DAY = 86400000
 const floorDay = (ms) => { const d = new Date(ms); d.setHours(0, 0, 0, 0); return d.getTime() }
@@ -18,8 +19,8 @@ const compact = (n) => {
   if (n >= 1e3) return (n / 1e3).toFixed(1) + 'K'
   return String(Math.round(n))
 }
-const usd = (n) => '$' + (Number(n) || 0).toFixed(2)
-const usd4 = (n) => '$' + (Number(n) || 0).toFixed(4)
+const usd = (n) => (Number(n) || 0).toFixed(2)
+const usd4 = (n) => (Number(n) || 0).toFixed(4)
 const dayLabel = (ms) => new Date(ms).toLocaleDateString(undefined, { month: 'short', day: 'numeric' })
 const num = (n) => (Number(n) || 0).toLocaleString()
 const timeLabel = (ms) => {

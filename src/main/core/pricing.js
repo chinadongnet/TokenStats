@@ -37,8 +37,11 @@ function ratesFor(model) {
   return DEFAULT
 }
 
-// Estimate USD cost for one normalized usage record.
+// Estimate USD cost for one normalized usage record. A record may carry a
+// real `cost` (currently: litellm, which reports actual spend) — prefer that
+// over the estimate table since it's exact, not a guess.
 export function costFor(rec) {
+  if (typeof rec.cost === 'number') return rec.cost
   const [inP, outP, cacheReadP, cacheWriteP] = ratesFor(rec.model)
   return (
     (rec.input * inP +

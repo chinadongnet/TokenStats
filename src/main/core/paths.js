@@ -66,6 +66,23 @@ function loadExtraRoots() {
 
 const extra = loadExtraRoots()
 
+// LiteLLM is a self-hosted proxy with no local footprint at all — usage lives
+// only in its admin API — so unlike every other CLI it has no roots/files,
+// just a base URL + admin key read from config.json (never hardcoded/committed).
+function loadLitellmConfig() {
+  try {
+    const cfg = JSON.parse(fs.readFileSync(CONFIG_FILE, 'utf8'))
+    const l = cfg.litellm || {}
+    const baseUrl = typeof l.baseUrl === 'string' ? l.baseUrl.trim().replace(/\/+$/, '') : ''
+    const apiKey = typeof l.apiKey === 'string' ? l.apiKey.trim() : ''
+    return baseUrl && apiKey ? { baseUrl, apiKey } : null
+  } catch {
+    return null
+  }
+}
+
+export const LITELLM_CONFIG = loadLitellmConfig()
+
 // All roots to scan per CLI: local first, then extra dirs from other devices.
 export const CLI_ROOTS = {
   claude: [PRIMARY.claude, ...extra.claude],
@@ -81,6 +98,9 @@ export const CLI_META = {
   gemini: { label: 'Gemini', color: '#4285f4', root: PRIMARY.gemini },
   agy: { label: 'Antigravity', color: '#a142f4', root: PRIMARY.agy },
   cursor: { label: 'Cursor', color: '#6366f1', root: PRIMARY.cursor },
+  // No local root — "open data dir" points at the config file's folder instead,
+  // since that's the only local artifact this integration has.
+  litellm: { label: 'LiteLLM', color: '#f59e0b', root: CONFIG_DIR },
 }
 
 export const CLIS = Object.keys(CLI_META)
@@ -106,6 +126,10 @@ export function ensureConfigFile() {
         cursor: 'D:/from-laptop/AppData/Roaming/Cursor/User/globalStorage',
       },
       extraRoots: { claude: [], codex: [], gemini: [], agy: [], cursor: [] },
+      _litellmComment:
+        'Optional: track usage from a self-hosted LiteLLM proxy via its admin API. ' +
+        'Leave apiKey empty to disable. apiKey is an admin/management key, not a per-user key.',
+      litellm: { baseUrl: '', apiKey: '' },
     }
     fs.writeFileSync(CONFIG_FILE, JSON.stringify(template, null, 2))
   } catch {

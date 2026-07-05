@@ -11,6 +11,7 @@ fs.rmSync(dbPath, { force: true })
 
 const store = new Store()
 await store.scanAll()
+await store.pollAll() // no-op unless litellm is configured in ~/.tokenstatus/config.json
 const records = store.dedupedRecords()
 
 const db = new UsageDb({ dbPath })
