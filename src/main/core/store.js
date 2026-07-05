@@ -6,10 +6,18 @@ import { claude } from './parsers/claude.js'
 import { codex } from './parsers/codex.js'
 import { geminiJsonl, geminiJson } from './parsers/gemini.js'
 import { antigravity } from './parsers/antigravity.js'
+import { cursor } from './parsers/cursor.js'
+import { litellm } from './parsers/litellm.js'
 import { costFor } from './pricing.js'
 import { CLIS } from './paths.js'
 
-const PARSERS = [claude, codex, geminiJsonl, geminiJson, antigravity]
+const PARSERS = [claude, codex, geminiJsonl, geminiJson, antigravity, cursor]
+
+// Pollers are usage sources with no local files to watch (currently just
+// LiteLLM, whose usage lives entirely on the proxy server) — polled on a
+// timer instead of via chokidar. Each exposes `cli` and an async `poll()`
+// returning the current full record set for that source.
+const POLLERS = [litellm].filter((p) => p.enabled)
 
 // In-memory index of every parsed file:
 //   path -> { parser, size, mtimeMs, state, records[] }
@@ -21,6 +29,7 @@ export class Store extends EventEmitter {
     this.files = new Map()
     this.watchers = []
     this._scanTimer = null
+    this._pollTimers = []
   }
 
   parserFor(file) {
@@ -75,6 +84,22 @@ export class Store extends EventEmitter {
     entry.size = stat.size
     entry.mtimeMs = stat.mtimeMs
     return true
+  }
+
+  // Runs every poller once and stores its full record set under a synthetic
+  // key, the same shape as a file entry so allRecords()/dedupedRecords() pick
+  // it up unchanged. Each poller throttles/caches its own network calls, so
+  // calling this often (e.g. on a timer) is cheap.
+  async pollAll() {
+    let changed = false
+    for (const p of POLLERS) {
+      const records = await p.poll()
+      const key = `poller:${p.cli}`
+      const prev = this.files.get(key)
+      if (!prev || prev.records !== records) changed = true
+      this.files.set(key, { parser: p, size: 0, mtimeMs: Date.now(), state: {}, records })
+    }
+    return changed
   }
 
   async scanAll() {
@@ -193,7 +218,9 @@ export class Store extends EventEmitter {
       if (!latest || r.ts > latest.ts) latest = r
     }
 
+    const todayRecords = records.filter((r) => dayKey(r.ts) === todayKey)
     const sessions = sessionSummary(records)
+    const todaySessions = sessionSummary(todayRecords)
 
     return {
       generatedAt: now.getTime(),
@@ -207,6 +234,7 @@ export class Store extends EventEmitter {
       todayPerModel: [...todayPerModel.values()].sort((a, b) => b.total - a.total),
       perDay: [...perDay.values()].sort((a, b) => a.day.localeCompare(b.day)).slice(-30),
       recentSessions: sessions.slice(0, 12),
+      todayRecentSessions: todaySessions.slice(0, 12),
       recentProjects: projectSummary(records).slice(0, 12),
       sessionCount: sessions.length,
       live: latest
@@ -219,6 +247,16 @@ export class Store extends EventEmitter {
 
   async start() {
     await this.scanAll()
+    await this.pollAll()
+    if (POLLERS.length) {
+      // Each poller throttles its own network calls (see litellm.js); this
+      // timer just needs to fire more often than that throttle window so a
+      // fresh fetch is picked up promptly once it's due.
+      const timer = setInterval(async () => {
+        if (await this.pollAll()) this.emit('update', this.snapshot())
+      }, 5 * 60 * 1000)
+      this._pollTimers.push(timer)
+    }
     const chokidar = (await import('chokidar')).default
     const roots = [...new Set(PARSERS.flatMap((p) => p.roots))]
     for (const root of roots) {
@@ -254,6 +292,8 @@ export class Store extends EventEmitter {
   async stop() {
     for (const w of this.watchers) await w.close()
     this.watchers = []
+    for (const t of this._pollTimers) clearInterval(t)
+    this._pollTimers = []
   }
 }
 

@@ -4,12 +4,22 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## What this is
 
-TokenStatus is a Windows system-tray app that tracks token usage across four local
-AI coding CLIs — **Claude Code**, **Codex**, **Gemini**, and **Antigravity** (`agy`) — by parsing the
-transcript/log files each CLI writes to disk. It watches those files live and shows
-per-CLI / per-model / per-day token counts and rough cost estimates in a tray popup.
+TokenStatus is a Windows system-tray app that tracks token usage across five local
+AI coding tools — **Claude Code**, **Codex**, **Gemini**, **Antigravity** (`agy`), and the
+**Cursor** IDE — plus a self-hosted **LiteLLM** proxy, by parsing the transcript/log
+files each local tool writes to disk (and, for LiteLLM, polling its admin API). It
+watches those files live and shows per-CLI / per-model / per-day token counts and cost
+in a tray popup.
 
-There is no network, account, or API involved: all data comes from reading local files.
+All data comes from reading local files, with **two exceptions**:
+- Cursor's local files carry no real token counts (see below), so `parsers/cursor.js`
+  calls an undocumented cursor.com dashboard endpoint using the session token the
+  Cursor IDE already stores locally.
+- LiteLLM has no local footprint at all — it's a proxy server, not a local tool — so
+  `parsers/litellm.js` polls its admin API for usage instead. Unlike every other
+  source, this one reports **real spend** (not a `pricing.js` estimate); see below.
+Both were added at the user's explicit request/approval after confirming the
+local-only approach returns no data; every other CLI stays fully offline.
 
 ## Commands
 
@@ -39,13 +49,15 @@ testable via `npm run test:parsers`.
 
 ### Parsing engine — `src/main/core/`
 
-- **`parsers/{claude,codex,gemini,antigravity}.js`** — one module per CLI. Each
+- **`parsers/{claude,codex,gemini,antigravity,cursor}.js`** — one module per CLI. Each
   declares its `roots` array (from `CLI_ROOTS`), a `kind` (`'jsonl'` append-only,
   `'json'` whole-file text, or `'binary'` whole-file buffer), a `match(file)`
   predicate, and either `parseLine(line, state, file)` (jsonl) or
   `parseFile(textOrBuffer, file)` (json/binary, may be async). Each returns
   *normalized records* (below).
   Gemini ships two parser objects (`geminiJsonl` + `geminiJson`) sharing one root.
+  `parsers/litellm.js` is the odd one out — it has no roots/files at all (see below)
+  and is registered in `store.js`'s separate `POLLERS` array, not `PARSERS`.
 - **`store.js`** — the engine core. Walks each root, reads files, and holds an
   in-memory index `Map<path, {parser, size, mtimeMs, state, records[]}>`.
   - JSONL files (Claude, Codex) are **tailed incrementally** from the last byte
@@ -60,13 +72,42 @@ testable via `npm run test:parsers`.
     in the `gen_metadata` table (field map documented in `parsers/antigravity.js` —
     reverse-engineered, so re-validate after Antigravity updates). Whole-file
     re-parse on change.
+  - Cursor's local chat db (`%APPDATA%/Cursor/User/globalStorage/state.vscdb`)
+    writes every message's `tokenCount` as zeros in current Cursor versions —
+    confirmed by raw-scanning the whole db + WAL, real usage is server-side only.
+    So `parsers/cursor.js` only reads that db to extract the `cursorAuth/accessToken`
+    JWT the IDE already stores after login, then calls the **undocumented** CSV
+    export the cursor.com dashboard's Usage tab uses
+    (`GET cursor.com/api/dashboard/export-usage-events-csv?startDate=0&endDate=<now>&strategy=tokens`,
+    with a forged `WorkosCursorSessionToken` cookie) to get real per-request token
+    counts. No conversationId is included, so all Cursor records land in one
+    synthetic `cursor`/`cloud` project/session rather than per-conversation.
+    Fetches are cached per-account and throttled to once per 15 minutes — the
+    endpoint 403'd after a handful of rapid calls to a sibling JSON endpoint during
+    testing. This is reverse-engineered and **can break or disappear without
+    notice**; re-validate the endpoint and CSV column names (looked up by header
+    name, not position) after Cursor updates. Full investigation and rationale are
+    in the header comment of `parsers/cursor.js`.
+  - **LiteLLM** (`parsers/litellm.js`) is polled, not file-watched — see "Pollers"
+    below.
   - `snapshot()` aggregates all records into per-CLI / per-model / per-day buckets,
     today-vs-all-time, recent sessions, and the current "live" model. This is the only
     object the UI consumes.
   - `start()` does the initial scan, then sets up `chokidar` watchers and emits
     debounced `'update'` events (400ms) carrying a fresh snapshot.
+  - **Pollers** (`store.js`'s `POLLERS` array, currently just `litellm`) are usage
+    sources with nothing on disk to watch. `pollAll()` calls each poller's `poll()`
+    and stores the returned records under a synthetic `poller:<cli>` key in the same
+    `this.files` map file entries use, so `allRecords()`/`dedupedRecords()` pick them
+    up unchanged. `start()` calls `pollAll()` once, then re-polls on a 5-minute timer;
+    each poller does its own internal throttling/caching (LiteLLM: 15 min) so the
+    timer firing often is cheap. A poller is only added to `POLLERS` if its config is
+    present (`litellm.enabled`), so an unconfigured LiteLLM makes zero network calls.
 - **`pricing.js`** — rough USD-per-million-token table, matched by model-id substring.
-  Cost figures are **estimates**, clearly labelled in the UI; edit the table freely.
+  Cost figures are **estimates**, clearly labelled in the UI, for every source except
+  LiteLLM — `costFor(rec)` returns `rec.cost` directly when a record carries one
+  (LiteLLM's admin API reports actual spend, so its records aren't estimated at all).
+  Edit the table freely.
 - **`db.js`** — SQLite (via `sql.js` WASM, no native build) persistence of **hourly**
   usage buckets at `~/.tokenstatus/usage.sqlite`. `UsageDb.ingest(records)` re-aggregates
   the full record set into one row per `(local-hour, cli, model)` and **replaces** the
@@ -80,7 +121,10 @@ testable via `npm run test:parsers`.
   `~/.tokenstatus/config.json` (override path via `AIMON_CONFIG`). Extra roots are how
   **other devices' usage is merged** — copy another machine's `.codex/.gemini/.claude`
   data folder locally and add its path. `ensureConfigFile()` writes a template on first
-  run. Also exposes per-CLI display metadata (label, color, primary root).
+  run. Also exposes per-CLI display metadata (label, color, primary root) and the
+  LiteLLM connection config (`config.litellm.{baseUrl,apiKey}`, both required or the
+  integration stays disabled) as `LITELLM_CONFIG` — never hardcode a LiteLLM key in
+  source; it only ever comes from the user's local, gitignored config file.
 
 ### Normalized record
 
@@ -96,11 +140,14 @@ Every parser emits records of this exact shape so aggregation is CLI-agnostic:
 - Codex: the per-turn **delta** of the cumulative `total_token_usage.total_tokens`
   (already includes cached input + reasoning)
 - Gemini: the message's `tokens.total`
+- LiteLLM: the admin API's `total_tokens` for that model/key/day
 
-`input` is stored as the *non-cached* portion for Codex/Gemini so the components don't
-double-count `cacheRead`.
+`input` is stored as the *non-cached* portion for Codex/Gemini/LiteLLM so the
+components don't double-count `cacheRead`.
 
-Records may also carry an optional **`dedupKey`** — see de-duplication below.
+Records may also carry an optional **`dedupKey`** — see de-duplication below — and an
+optional **`cost`**, which overrides the `pricing.js` estimate with a real dollar
+figure (currently only LiteLLM sets this).
 
 ### Electron shell — `src/main/`
 
@@ -149,7 +196,10 @@ No router, no state library.
   `.mjs`; the preload is emitted as CommonJS `.cjs` (sandbox requires `require`).
 - **Adding a CLI**: add `parsers/<cli>.js` implementing the parser contract, register
   it in `store.js`'s `PARSERS` array, add metadata in `paths.js` and `App.jsx`'s `CLI`/
-  `ORDER`, and a pricing row. Nothing else needs to change.
+  `ORDER` (and `Report.jsx`'s, which duplicates them), and a pricing row. Nothing else
+  needs to change. If the source has no local files (network-only, like LiteLLM),
+  implement `{ cli, enabled, poll() }` instead and register it in `store.js`'s
+  `POLLERS` array rather than `PARSERS`.
 - **Data formats are version-specific**: these parsers were written against observed
   on-disk shapes (Claude `message.usage`, Codex `event_msg`/`token_count`
   `total_token_usage`, Gemini `gemini`-type messages' `tokens`). A CLI update can change
@@ -173,3 +223,19 @@ No router, no state library.
   carries the previous cumulative per file; a counter reset (compaction) is treated as a
   fresh zero baseline.
 - "Today" uses the **local** calendar day so it matches the user's wall clock.
+- **LiteLLM** (`parsers/litellm.js`) polls `{baseUrl}/user/daily/activity`, an
+  internal/undocumented admin endpoint (not the documented public LiteLLM API) —
+  re-validate its response shape after LiteLLM upgrades. Two quirks to know:
+  - Its `page`/`total_pages` pagination is **not day-aligned** — a single date's
+    per-model rows can be split across adjacent pages. The parser just flattens
+    every per-model/per-key leaf across every page it fetches (35-day lookback,
+    capped at 40 pages/poll); leaves don't repeat across pages in practice, and
+    `dedupKey` (`litellm:<date>:<model>:<keyHash>`) makes it harmless if they did.
+  - It has no per-request timestamps, only a day + model + API-key breakdown, so
+    one record = one (day, model, key) bucket, timestamped at noon UTC for that day
+    (keeps it inside the same local calendar day everywhere, for "today" bucketing).
+    `key_alias` (e.g. a per-device key name) becomes the record's `project`, which
+    is the closest analog to per-project/session grouping this data supports.
+  - Buckets with zero `total_tokens` (a model that only ever failed) are dropped
+    entirely, so models with no real usage never show up in the model breakdown —
+    intentional per user request, not a bug if you see registered models missing.

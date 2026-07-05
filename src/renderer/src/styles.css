@@ -51,6 +51,7 @@ header {
   color: var(--muted); padding: 6px; border-radius: 8px; cursor: pointer;
 }
 .tabs button.on { background: var(--panel2); color: var(--text); border-color: #39405200; }
+.detail-tabs button { font-size: 11px; padding: 6px 3px; white-space: nowrap; }
 
 .hero { text-align: center; padding: 14px 0 6px; }
 .hero-num { font-size: 38px; font-weight: 700; letter-spacing: -1px; }
@@ -79,6 +80,7 @@ header {
 .num { font-variant-numeric: tabular-nums; color: var(--text); }
 .muted { color: var(--muted); }
 .small { font-size: 11px; }
+.empty.mini { padding: 4px 0; font-size: 12px; }
 
 footer {
   margin-top: auto; display: flex; align-items: center; justify-content: space-between;

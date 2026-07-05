@@ -5,8 +5,16 @@ const CLI = {
   codex: { label: 'Codex', color: '#10a37f' },
   gemini: { label: 'Gemini', color: '#4285f4' },
   agy: { label: 'Antigravity', color: '#a142f4' },
+  cursor: { label: 'Cursor', color: '#6366f1' },
+  litellm: { label: 'LiteLLM', color: '#f59e0b' },
 }
-const ORDER = ['claude', 'codex', 'gemini', 'agy']
+const ORDER = ['claude', 'codex', 'gemini', 'agy', 'cursor', 'litellm']
+const DETAIL_TABS = [
+  { id: 'today-models', label: 'Today Models', scope: 'today', detail: 'models', title: 'Today models' },
+  { id: 'today-sessions', label: 'Today Sessions', scope: 'today', detail: 'sessions', title: 'Today sessions' },
+  { id: 'all-models', label: 'All Models', scope: 'all', detail: 'models', title: 'All-time models' },
+  { id: 'all-sessions', label: 'All Sessions', scope: 'all', detail: 'sessions', title: 'All-time sessions' },
+]
 
 const compact = (n) => {
   if (!n) return '0'
@@ -15,7 +23,7 @@ const compact = (n) => {
   if (n >= 1e3) return (n / 1e3).toFixed(1) + 'K'
   return String(Math.round(n))
 }
-const usd = (n) => '$' + (n || 0).toFixed(2)
+const usd = (n) => (n || 0).toFixed(2)
 const ago = (ts) => {
   if (!ts) return ''
   const s = Math.round((Date.now() - ts) / 1000)
@@ -27,7 +35,7 @@ const ago = (ts) => {
 
 export default function App() {
   const [snap, setSnap] = useState(null)
-  const [scope, setScope] = useState('today') // 'today' | 'all'
+  const [tab, setTab] = useState('today-models')
 
   useEffect(() => {
     window.api.getSnapshot().then(setSnap)
@@ -36,14 +44,18 @@ export default function App() {
 
   if (!snap) return <div className="loading">Scanning CLI logs…</div>
 
+  const activeTab = DETAIL_TABS.find((t) => t.id === tab) || DETAIL_TABS[0]
+  const scope = activeTab.scope
   const per = scope === 'today' ? snap.todayPerCli : snap.perCli
-  const models = (scope === 'today' ? snap.todayPerModel : snap.perModel) || []
-  // All-time groups recent activity by project (tokens summed across sessions);
-  // Today keeps per-session rows.
-  const recent = scope === 'all' ? (snap.recentProjects || []) : snap.recentSessions
+  const models = ((scope === 'today' ? snap.todayPerModel : snap.perModel) || [])
+    .filter((m) => scope !== 'today' || (m.total || 0) > 0)
+  const sessions = (scope === 'today' ? snap.todayRecentSessions : snap.recentSessions) || []
+  const visibleCliOrder = scope === 'today'
+    ? ORDER.filter((c) => (per[c]?.total || 0) > 0)
+    : ORDER
   const totalTok = ORDER.reduce((a, c) => a + (per[c]?.total || 0), 0)
   const totalCost = ORDER.reduce((a, c) => a + (per[c]?.cost || 0), 0)
-  const maxTok = Math.max(1, ...ORDER.map((c) => per[c]?.total || 0))
+  const maxTok = Math.max(1, ...visibleCliOrder.map((c) => per[c]?.total || 0))
 
   return (
     <div className="app">
@@ -59,9 +71,12 @@ export default function App() {
         </div>
       </header>
 
-      <div className="tabs">
-        <button className={scope === 'today' ? 'on' : ''} onClick={() => setScope('today')}>Today</button>
-        <button className={scope === 'all' ? 'on' : ''} onClick={() => setScope('all')}>All time</button>
+      <div className="tabs detail-tabs">
+        {DETAIL_TABS.map((t) => (
+          <button key={t.id} className={tab === t.id ? 'on' : ''} onClick={() => setTab(t.id)}>
+            {t.label}
+          </button>
+        ))}
       </div>
 
       <div className="scroll">
@@ -71,7 +86,7 @@ export default function App() {
       </div>
 
       <section className="bars">
-        {ORDER.map((c) => {
+        {visibleCliOrder.map((c) => {
           const d = per[c] || { total: 0, cost: 0, count: 0 }
           return (
             <div className="row" key={c} onClick={() => window.api.openDataDir(c)} title="Open data folder">
@@ -93,26 +108,31 @@ export default function App() {
       </section>
 
       <section className="block">
-        <h3>Top models</h3>
-        {models.slice(0, 5).map((m) => (
-          <div className="line" key={m.model}>
-            <span className="dot sm" style={{ background: CLI[m.cli]?.color }} />
-            <span className="ellipsis">{m.model}</span>
-            <span className="num">{compact(m.total)}</span>
-          </div>
-        ))}
-      </section>
-
-      <section className="block">
-        <h3>{scope === 'all' ? 'Top projects' : 'Recent sessions'}</h3>
-        {recent.slice(0, 6).map((s) => (
-          <div className="line" key={s.cli + s.sessionId}>
-            <span className="dot sm" style={{ background: CLI[s.cli]?.color }} />
-            <span className="ellipsis">{s.project}</span>
-            <span className="muted small">{ago(s.lastTs)}</span>
-            <span className="num">{compact(s.total)}</span>
-          </div>
-        ))}
+        <h3>{activeTab.title}</h3>
+        {activeTab.detail === 'models' ? (
+          <>
+            {models.length === 0 && <div className="empty mini">No model usage in this range.</div>}
+            {models.slice(0, 8).map((m) => (
+              <div className="line" key={m.cli + m.model}>
+                <span className="dot sm" style={{ background: CLI[m.cli]?.color }} />
+                <span className="ellipsis">{m.model}</span>
+                <span className="num">{compact(m.total)}</span>
+              </div>
+            ))}
+          </>
+        ) : (
+          <>
+            {sessions.length === 0 && <div className="empty mini">No sessions in this range.</div>}
+            {sessions.slice(0, 8).map((s) => (
+              <div className="line" key={s.cli + s.sessionId}>
+                <span className="dot sm" style={{ background: CLI[s.cli]?.color }} />
+                <span className="ellipsis">{s.project}</span>
+                <span className="muted small">{ago(s.lastTs)}</span>
+                <span className="num">{compact(s.total)}</span>
+              </div>
+            ))}
+          </>
+        )}
       </section>
       </div>
 

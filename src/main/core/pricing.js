@@ -8,7 +8,10 @@ const TABLE = [
   ['claude-opus', 15, 75, 1.5, 18.75],
   ['claude-sonnet', 3, 15, 0.3, 3.75],
   ['claude-haiku', 0.8, 4, 0.08, 1],
+  ['claude-fable', 3, 15, 0.3, 3.75],
   ['gpt-5', 1.25, 10, 0.125, 1.25],
+  // Cursor's in-house Composer models (via the Cursor API price list).
+  ['composer', 1.25, 10, 0.125, 1.25],
   ['o3', 2, 8, 0.5, 2],
   ['codex', 1.25, 10, 0.125, 1.25],
   // Antigravity records carry display names ("Gemini 3.1 Pro (High)",
@@ -34,8 +37,11 @@ function ratesFor(model) {
   return DEFAULT
 }
 
-// Estimate USD cost for one normalized usage record.
+// Estimate USD cost for one normalized usage record. A record may carry a
+// real `cost` (currently: litellm, which reports actual spend) — prefer that
+// over the estimate table since it's exact, not a guess.
 export function costFor(rec) {
+  if (typeof rec.cost === 'number') return rec.cost
   const [inP, outP, cacheReadP, cacheWriteP] = ratesFor(rec.model)
   return (
     (rec.input * inP +

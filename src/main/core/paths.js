@@ -26,23 +26,39 @@ function migrateLegacyDir() {
 }
 migrateLegacyDir()
 
+// Cursor's globalStorage dir (holds state.vscdb) lives at a different path per
+// OS, unlike the other CLIs' dotfile-style homedir folders.
+const CURSOR_STORAGE_DIR =
+  process.platform === 'darwin'
+    ? path.join(home, 'Library', 'Application Support', 'Cursor', 'User', 'globalStorage')
+    : process.platform === 'win32'
+      ? path.join(home, 'AppData', 'Roaming', 'Cursor', 'User', 'globalStorage')
+      : path.join(home, '.config', 'Cursor', 'User', 'globalStorage')
+
 // Primary (local) data dirs for each CLI; overridable via env for testing.
 const PRIMARY = {
   claude: process.env.AIMON_CLAUDE_ROOT || path.join(home, '.claude', 'projects'),
   codex: process.env.AIMON_CODEX_ROOT || path.join(home, '.codex', 'sessions'),
   gemini: process.env.AIMON_GEMINI_ROOT || path.join(home, '.gemini', 'tmp'),
   agy: process.env.AIMON_AGY_ROOT || path.join(home, '.gemini', 'antigravity-cli', 'conversations'),
+  cursor: process.env.AIMON_CURSOR_ROOT || CURSOR_STORAGE_DIR,
 }
 
 // Extra roots come from config.extraRoots — typically the same CLI folders
 // copied here from OTHER devices, so their usage gets merged into the totals.
 function loadExtraRoots() {
-  const empty = { claude: [], codex: [], gemini: [], agy: [] }
+  const empty = { claude: [], codex: [], gemini: [], agy: [], cursor: [] }
   try {
     const cfg = JSON.parse(fs.readFileSync(CONFIG_FILE, 'utf8'))
     const e = cfg.extraRoots || {}
     const norm = (v) => (Array.isArray(v) ? v.filter((x) => typeof x === 'string' && x.trim()) : [])
-    return { claude: norm(e.claude), codex: norm(e.codex), gemini: norm(e.gemini), agy: norm(e.agy) }
+    return {
+      claude: norm(e.claude),
+      codex: norm(e.codex),
+      gemini: norm(e.gemini),
+      agy: norm(e.agy),
+      cursor: norm(e.cursor),
+    }
   } catch {
     return empty
   }
@@ -50,12 +66,30 @@ function loadExtraRoots() {
 
 const extra = loadExtraRoots()
 
+// LiteLLM is a self-hosted proxy with no local footprint at all — usage lives
+// only in its admin API — so unlike every other CLI it has no roots/files,
+// just a base URL + admin key read from config.json (never hardcoded/committed).
+function loadLitellmConfig() {
+  try {
+    const cfg = JSON.parse(fs.readFileSync(CONFIG_FILE, 'utf8'))
+    const l = cfg.litellm || {}
+    const baseUrl = typeof l.baseUrl === 'string' ? l.baseUrl.trim().replace(/\/+$/, '') : ''
+    const apiKey = typeof l.apiKey === 'string' ? l.apiKey.trim() : ''
+    return baseUrl && apiKey ? { baseUrl, apiKey } : null
+  } catch {
+    return null
+  }
+}
+
+export const LITELLM_CONFIG = loadLitellmConfig()
+
 // All roots to scan per CLI: local first, then extra dirs from other devices.
 export const CLI_ROOTS = {
   claude: [PRIMARY.claude, ...extra.claude],
   codex: [PRIMARY.codex, ...extra.codex],
   gemini: [PRIMARY.gemini, ...extra.gemini],
   agy: [PRIMARY.agy, ...extra.agy],
+  cursor: [PRIMARY.cursor, ...extra.cursor],
 }
 
 export const CLI_META = {
@@ -63,13 +97,17 @@ export const CLI_META = {
   codex: { label: 'Codex', color: '#10a37f', root: PRIMARY.codex },
   gemini: { label: 'Gemini', color: '#4285f4', root: PRIMARY.gemini },
   agy: { label: 'Antigravity', color: '#a142f4', root: PRIMARY.agy },
+  cursor: { label: 'Cursor', color: '#6366f1', root: PRIMARY.cursor },
+  // No local root — "open data dir" points at the config file's folder instead,
+  // since that's the only local artifact this integration has.
+  litellm: { label: 'LiteLLM', color: '#f59e0b', root: CONFIG_DIR },
 }
 
 export const CLIS = Object.keys(CLI_META)
 
 // Number of extra (other-device) roots configured, for display.
 export const EXTRA_ROOT_COUNT =
-  extra.claude.length + extra.codex.length + extra.gemini.length + extra.agy.length
+  extra.claude.length + extra.codex.length + extra.gemini.length + extra.agy.length + extra.cursor.length
 
 // Create a commented template on first run so users know what to edit.
 export function ensureConfigFile() {
@@ -85,8 +123,13 @@ export function ensureConfigFile() {
         gemini: 'D:/from-laptop/.gemini/tmp',
         claude: 'D:/from-laptop/.claude/projects',
         agy: 'D:/from-laptop/.gemini/antigravity-cli/conversations',
+        cursor: 'D:/from-laptop/AppData/Roaming/Cursor/User/globalStorage',
       },
-      extraRoots: { claude: [], codex: [], gemini: [], agy: [] },
+      extraRoots: { claude: [], codex: [], gemini: [], agy: [], cursor: [] },
+      _litellmComment:
+        'Optional: track usage from a self-hosted LiteLLM proxy via its admin API. ' +
+        'Leave apiKey empty to disable. apiKey is an admin/management key, not a per-user key.',
+      litellm: { baseUrl: '', apiKey: '' },
     }
     fs.writeFileSync(CONFIG_FILE, JSON.stringify(template, null, 2))
   } catch {
