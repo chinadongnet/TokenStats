@@ -2,7 +2,7 @@
 
 ## Project Structure & Module Organization
 
-TokenStats is an Electron/Vite desktop app. Main-process code lives in `src/main`, with core logic in `src/main/core` and CLI parsers in `src/main/core/parsers`. The preload bridge is `src/preload/index.js`. The React renderer is in `src/renderer/src`, including `App.jsx`, `Report.jsx`, `main.jsx`, and `styles.css`. Static app resources belong in `resources`. Build output is generated in `out` and packaged artifacts in `dist`; do not edit either by hand.
+TokenStats is an Electron/Vite desktop app. Main-process code lives in `src/main`, with core logic in `src/main/core` and CLI parsers in `src/main/core/parsers`. The preload bridge is `src/preload/index.js`. The React renderer is in `src/renderer/src`, including `App.jsx`, `Report.jsx`, `Settings.jsx`, `main.jsx`, and `styles.css`. Static app resources belong in `resources`. Build output is generated in `out` and packaged artifacts in `dist`; do not edit either by hand.
 
 ## Build, Test, and Development Commands
 

@@ -68,7 +68,11 @@ const extra = loadExtraRoots()
 
 // LiteLLM is a self-hosted proxy with no local footprint at all — usage lives
 // only in its admin API — so unlike every other CLI it has no roots/files,
-// just a base URL + admin key read from config.json (never hardcoded/committed).
+// just a base URL + admin key. As of the multi-provider Settings feature,
+// LiteLLM providers are stored in the usage.sqlite DB instead (see db.js's
+// litellm_providers table), not config.json. This single-provider config.json
+// reader is kept ONLY so migrateLitellm.js can do a one-time import of a
+// pre-existing config into the DB on first run after upgrading.
 function loadLitellmConfig() {
   try {
     const cfg = JSON.parse(fs.readFileSync(CONFIG_FILE, 'utf8'))
@@ -83,6 +87,11 @@ function loadLitellmConfig() {
 
 export const LITELLM_CONFIG = loadLitellmConfig()
 
+// Default color for the LiteLLM Settings UI's "add provider" form and for the
+// one-time config.json migration — the single canonical source other than the
+// (necessarily duplicated) literal copies in App.jsx/Report.jsx/Settings.jsx.
+export const LITELLM_DEFAULT_COLOR = '#f59e0b'
+
 // All roots to scan per CLI: local first, then extra dirs from other devices.
 export const CLI_ROOTS = {
   claude: [PRIMARY.claude, ...extra.claude],
@@ -92,15 +101,16 @@ export const CLI_ROOTS = {
   cursor: [PRIMARY.cursor, ...extra.cursor],
 }
 
+// The 5 fixed, hardcoded CLIs. LiteLLM providers are NOT listed here — they're
+// dynamic, DB-backed pseudo-CLIs (`litellm:<providerId>`) built at runtime by
+// store.js from the Settings UI's provider rows, so N of them can exist
+// alongside these 5 without any code change per provider.
 export const CLI_META = {
   claude: { label: 'Claude Code', color: '#d97757', root: PRIMARY.claude },
   codex: { label: 'Codex', color: '#10a37f', root: PRIMARY.codex },
   gemini: { label: 'Gemini', color: '#4285f4', root: PRIMARY.gemini },
   agy: { label: 'Antigravity', color: '#a142f4', root: PRIMARY.agy },
   cursor: { label: 'Cursor', color: '#6366f1', root: PRIMARY.cursor },
-  // No local root — "open data dir" points at the config file's folder instead,
-  // since that's the only local artifact this integration has.
-  litellm: { label: 'LiteLLM', color: '#f59e0b', root: CONFIG_DIR },
 }
 
 export const CLIS = Object.keys(CLI_META)

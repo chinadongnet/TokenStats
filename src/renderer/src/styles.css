@@ -170,3 +170,34 @@ footer {
 .reqtable .cost { color: #7ee0b8; }
 .reqtable .dot { display: inline-block; width: 8px; height: 8px; border-radius: 50%; }
 .rwsub { color: var(--muted); font-size: 10px; margin-top: 2px; }
+
+/* --- settings: provider form + per-model rows --- */
+.field { display: flex; flex-direction: column; gap: 4px; }
+.field label { font-size: 11px; color: var(--muted); text-transform: uppercase; letter-spacing: .4px; }
+.field input[type="text"], .field input[type="number"], .field input[type="password"] {
+  background: var(--panel2); border: 1px solid var(--line); color: var(--text);
+  border-radius: 8px; padding: 7px 10px; font-size: 12px; font-family: inherit;
+}
+.field input[type="color"] { width: 40px; height: 30px; padding: 2px; border: 1px solid var(--line); border-radius: 6px; background: var(--panel2); cursor: pointer; }
+.field-row { display: flex; gap: 12px; flex-wrap: wrap; margin-bottom: 12px; }
+.field-row .field { flex: 1; min-width: 140px; }
+.field-row .field.grow { flex: 2; min-width: 220px; }
+.field-row .field.shrink { flex: none; width: 100px; }
+
+.model-row { display: grid; grid-template-columns: 16px 1fr 90px 70px 1fr; align-items: center; gap: 10px; }
+.model-row input[type="text"] {
+  background: var(--panel2); border: 1px solid var(--line); color: var(--text);
+  border-radius: 6px; padding: 5px 8px; font-size: 12px; font-family: inherit; width: 100%;
+}
+.model-row.hidden { opacity: .45; }
+.model-row input[type="checkbox"] { width: 14px; height: 14px; cursor: pointer; }
+
+.provider-title { display: flex; align-items: center; gap: 8px; font-weight: 600; font-size: 13px; }
+.provider-title input[type="text"] {
+  background: transparent; border: none; border-bottom: 1px solid transparent; color: var(--text);
+  font-size: 13px; font-weight: 600; font-family: inherit; padding: 2px 0; min-width: 0;
+}
+.provider-title input[type="text"]:focus { border-bottom-color: var(--line); outline: none; }
+.provider-meta { color: var(--muted); font-size: 11px; margin-top: 2px; }
+.btn.danger { color: #e07e7e; }
+.btn.danger:hover:not(:disabled) { background: rgba(224,126,126,.12); }

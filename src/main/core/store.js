@@ -7,17 +7,10 @@ import { codex } from './parsers/codex.js'
 import { geminiJsonl, geminiJson } from './parsers/gemini.js'
 import { antigravity } from './parsers/antigravity.js'
 import { cursor } from './parsers/cursor.js'
-import { litellm } from './parsers/litellm.js'
 import { costFor } from './pricing.js'
 import { CLIS } from './paths.js'
 
 const PARSERS = [claude, codex, geminiJsonl, geminiJson, antigravity, cursor]
-
-// Pollers are usage sources with no local files to watch (currently just
-// LiteLLM, whose usage lives entirely on the proxy server) — polled on a
-// timer instead of via chokidar. Each exposes `cli` and an async `poll()`
-// returning the current full record set for that source.
-const POLLERS = [litellm].filter((p) => p.enabled)
 
 // In-memory index of every parsed file:
 //   path -> { parser, size, mtimeMs, state, records[] }
@@ -30,6 +23,27 @@ export class Store extends EventEmitter {
     this.watchers = []
     this._scanTimer = null
     this._pollTimers = []
+    // Pollers are usage sources with no local files to watch — currently just
+    // LiteLLM providers, whose usage lives entirely on the proxy server(s).
+    // Unlike PARSERS this is NOT a static list: each LiteLLM provider row in
+    // the Settings DB becomes its own poller with a dynamic `litellm:<id>`
+    // cli id, so index.js rebuilds this array (via setPollers()) whenever
+    // providers are added/edited/removed/toggled. Each entry exposes `cli`
+    // and an async `poll()` returning that source's current full record set.
+    this.pollers = []
+  }
+
+  // Replaces the active poller set (called by index.js after any LiteLLM
+  // provider CRUD). Immediately purges live records for any poller that's no
+  // longer present (deleted/disabled provider) so it stops contributing to
+  // totals right away instead of lingering until the next snapshot happens
+  // to overwrite that key.
+  setPollers(pollers) {
+    const keep = new Set(pollers.map((p) => `poller:${p.cli}`))
+    for (const key of this.files.keys()) {
+      if (key.startsWith('poller:') && !keep.has(key)) this.files.delete(key)
+    }
+    this.pollers = pollers
   }
 
   parserFor(file) {
@@ -92,7 +106,7 @@ export class Store extends EventEmitter {
   // calling this often (e.g. on a timer) is cheap.
   async pollAll() {
     let changed = false
-    for (const p of POLLERS) {
+    for (const p of this.pollers) {
       const records = await p.poll()
       const key = `poller:${p.cli}`
       const prev = this.files.get(key)
@@ -100,6 +114,28 @@ export class Store extends EventEmitter {
       this.files.set(key, { parser: p, size: 0, mtimeMs: Date.now(), state: {}, records })
     }
     return changed
+  }
+
+  // Forces one poller to refresh immediately (bypassing its own throttle),
+  // used right after a provider is saved so the UI updates without waiting
+  // for the next timer tick. Returns false if no matching poller is active.
+  async forcePoll(cli) {
+    const p = this.pollers.find((x) => x.cli === cli)
+    if (!p) return false
+    const records = await (p.forceRefresh ? p.forceRefresh() : p.poll())
+    this.files.set(`poller:${cli}`, { parser: p, size: 0, mtimeMs: Date.now(), state: {}, records })
+    return true
+  }
+
+  // Re-applies a poller's live settings (LiteLLM model visibility/rename)
+  // against its already-cached data, with no network call — used right after
+  // a per-model Settings edit. Returns false if no matching poller is active.
+  reapplyPoller(cli) {
+    const p = this.pollers.find((x) => x.cli === cli)
+    if (!p || !p.reapplySettings) return false
+    const records = p.reapplySettings()
+    this.files.set(`poller:${cli}`, { parser: p, size: 0, mtimeMs: Date.now(), state: {}, records })
+    return true
   }
 
   async scanAll() {
@@ -188,9 +224,13 @@ export class Store extends EventEmitter {
     const now = new Date()
     const todayKey = dayKey(now.getTime())
 
+    // 5 fixed built-in CLIs + whatever LiteLLM providers are currently active,
+    // so a dynamic `litellm:<id>` cli id never hits a missing blank accumulator.
+    const dynamicIds = this.pollers.map((p) => p.cli)
+    const allCliIds = [...CLIS, ...dynamicIds]
     const blank = () => ({ total: 0, input: 0, output: 0, cacheRead: 0, cacheCreate: 0, reasoning: 0, cost: 0, count: 0 })
-    const perCli = Object.fromEntries(CLIS.map((c) => [c, blank()]))
-    const todayPerCli = Object.fromEntries(CLIS.map((c) => [c, blank()]))
+    const perCli = Object.fromEntries(allCliIds.map((c) => [c, blank()]))
+    const todayPerCli = Object.fromEntries(allCliIds.map((c) => [c, blank()]))
     const perModel = new Map()
     const todayPerModel = new Map()
     const perDay = new Map() // dayKey -> { [cli]: total }
@@ -210,7 +250,7 @@ export class Store extends EventEmitter {
         add(todayPerModel.get(r.model), r, cost)
       }
 
-      if (!perDay.has(dk)) perDay.set(dk, { day: dk, total: 0, ...Object.fromEntries(CLIS.map((c) => [c, 0])) })
+      if (!perDay.has(dk)) perDay.set(dk, { day: dk, total: 0, ...Object.fromEntries(allCliIds.map((c) => [c, 0])) })
       const d = perDay.get(dk)
       d[r.cli] += r.total
       d.total += r.total
@@ -240,6 +280,9 @@ export class Store extends EventEmitter {
       live: latest
         ? { cli: latest.cli, model: latest.model, project: latest.project, ts: latest.ts }
         : null,
+      // Active LiteLLM providers, for the renderer to merge onto its 5 fixed
+      // built-in CLI entries so each shows up as its own labeled/colored row.
+      providers: this.pollers.map((p) => ({ id: p.cli, label: p.meta.label, color: p.meta.color })),
     }
   }
 
@@ -248,15 +291,19 @@ export class Store extends EventEmitter {
   async start() {
     await this.scanAll()
     await this.pollAll()
-    if (POLLERS.length) {
-      // Each poller throttles its own network calls (see litellm.js); this
-      // timer just needs to fire more often than that throttle window so a
-      // fresh fetch is picked up promptly once it's due.
-      const timer = setInterval(async () => {
-        if (await this.pollAll()) this.emit('update', this.snapshot())
-      }, 5 * 60 * 1000)
-      this._pollTimers.push(timer)
-    }
+    // Always run the poll-check timer, even if there are zero pollers right
+    // now — LiteLLM providers can be added later via the Settings UI (via
+    // setPollers()), and this timer must already be running for a newly
+    // added provider's configurable sync-minutes interval to actually fire
+    // repeatedly rather than only once (from the save-provider handler's
+    // immediate forcePoll()). Each poller throttles its own network calls to
+    // its configured syncMinutes (see litellm.js); this timer just needs to
+    // fire more often than the shortest configured interval so a fresh fetch
+    // is picked up promptly once it's due.
+    const timer = setInterval(async () => {
+      if (await this.pollAll()) this.emit('update', this.snapshot())
+    }, 60 * 1000)
+    this._pollTimers.push(timer)
     const chokidar = (await import('chokidar')).default
     const roots = [...new Set(PARSERS.flatMap((p) => p.roots))]
     for (const root of roots) {

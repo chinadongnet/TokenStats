@@ -13,6 +13,7 @@ contextBridge.exposeInMainWorld('api', {
   hide: () => ipcRenderer.send('hide-window'),
   quit: () => ipcRenderer.send('quit-app'),
   openReport: () => ipcRenderer.send('open-report'),
+  openSettings: () => ipcRenderer.send('open-settings'),
 
   // report window
   reportHourly: (dayStartMs) => ipcRenderer.invoke('report:hourly', dayStartMs),
@@ -27,4 +28,12 @@ contextBridge.exposeInMainWorld('api', {
     ipcRenderer.on('report-updated', handler)
     return () => ipcRenderer.removeListener('report-updated', handler)
   },
+
+  // settings window — multi-provider LiteLLM configuration
+  litellmListProviders: () => ipcRenderer.invoke('litellm:list-providers'),
+  litellmSaveProvider: (provider) => ipcRenderer.invoke('litellm:save-provider', provider),
+  litellmDeleteProvider: (id) => ipcRenderer.invoke('litellm:delete-provider', id),
+  litellmListModels: (conn) => ipcRenderer.invoke('litellm:list-models', conn),
+  litellmGetModelSettings: (providerId) => ipcRenderer.invoke('litellm:get-model-settings', providerId),
+  litellmSaveModelSetting: (setting) => ipcRenderer.invoke('litellm:save-model-setting', setting),
 })
