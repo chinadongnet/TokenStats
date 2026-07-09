@@ -1,14 +1,15 @@
 # TokenStatus
 
 A Windows **system-tray** app that tracks token usage across your local AI coding
-tools — **Claude Code**, **Codex**, **Gemini**, **Antigravity**, and **Cursor** — and
-shows it at a glance.
+tools — **Claude Code**, **Codex**, **Gemini**, **Antigravity**, and **Cursor** — plus
+any number of self-hosted **LiteLLM** proxies, and shows it at a glance.
 
 It reads the transcript/log files each tool already writes to disk, watches them live,
 and surfaces per-CLI / per-model / per-day token counts plus rough cost estimates in a
 little popup that drops down from the tray icon. No accounts, no API keys, no network —
-**except for Cursor**, whose local files carry no real usage data; see
-[Cursor usage](#cursor-usage-the-one-network-exception) below.
+**except for Cursor and LiteLLM**, neither of which has real usage data sitting in a
+local file; see [Cursor usage](#cursor-usage-the-one-network-exception) and
+[LiteLLM providers](#litellm-providers) below.
 
 ```
 System tray:  [▮ AI] ◄ click
@@ -33,6 +34,9 @@ System tray:  [▮ AI] ◄ click
 - 📊 **Usage report** — a full window with **hour-by-hour** and daily charts, per-model
   breakdown, and a one-click **Export PNG**. Backed by a local **SQLite** database
   (`~/.tokenstatus/usage.sqlite`) that records usage at hourly granularity per model.
+- ⚙️ **LiteLLM Settings** — track any number of self-hosted LiteLLM proxies, each with
+  its own name, color, sync frequency, and per-model show/hide + rename. See
+  [LiteLLM providers](#litellm-providers) below.
 
 ## Data sources
 
@@ -43,6 +47,7 @@ System tray:  [▮ AI] ◄ click
 | Gemini      | `~/.gemini/tmp/<project>/chats/session-*.jsonl` (and older `.json`) | per-message `tokens` |
 | Antigravity | `~/.gemini/antigravity-cli/conversations/<uuid>.db` (SQLite) | per-turn usage decoded from a protobuf blob |
 | Cursor      | cursor.com usage export (see below) — **not** local files | per-request token counts |
+| LiteLLM     | your proxy's admin API (see below) — **not** local files | real spend + per-model token counts, polled |
 
 ## Cursor usage (the one network exception)
 
@@ -70,6 +75,30 @@ Trade-offs worth knowing:
   proper usage endpoints, but only to **Team/Organization** API keys — an individual
   account's personal API key can't reach them, which is why this endpoint is used
   instead.
+
+## LiteLLM providers
+
+If you run a self-hosted [LiteLLM](https://docs.litellm.ai/) proxy, TokenStatus can
+track its usage too — unlike the other tools, LiteLLM has no local footprint at all
+(it's a server, not a CLI), so this polls its admin API instead of watching files.
+
+Open **Settings** — the gear icon ⚙ in the tray popup's header, or **Settings…** from
+the tray's right-click menu — to add a provider:
+
+- **Name** and **color**, shown as its own row in the popup and Report, just like a
+  built-in CLI.
+- **Base URL** and an **admin/management API key** (not a per-user key).
+- **Sync frequency** (minutes) — how often TokenStatus polls that proxy.
+- Per-model **show/hide** and **rename** — use "Load models" to see every model the
+  key has usage for, then hide ones you don't want counted or give one a friendlier
+  display name.
+
+You can add multiple providers (e.g. one per team, or per proxy instance); each shows
+up as its own independent row everywhere the built-in CLIs do. Unlike every other
+source here, LiteLLM's admin API reports **actual spend**, not a `pricing.js` estimate.
+
+Provider configuration (including the API key) is stored locally in
+`~/.tokenstatus/usage.sqlite`, never sent anywhere except to the proxy you configured.
 
 ## Multiple devices
 
@@ -121,6 +150,7 @@ npm run package        # -> dist/  (NSIS .exe installer)
   Edit `src/main/core/pricing.js` to match your rates.
 - Claude's totals include cache-read tokens, which accumulate fast on long sessions;
   that's why its token count dwarfs the others. The breakdown is preserved per record.
-- Cursor is the only tool tracked over the network rather than from local files — see
-  [Cursor usage](#cursor-usage-the-one-network-exception) above.
+- Cursor and LiteLLM are the only tools tracked over the network rather than from
+  local files — see [Cursor usage](#cursor-usage-the-one-network-exception) and
+  [LiteLLM providers](#litellm-providers) above.
 - See `CLAUDE.md` for architecture details and how to add another CLI.

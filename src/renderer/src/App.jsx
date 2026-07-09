@@ -1,14 +1,20 @@
-import React, { useEffect, useState } from 'react'
+import React, { useEffect, useMemo, useState } from 'react'
 
-const CLI = {
+// The 5 fixed built-in CLIs. LiteLLM providers are NOT listed here — they're
+// dynamic, DB-backed entries (`litellm:<providerId>`) merged in at render time
+// from the snapshot's `providers` field (see the useMemo below), so N of them
+// can appear alongside these 5 without any code change per provider.
+const FIXED_CLI = {
   claude: { label: 'Claude Code', color: '#d97757' },
   codex: { label: 'Codex', color: '#10a37f' },
   gemini: { label: 'Gemini', color: '#4285f4' },
   agy: { label: 'Antigravity', color: '#a142f4' },
   cursor: { label: 'Cursor', color: '#6366f1' },
-  litellm: { label: 'LiteLLM', color: '#f59e0b' },
 }
-const ORDER = ['claude', 'codex', 'gemini', 'agy', 'cursor', 'litellm']
+const FIXED_ORDER = ['claude', 'codex', 'gemini', 'agy', 'cursor']
+// Cheap insurance for the rare case a snapshot references a provider that was
+// just deleted (stale-by-one-tick), so a lookup never renders `undefined`.
+const FALLBACK_META = (id) => ({ label: id.startsWith('litellm:') ? '(deleted provider)' : id, color: '#5b6172' })
 const DETAIL_TABS = [
   { id: 'today-models', label: 'Today Models', scope: 'today', detail: 'models', title: 'Today models' },
   { id: 'today-sessions', label: 'Today Sessions', scope: 'today', detail: 'sessions', title: 'Today sessions' },
@@ -42,6 +48,16 @@ export default function App() {
     return window.api.onSnapshot(setSnap)
   }, [])
 
+  // 5 fixed built-in CLIs + whatever LiteLLM providers are currently active
+  // (from the live snapshot), so each shows up as its own labeled/colored row.
+  const { CLI, ORDER } = useMemo(() => {
+    const dyn = snap?.providers || []
+    return {
+      CLI: { ...FIXED_CLI, ...Object.fromEntries(dyn.map((p) => [p.id, { label: p.label, color: p.color }])) },
+      ORDER: [...FIXED_ORDER, ...dyn.map((p) => p.id)],
+    }
+  }, [snap?.providers])
+
   if (!snap) return <div className="loading">Scanning CLI logs…</div>
 
   const activeTab = DETAIL_TABS.find((t) => t.id === tab) || DETAIL_TABS[0]
@@ -66,6 +82,7 @@ export default function App() {
         </div>
         <div className="hwin">
           <button className="ghost" title="Usage report" onClick={() => window.api.openReport()}>▤</button>
+          <button className="ghost" title="Settings" onClick={() => window.api.openSettings()}>⚙</button>
           <button className="ghost" title="Refresh" onClick={() => window.api.getSnapshot().then(setSnap)}>⟳</button>
           <button className="ghost" title="Hide" onClick={() => window.api.hide()}>—</button>
         </div>
@@ -114,7 +131,7 @@ export default function App() {
             {models.length === 0 && <div className="empty mini">No model usage in this range.</div>}
             {models.slice(0, 8).map((m) => (
               <div className="line" key={m.cli + m.model}>
-                <span className="dot sm" style={{ background: CLI[m.cli]?.color }} />
+                <span className="dot sm" style={{ background: (CLI[m.cli] || FALLBACK_META(m.cli)).color }} />
                 <span className="ellipsis">{m.model}</span>
                 <span className="num">{compact(m.total)}</span>
               </div>
@@ -125,7 +142,7 @@ export default function App() {
             {sessions.length === 0 && <div className="empty mini">No sessions in this range.</div>}
             {sessions.slice(0, 8).map((s) => (
               <div className="line" key={s.cli + s.sessionId}>
-                <span className="dot sm" style={{ background: CLI[s.cli]?.color }} />
+                <span className="dot sm" style={{ background: (CLI[s.cli] || FALLBACK_META(s.cli)).color }} />
                 <span className="ellipsis">{s.project}</span>
                 <span className="muted small">{ago(s.lastTs)}</span>
                 <span className="num">{compact(s.total)}</span>
@@ -139,8 +156,8 @@ export default function App() {
       <footer>
         {snap.live ? (
           <span className="live">
-            <span className="pulse" style={{ background: CLI[snap.live.cli]?.color }} />
-            {CLI[snap.live.cli]?.label} · {snap.live.model} · {ago(snap.live.ts)}
+            <span className="pulse" style={{ background: (CLI[snap.live.cli] || FALLBACK_META(snap.live.cli)).color }} />
+            {(CLI[snap.live.cli] || FALLBACK_META(snap.live.cli)).label} · {snap.live.model} · {ago(snap.live.ts)}
           </span>
         ) : (
           <span className="muted">No activity yet</span>

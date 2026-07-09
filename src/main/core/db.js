@@ -1,12 +1,15 @@
 import fs from 'node:fs'
 import path from 'node:path'
+import crypto from 'node:crypto'
 import { createRequire } from 'node:module'
 import { CONFIG_DIR } from './paths.js'
 import { costFor } from './pricing.js'
 
 const require = createRequire(import.meta.url)
 
-// SQLite (via sql.js / WASM) persistence of HOURLY usage buckets.
+// SQLite (via sql.js / WASM) persistence of HOURLY usage buckets, plus (since the
+// multi-provider LiteLLM settings feature) the LiteLLM provider configs and
+// per-model visibility/rename settings that used to live in config.json.
 // One row per (local-hour, cli, model); the file is a standard .sqlite that any
 // SQLite tool can open. We re-aggregate from the in-memory records and replace
 // the table, so it always matches what the parsers see — no drift.
@@ -26,6 +29,27 @@ CREATE TABLE IF NOT EXISTS usage_hourly (
   PRIMARY KEY (hour, cli, model)
 );
 CREATE INDEX IF NOT EXISTS idx_usage_hour ON usage_hourly(hour);
+
+CREATE TABLE IF NOT EXISTS litellm_providers (
+  id           TEXT    PRIMARY KEY,
+  name         TEXT    NOT NULL,
+  base_url     TEXT    NOT NULL,
+  api_key      TEXT    NOT NULL,
+  color        TEXT    NOT NULL DEFAULT '#f59e0b',
+  sync_minutes INTEGER NOT NULL DEFAULT 15,
+  enabled      INTEGER NOT NULL DEFAULT 1,
+  created_at   INTEGER NOT NULL,
+  updated_at   INTEGER NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS litellm_model_settings (
+  provider_id  TEXT    NOT NULL,
+  model        TEXT    NOT NULL,
+  visible      INTEGER NOT NULL DEFAULT 1,
+  display_name TEXT,
+  PRIMARY KEY (provider_id, model)
+);
+CREATE INDEX IF NOT EXISTS idx_lms_provider ON litellm_model_settings(provider_id);
 `
 
 export class UsageDb {
@@ -89,6 +113,73 @@ export class UsageDb {
     const data = Buffer.from(this.db.export())
     fs.mkdirSync(path.dirname(this.dbPath), { recursive: true })
     fs.writeFileSync(this.dbPath, data)
+  }
+
+  // ---- LiteLLM provider settings (multi-provider Settings UI) -------------
+
+  listLitellmProviders() {
+    return this.rows('SELECT * FROM litellm_providers ORDER BY created_at ASC').map(mapProviderRow)
+  }
+
+  getLitellmProvider(id) {
+    const r = this.rows('SELECT * FROM litellm_providers WHERE id = ?', [id])[0]
+    return r ? mapProviderRow(r) : null
+  }
+
+  // id absent -> insert a new provider (uuid generated here); id present -> update in place.
+  upsertLitellmProvider({ id, name, baseUrl, apiKey, color, syncMinutes, enabled }) {
+    const now = Date.now()
+    const existing = id ? this.getLitellmProvider(id) : null
+    const row = {
+      id: existing ? id : id || crypto.randomUUID(),
+      name,
+      baseUrl,
+      apiKey,
+      color: color || '#f59e0b',
+      syncMinutes: Number(syncMinutes) > 0 ? Number(syncMinutes) : 15,
+      enabled: enabled !== false ? 1 : 0,
+    }
+    if (existing) {
+      this.db.run(
+        'UPDATE litellm_providers SET name=?, base_url=?, api_key=?, color=?, sync_minutes=?, enabled=?, updated_at=? WHERE id=?',
+        [row.name, row.baseUrl, row.apiKey, row.color, row.syncMinutes, row.enabled, now, row.id]
+      )
+    } else {
+      this.db.run(
+        'INSERT INTO litellm_providers (id,name,base_url,api_key,color,sync_minutes,enabled,created_at,updated_at) VALUES (?,?,?,?,?,?,?,?,?)',
+        [row.id, row.name, row.baseUrl, row.apiKey, row.color, row.syncMinutes, row.enabled, now, now]
+      )
+    }
+    this.persist()
+    return this.getLitellmProvider(row.id)
+  }
+
+  deleteLitellmProvider(id) {
+    this.db.run('DELETE FROM litellm_providers WHERE id = ?', [id])
+    this.db.run('DELETE FROM litellm_model_settings WHERE provider_id = ?', [id])
+    this.persist()
+  }
+
+  listModelSettings(providerId) {
+    return this.rows('SELECT * FROM litellm_model_settings WHERE provider_id = ?', [providerId]).map(mapSettingRow)
+  }
+
+  // Hot path for the poller: called on every poll() to re-apply live visibility/rename.
+  getModelSettingsMap(providerId) {
+    const map = new Map()
+    for (const s of this.listModelSettings(providerId)) map.set(s.model, s)
+    return map
+  }
+
+  saveModelSetting({ providerId, model, visible, displayName }) {
+    const v = visible !== false ? 1 : 0
+    const name = typeof displayName === 'string' && displayName.trim() ? displayName.trim() : null
+    this.db.run(
+      `INSERT INTO litellm_model_settings (provider_id, model, visible, display_name) VALUES (?,?,?,?)
+       ON CONFLICT(provider_id, model) DO UPDATE SET visible=excluded.visible, display_name=excluded.display_name`,
+      [providerId, model, v, name]
+    )
+    this.persist()
   }
 
   // ---- queries for the report ---------------------------------------------
@@ -156,4 +247,22 @@ export function floorDayLocal(ts) {
   const d = new Date(ts)
   d.setHours(0, 0, 0, 0)
   return d.getTime()
+}
+
+function mapProviderRow(r) {
+  return {
+    id: r.id,
+    name: r.name,
+    baseUrl: r.base_url,
+    apiKey: r.api_key,
+    color: r.color,
+    syncMinutes: r.sync_minutes,
+    enabled: !!r.enabled,
+    createdAt: r.created_at,
+    updatedAt: r.updated_at,
+  }
+}
+
+function mapSettingRow(r) {
+  return { model: r.model, visible: !!r.visible, displayName: r.display_name || null }
 }

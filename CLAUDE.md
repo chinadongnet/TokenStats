@@ -6,10 +6,10 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 TokenStatus is a Windows system-tray app that tracks token usage across five local
 AI coding tools — **Claude Code**, **Codex**, **Gemini**, **Antigravity** (`agy`), and the
-**Cursor** IDE — plus a self-hosted **LiteLLM** proxy, by parsing the transcript/log
-files each local tool writes to disk (and, for LiteLLM, polling its admin API). It
-watches those files live and shows per-CLI / per-model / per-day token counts and cost
-in a tray popup.
+**Cursor** IDE — plus any number of self-hosted **LiteLLM** proxies, by parsing the
+transcript/log files each local tool writes to disk (and, for LiteLLM, polling its
+admin API). It watches those files live and shows per-CLI / per-model / per-day token
+counts and cost in a tray popup.
 
 All data comes from reading local files, with **two exceptions**:
 - Cursor's local files carry no real token counts (see below), so `parsers/cursor.js`
@@ -20,6 +20,14 @@ All data comes from reading local files, with **two exceptions**:
   source, this one reports **real spend** (not a `pricing.js` estimate); see below.
 Both were added at the user's explicit request/approval after confirming the
 local-only approach returns no data; every other CLI stays fully offline.
+
+Unlike the 5 fixed built-in CLIs, LiteLLM is **multi-instance**: the Settings window
+(`Settings.jsx`, opened via the tray popup's gear icon or right-click menu) lets a
+user configure any number of LiteLLM "providers" (name, base URL, admin key, UI
+color, sync-minutes, per-model show/hide + rename), stored in `usage.sqlite` (not
+`config.json`). Each enabled provider becomes its own dynamic pseudo-CLI
+(`litellm:<providerId>`) and shows up as its own row everywhere a built-in CLI would
+— see "Dynamic LiteLLM providers" under Conventions below.
 
 ## Commands
 
@@ -57,7 +65,12 @@ testable via `npm run test:parsers`.
   *normalized records* (below).
   Gemini ships two parser objects (`geminiJsonl` + `geminiJson`) sharing one root.
   `parsers/litellm.js` is the odd one out — it has no roots/files at all (see below)
-  and is registered in `store.js`'s separate `POLLERS` array, not `PARSERS`.
+  and isn't in `PARSERS` at all: it exports a `createLitellmPoller({id, name, baseUrl,
+  apiKey, color, syncMinutes, getModelSettings})` factory (one call per configured
+  provider, made by `index.js`'s `refreshLitellmPollers()`) plus a throttle-free
+  `listModels({baseUrl, apiKey})` used by the Settings UI's "load models"/"test
+  connection" actions. `store.js` holds the resulting pollers in an instance field
+  (`this.pollers`), not a static array — see "Pollers" below.
 - **`store.js`** — the engine core. Walks each root, reads files, and holds an
   in-memory index `Map<path, {parser, size, mtimeMs, state, records[]}>`.
   - JSONL files (Claude, Codex) are **tailed incrementally** from the last byte
@@ -88,43 +101,78 @@ testable via `npm run test:parsers`.
     notice**; re-validate the endpoint and CSV column names (looked up by header
     name, not position) after Cursor updates. Full investigation and rationale are
     in the header comment of `parsers/cursor.js`.
-  - **LiteLLM** (`parsers/litellm.js`) is polled, not file-watched — see "Pollers"
-    below.
+  - **LiteLLM** providers are polled, not file-watched — see "Pollers" below.
   - `snapshot()` aggregates all records into per-CLI / per-model / per-day buckets,
-    today-vs-all-time, recent sessions, and the current "live" model. This is the only
-    object the UI consumes.
+    today-vs-all-time, recent sessions, and the current "live" model, over
+    `[...CLIS, ...dynamicIds]` (the 5 fixed CLIs plus every currently-active LiteLLM
+    provider's `litellm:<id>`) so a dynamic id never hits a missing accumulator. It
+    also returns a `providers: [{id, label, color}]` field — the only way the
+    renderer learns provider names/colors, since it has no other route to the DB.
+    This is the only object the UI consumes.
   - `start()` does the initial scan, then sets up `chokidar` watchers and emits
     debounced `'update'` events (400ms) carrying a fresh snapshot.
-  - **Pollers** (`store.js`'s `POLLERS` array, currently just `litellm`) are usage
-    sources with nothing on disk to watch. `pollAll()` calls each poller's `poll()`
-    and stores the returned records under a synthetic `poller:<cli>` key in the same
-    `this.files` map file entries use, so `allRecords()`/`dedupedRecords()` pick them
-    up unchanged. `start()` calls `pollAll()` once, then re-polls on a 5-minute timer;
-    each poller does its own internal throttling/caching (LiteLLM: 15 min) so the
-    timer firing often is cheap. A poller is only added to `POLLERS` if its config is
-    present (`litellm.enabled`), so an unconfigured LiteLLM makes zero network calls.
+  - **Pollers** (`this.pollers`, an **instance field**, not a static array) are usage
+    sources with nothing on disk to watch — currently only LiteLLM providers, one
+    poller per enabled provider row. `index.js`'s `refreshLitellmPollers()` rebuilds
+    this array from `db.listLitellmProviders()` on startup and after any Settings CRUD
+    (`store.setPollers()` — purges `poller:<cli>` file entries for removed/disabled
+    providers immediately so they stop contributing right away). `pollAll()` calls
+    each poller's `poll()` and stores the returned records under a synthetic
+    `poller:<cli>` key in the same `this.files` map file entries use, so
+    `allRecords()`/`dedupedRecords()` pick them up unchanged. `start()` always runs a
+    60s poll-check timer regardless of whether any pollers exist yet (a provider can
+    be added later via Settings); each poller throttles its own network calls to its
+    configured `syncMinutes` (default 15) so the timer firing often is cheap.
+    `store.forcePoll(cli)` / `store.reapplyPoller(cli)` let `index.js` push an
+    immediate update after a Settings change — `forcePoll` bypasses the fetch
+    throttle (new/edited provider), `reapplyPoller` re-runs visibility/rename against
+    already-cached data with **no network call** (model show/hide/rename edits).
 - **`pricing.js`** — rough USD-per-million-token table, matched by model-id substring.
   Cost figures are **estimates**, clearly labelled in the UI, for every source except
   LiteLLM — `costFor(rec)` returns `rec.cost` directly when a record carries one
   (LiteLLM's admin API reports actual spend, so its records aren't estimated at all).
   Edit the table freely.
-- **`db.js`** — SQLite (via `sql.js` WASM, no native build) persistence of **hourly**
-  usage buckets at `~/.tokenstatus/usage.sqlite`. `UsageDb.ingest(records)` re-aggregates
-  the full record set into one row per `(local-hour, cli, model)` and **replaces** the
-  table (so it never drifts from the parsers), then exports the DB to disk. Query helpers
-  `hourly(dayStart)`, `daily(from,to)`, `models(from,to)`, `span()` feed the report.
-  Stays pure-Node (loads the wasm via `wasmBinary`), so it's testable with
-  `node scripts/test-db.mjs`.
-- **`paths.js`** — resolves the data roots and reads user config. Each CLI has an
-  array of roots (`CLI_ROOTS[cli]`): the local dir first (overridable via `AIMON_*_ROOT`
-  env vars), then any **extra dirs** listed under `extraRoots` in
+- **`db.js`** — SQLite (via `sql.js` WASM, no native build) persistence at
+  `~/.tokenstatus/usage.sqlite`, split across three concerns:
+  - **hourly usage** — `UsageDb.ingest(records)` re-aggregates the full record set
+    into one row per `(local-hour, cli, model)` in `usage_hourly` and **replaces** the
+    table (so it never drifts from the parsers), then exports the DB to disk. Query
+    helpers `hourly(dayStart)`, `daily(from,to)`, `models(from,to)`, `span()` feed the
+    report.
+  - **LiteLLM provider config** — `litellm_providers` (id, name, base_url, api_key,
+    color, sync_minutes, enabled) — the DB-backed replacement for the old single
+    `config.json` `litellm` block. CRUD: `listLitellmProviders()`,
+    `getLitellmProvider(id)`, `upsertLitellmProvider({id?, ...})` (id absent →
+    `crypto.randomUUID()`), `deleteLitellmProvider(id)` (cascades to its model
+    settings).
+  - **per-model visibility/rename** — `litellm_model_settings` (provider_id, model,
+    visible, display_name), one row per model a user has explicitly hidden or
+    renamed (unlisted models default to visible, no rename). CRUD:
+    `listModelSettings(providerId)`, `getModelSettingsMap(providerId)` (hot path —
+    called on every poller `poll()`/`reapplySettings()`), `saveModelSetting({...})`
+    (upsert via `ON CONFLICT`).
+  Every mutating method ends with `persist()` (whole-file re-export + write, same as
+  `ingest()` — no WAL). Stays pure-Node (loads the wasm via `wasmBinary`), so it's
+  testable with `node scripts/test-db.mjs`.
+- **`paths.js`** — resolves the data roots and reads user config. Each of the 5 fixed
+  CLIs has an array of roots (`CLI_ROOTS[cli]`): the local dir first (overridable via
+  `AIMON_*_ROOT` env vars), then any **extra dirs** listed under `extraRoots` in
   `~/.tokenstatus/config.json` (override path via `AIMON_CONFIG`). Extra roots are how
   **other devices' usage is merged** — copy another machine's `.codex/.gemini/.claude`
   data folder locally and add its path. `ensureConfigFile()` writes a template on first
-  run. Also exposes per-CLI display metadata (label, color, primary root) and the
-  LiteLLM connection config (`config.litellm.{baseUrl,apiKey}`, both required or the
-  integration stays disabled) as `LITELLM_CONFIG` — never hardcode a LiteLLM key in
-  source; it only ever comes from the user's local, gitignored config file.
+  run. Also exposes per-CLI display metadata (label, color, primary root) as
+  `CLI_META`/`CLIS` — **LiteLLM is deliberately absent from both**, since it's no
+  longer a fixed CLI (see `migrateLitellm.js` below). `LITELLM_CONFIG`/
+  `loadLitellmConfig()` (the old single-provider `config.litellm.{baseUrl,apiKey}`
+  reader) and `LITELLM_DEFAULT_COLOR` are kept, but **only** for the one-time
+  migration and as the Settings UI's new-provider color default — nothing in the live
+  poller path reads `LITELLM_CONFIG` anymore.
+- **`migrateLitellm.js`** — `migrateLegacyLitellmConfig(db)`, called once from
+  `index.js`'s `init()` right after opening the DB. If a legacy `config.json`
+  `litellm` block exists and the DB has zero providers yet, creates one provider row
+  from it (named "LiteLLM"); a no-op on every startup after that, or if the user never
+  had one. The old `config.json` block is left in place untouched (harmless dead
+  config) — kept only so this migration stays possible if the DB is ever wiped.
 
 ### Normalized record
 
@@ -162,12 +210,27 @@ figure (currently only LiteLLM sets this).
   scrolls internally when content is taller (see `App.jsx`). `sizeWindow()` +
   `positionWindow()` run on every `showWindow()` and on `screen`'s
   `'display-metrics-changed'`, so a live resolution/DPI switch re-fits the popup.
+
+  Also owns the **Settings window** (`openSettings` — a resizable window loading the
+  renderer with `#settings`, mirroring `openReport`'s pattern), opened via the tray
+  popup's gear icon or the tray right-click menu's "Settings…" item. All
+  `litellm:*` IPC handlers (`list-providers`, `save-provider`, `delete-provider`,
+  `list-models`, `get-model-settings`, `save-model-setting`) live here; a save/delete
+  calls `refreshLitellmPollers()` to rebuild `store.pollers` from the DB, then either
+  `store.forcePoll()` (new/edited connection — bypasses the fetch throttle) or
+  `store.reapplyPoller()` (model visibility/rename — no network call), then
+  `broadcastSnapshot()` to push the change to the popup/tray/DB immediately instead of
+  waiting for the next poll timer tick. `dynamicCliMeta` (module-level, kept in sync
+  by `refreshLitellmPollers()`) is consulted alongside the static `CLI_META` wherever
+  a lookup needs to resolve a `litellm:<id>` (tray recolor in `updateTray()`,
+  `open-data-dir`'s `shell.openExternal(provider.baseUrl)` fallback for providers).
 - **`trayIcon.js`** — renders the tray icon at runtime as a raw BGRA bitmap
   (`nativeImage.createFromBitmap`) so no image asset files are needed; recolored by the
-  most recently active CLI.
+  most recently active CLI (built-in or dynamic LiteLLM provider).
 - **`src/preload/index.js`** — CommonJS (`require`) contextBridge exposing
-  `window.api`: `getSnapshot`, `onSnapshot`, `openDataDir`, `hide`, `quit`. Built to
-  `out/preload/index.cjs`; `index.js` references it by the `.cjs` extension.
+  `window.api`: `getSnapshot`, `onSnapshot`, `openDataDir`, `hide`, `quit`,
+  `openSettings`, plus the `litellm*` methods mirroring the IPC handlers above. Built
+  to `out/preload/index.cjs`; `index.js` references it by the `.cjs` extension.
 
   Main also owns the **SQLite ingest** (throttled to ≤ once / 4s via `scheduleIngest`,
   forced on report open and manual refresh), the **report window** (`openReport` — a
@@ -177,29 +240,55 @@ figure (currently only LiteLLM sets this).
 
 ### Renderer — `src/renderer/`
 
-React + Vite, two views selected by URL hash in `main.jsx`:
+React + Vite, three views selected by URL hash in `main.jsx`:
 - **`App.jsx`** — the tray popup. Reads the snapshot via `window.api`, subscribes to live
   updates, renders the hero total, per-CLI bars, top models, recent sessions, live
-  indicator. Header has a Report button (`window.api.openReport()`). Header, tabs and
-  footer are pinned; the middle sits in a `.scroll` region (`flex:1; min-height:0;
-  overflow-y:auto`) so the content is never clipped when the window is shorter than the
-  content — which is what makes the height-capping in `index.js` safe.
+  indicator. Header has Report/Settings buttons (`window.api.openReport()`/
+  `openSettings()`). Header, tabs and footer are pinned; the middle sits in a
+  `.scroll` region (`flex:1; min-height:0; overflow-y:auto`) so the content is never
+  clipped when the window is shorter than the content — which is what makes the
+  height-capping in `index.js` safe.
 - **`Report.jsx`** (`#report`) — the usage report window. Pulls hourly/daily/model data
   from the SQLite DB via IPC and draws hand-rolled **SVG stacked-bar charts** (no chart
   lib): by-hour for a chosen day, daily trend over a range (7d/30d/all), per-model
   breakdown, summary tiles. The **Export PNG** button calls `window.api.exportPng()`.
-No router, no state library.
+- **`Settings.jsx`** (`#settings`) — LiteLLM provider management: add/edit/delete
+  provider cards (name, color, base URL, admin key, sync minutes), a "Test
+  connection"/"Models" action that calls `litellmListModels()` (throttle-free, works
+  for an unsaved draft), and per-model checkboxes (visible) + rename inputs that call
+  `litellmSaveModelSetting()` on change/blur.
+
+Both `App.jsx` and `Report.jsx` merge the 5 fixed built-in CLIs with the currently
+active LiteLLM providers into local `CLI`/`ORDER` — see "Dynamic LiteLLM providers"
+below. No router, no state library.
 
 ## Conventions and gotchas
 
 - **`"type": "module"`** — the whole project is ESM. The standalone test script is
   `.mjs`; the preload is emitted as CommonJS `.cjs` (sandbox requires `require`).
-- **Adding a CLI**: add `parsers/<cli>.js` implementing the parser contract, register
-  it in `store.js`'s `PARSERS` array, add metadata in `paths.js` and `App.jsx`'s `CLI`/
-  `ORDER` (and `Report.jsx`'s, which duplicates them), and a pricing row. Nothing else
-  needs to change. If the source has no local files (network-only, like LiteLLM),
-  implement `{ cli, enabled, poll() }` instead and register it in `store.js`'s
-  `POLLERS` array rather than `PARSERS`.
+- **Adding a fixed CLI**: add `parsers/<cli>.js` implementing the parser contract,
+  register it in `store.js`'s `PARSERS` array, add metadata in `paths.js`'s
+  `CLI_META` and `App.jsx`'s `FIXED_CLI`/`FIXED_ORDER` (and `Report.jsx`'s, which
+  duplicates them), and a pricing row. Nothing else needs to change. This path is for
+  CLIs with local files to watch; it's how the 5 built-ins (claude/codex/gemini/
+  agy/cursor) work.
+- **Adding a LiteLLM provider** is a *user* action, not a code change: the Settings
+  UI writes a row to `usage.sqlite`'s `litellm_providers` table, and it becomes a
+  dynamic pseudo-CLI (`litellm:<providerId>`) automatically — see "Dynamic LiteLLM
+  providers" below. Only touch `parsers/litellm.js`/`db.js` when changing behavior
+  that applies to *every* provider (e.g. the admin API shape, or what a "model
+  setting" can control), never per-provider.
+- **Dynamic LiteLLM providers**: unlike the 5 fixed CLIs, LiteLLM providers aren't
+  hardcoded anywhere — `store.snapshot()` returns a `providers: [{id, label, color}]`
+  field built from `this.pollers` (each `litellm:<id>`), and `App.jsx`/`Report.jsx`
+  merge that onto their `FIXED_CLI`/`FIXED_ORDER` constants in a `useMemo` to build
+  the `CLI`/`ORDER` used for rendering (`Report.jsx` has no live snapshot, so it
+  fetches `window.api.litellmListProviders()` directly instead). Both files pass
+  `CLI`/`ORDER` down as props to their `Legend`/`StackedBars`/`RequestLog` helper
+  components rather than reading module-level constants. Because the hourly SQLite
+  table can outlive a deleted provider, every `CLI[id]` lookup outside an
+  `ORDER`-driven loop goes through a `FALLBACK_META(id)`/`metaFor()` helper instead
+  of risking `undefined`.
 - **Data formats are version-specific**: these parsers were written against observed
   on-disk shapes (Claude `message.usage`, Codex `event_msg`/`token_count`
   `total_token_usage`, Gemini `gemini`-type messages' `tokens`). A CLI update can change
@@ -225,12 +314,14 @@ No router, no state library.
 - "Today" uses the **local** calendar day so it matches the user's wall clock.
 - **LiteLLM** (`parsers/litellm.js`) polls `{baseUrl}/user/daily/activity`, an
   internal/undocumented admin endpoint (not the documented public LiteLLM API) —
-  re-validate its response shape after LiteLLM upgrades. Two quirks to know:
+  re-validate its response shape after LiteLLM upgrades. Quirks to know:
   - Its `page`/`total_pages` pagination is **not day-aligned** — a single date's
     per-model rows can be split across adjacent pages. The parser just flattens
     every per-model/per-key leaf across every page it fetches (35-day lookback,
     capped at 40 pages/poll); leaves don't repeat across pages in practice, and
-    `dedupKey` (`litellm:<date>:<model>:<keyHash>`) makes it harmless if they did.
+    `dedupKey` (`litellm:<providerId>:<date>:<model>:<keyHash>` — namespaced by
+    provider since the multi-provider Settings feature, so two providers can never
+    collide on the same date/model/keyHash) makes it harmless if they did.
   - It has no per-request timestamps, only a day + model + API-key breakdown, so
     one record = one (day, model, key) bucket, timestamped at noon UTC for that day
     (keeps it inside the same local calendar day everywhere, for "today" bucketing).
@@ -239,3 +330,15 @@ No router, no state library.
   - Buckets with zero `total_tokens` (a model that only ever failed) are dropped
     entirely, so models with no real usage never show up in the model breakdown —
     intentional per user request, not a bug if you see registered models missing.
+  - Per-provider **model visibility/rename** (`litellm_model_settings` in `db.js`) is
+    applied as the *last* step, in `applyModelSettings()`, after `dedupKey` is
+    computed from the raw API model id — so renaming a model's display name never
+    perturbs dedup/grouping identity, and hiding a model drops its records entirely
+    (same "zero-usage dropped" precedent as above). This is safe against
+    `pricing.js`'s cost estimate table too: `costFor()` prefers a record's real
+    `cost` over any model-name lookup, and LiteLLM records always carry one.
+  - `test:parsers`/`test:db` (the headless scripts) don't wire any LiteLLM pollers —
+    they only exercise `PARSERS` (file-based CLIs). LiteLLM pollers are built
+    exclusively by `index.js`'s `refreshLitellmPollers()` from DB provider rows, so
+    testing LiteLLM changes requires the real Electron app (`npm run dev`) with at
+    least one provider configured via Settings.
