@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## What this is
 
-TokenStatus is a Windows system-tray app that tracks token usage across five local
+TokenStats is a Windows system-tray app that tracks token usage across five local
 AI coding tools — **Claude Code**, **Codex**, **Gemini**, **Antigravity** (`agy`), and the
 **Cursor** IDE — plus any number of self-hosted **LiteLLM** proxies, by parsing the
 transcript/log files each local tool writes to disk (and, for LiteLLM, polling its
@@ -133,7 +133,7 @@ testable via `npm run test:parsers`.
   (LiteLLM's admin API reports actual spend, so its records aren't estimated at all).
   Edit the table freely.
 - **`db.js`** — SQLite (via `sql.js` WASM, no native build) persistence at
-  `~/.tokenstatus/usage.sqlite`, split across three concerns:
+  `~/.TokenStats/usage.sqlite`, split across three concerns:
   - **hourly usage** — `UsageDb.ingest(records)` re-aggregates the full record set
     into one row per `(local-hour, cli, model)` in `usage_hourly` and **replaces** the
     table (so it never drifts from the parsers), then exports the DB to disk. Query
@@ -157,7 +157,7 @@ testable via `npm run test:parsers`.
 - **`paths.js`** — resolves the data roots and reads user config. Each of the 5 fixed
   CLIs has an array of roots (`CLI_ROOTS[cli]`): the local dir first (overridable via
   `AIMON_*_ROOT` env vars), then any **extra dirs** listed under `extraRoots` in
-  `~/.tokenstatus/config.json` (override path via `AIMON_CONFIG`). Extra roots are how
+  `~/.TokenStats/config.json` (override path via `AIMON_CONFIG`). Extra roots are how
   **other devices' usage is merged** — copy another machine's `.codex/.gemini/.claude`
   data folder locally and add its path. `ensureConfigFile()` writes a template on first
   run. Also exposes per-CLI display metadata (label, color, primary root) as

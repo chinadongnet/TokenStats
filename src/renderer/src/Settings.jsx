@@ -80,7 +80,7 @@ export default function Settings() {
   }
 
   async function deleteProvider(p) {
-    if (!window.confirm(`Delete provider "${p.name}"? TokenStatus will stop tracking its usage.`)) return
+    if (!window.confirm(`Delete provider "${p.name}"? TokenStats will stop tracking its usage.`)) return
     await window.api.litellmDeleteProvider(p.id)
     if (editingId === p.id) setEditingId(null)
     if (expanded === p.id) setExpanded(null)
@@ -228,7 +228,7 @@ export default function Settings() {
       ))}
 
       <footer className="rep-foot">
-        TokenStatus v{__APP_VERSION__} · provider keys stored locally in ~/.tokenstatus/usage.sqlite
+        TokenStats v{__APP_VERSION__} · provider keys stored locally in ~/.tokenstats/usage.sqlite
       </footer>
     </div>
   )
@@ -306,7 +306,7 @@ function ModelList({ state, onReload, onToggle, onRename, onCommitRename }) {
             type="checkbox"
             checked={r.visible}
             onChange={(e) => onToggle(r.model, e.target.checked)}
-            title="Show in TokenStatus"
+            title="Show in TokenStats"
           />
           <span className="mname" title={r.model}>{r.model}</span>
           <span className="mtok">{compact(r.total)}</span>

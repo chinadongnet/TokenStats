@@ -5,7 +5,7 @@
 // that calls the proxy's admin API with the org's management key.
 //
 // Multiple LiteLLM providers (keys) can be configured via the Settings UI —
-// each is stored as a row in ~/.tokenstatus/usage.sqlite's `litellm_providers`
+// each is stored as a row in ~/.tokenstats/usage.sqlite's `litellm_providers`
 // table (see db.js) and becomes its own poller, tagged with a pseudo-CLI id
 // `litellm:<providerId>` so it shows up as an independent row everywhere a
 // built-in CLI (claude/codex/...) would, dynamically instead of hardcoded.

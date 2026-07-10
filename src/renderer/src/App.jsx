@@ -78,7 +78,7 @@ export default function App() {
       <header className="drag">
         <div className="brand">
           <span className="logo" />
-          <span>TokenStatus</span>
+          <span>TokenStats</span>
         </div>
         <div className="hwin">
           <button className="ghost" title="Usage report" onClick={() => window.api.openReport()}>▤</button>

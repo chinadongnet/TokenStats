@@ -6,7 +6,7 @@ const store = new Store()
 console.time('scan')
 await store.scanAll()
 console.timeEnd('scan')
-console.time('poll') // no-op unless litellm is configured in ~/.tokenstatus/config.json
+console.time('poll') // no-op unless litellm is configured in ~/.tokenstats/config.json
 await store.pollAll()
 console.timeEnd('poll')
 

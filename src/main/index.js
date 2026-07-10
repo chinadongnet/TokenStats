@@ -39,8 +39,8 @@ if (!app.requestSingleInstanceLock()) {
 }
 
 async function init() {
-  app.setAppUserModelId('com.tokenstatus.app')
-  ensureConfigFile() // create ~/.tokenstatus/config.json template on first run
+  app.setAppUserModelId('com.tokenstats.app')
+  ensureConfigFile() // create ~/.tokenstats/config.json template on first run
 
   createWindow()
   createTray()
@@ -239,7 +239,7 @@ function openReport() {
     minHeight: 560,
     show: false,
     backgroundColor: '#0e0f13',
-    title: 'TokenStatus — Usage Report',
+    title: 'TokenStats — Usage Report',
     autoHideMenuBar: true,
     webPreferences: {
       preload: path.join(__dirname, '../preload/index.cjs'),
@@ -275,7 +275,7 @@ function openSettings() {
     minHeight: 480,
     show: false,
     backgroundColor: '#0e0f13',
-    title: 'TokenStatus — Settings',
+    title: 'TokenStats — Settings',
     autoHideMenuBar: true,
     webPreferences: {
       preload: path.join(__dirname, '../preload/index.cjs'),
@@ -311,7 +311,7 @@ async function exportReportPng() {
     const img = await reportWin.webContents.capturePage()
     const defaultPath = path.join(
       app.getPath('pictures'),
-      `tokenstatus-report-${new Date().toISOString().slice(0, 19).replace(/[:T]/g, '-')}.png`
+      `tokenstats-report-${new Date().toISOString().slice(0, 19).replace(/[:T]/g, '-')}.png`
     )
     const { canceled, filePath } = await dialog.showSaveDialog(reportWin, {
       title: 'Export report as PNG',
@@ -332,11 +332,11 @@ async function exportReportPng() {
 
 function createTray() {
   tray = new Tray(makeTrayIcon({ color: [217, 119, 87] }))
-  tray.setToolTip('TokenStatus')
+  tray.setToolTip('TokenStats')
   tray.on('click', () => toggleWindow())
   tray.on('right-click', () => {
     const menu = Menu.buildFromTemplate([
-      { label: 'Open TokenStatus', click: () => showWindow() },
+      { label: 'Open TokenStats', click: () => showWindow() },
       { label: 'Usage report…', click: () => openReport() },
       { label: 'Settings…', click: () => openSettings() },
       { type: 'separator' },
@@ -369,7 +369,7 @@ function setAutoLaunch(enabled) {
 function updateTray(snap) {
   if (!tray) return
   const today = snap?.totals?.today?.total || 0
-  tray.setToolTip(`TokenStatus v${app.getVersion()} — today ${compact(today)} tokens`)
+  tray.setToolTip(`TokenStats v${app.getVersion()} — today ${compact(today)} tokens`)
   // Recolour by the most recently active CLI (built-in or a dynamic LiteLLM provider).
   const cli = snap?.live?.cli
   const meta = cli && (CLI_META[cli] || dynamicCliMeta[cli])
