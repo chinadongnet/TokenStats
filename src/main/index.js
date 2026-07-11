@@ -1,4 +1,4 @@
-import { app, BrowserWindow, Tray, Menu, ipcMain, shell, screen, dialog } from 'electron'
+import { app, BrowserWindow, Tray, Menu, ipcMain, shell, screen, dialog, clipboard } from 'electron'
 import path from 'node:path'
 import fs from 'node:fs'
 import { fileURLToPath } from 'node:url'
@@ -29,6 +29,9 @@ let ingestTimer = null
 // in sync by refreshLitellmPollers() — used wherever a static CLI_META lookup
 // alone wouldn't know about a dynamic provider (tray recolor, open-data-dir).
 let dynamicCliMeta = {}
+// True while the popup's screenshot save dialog is open — the dialog steals
+// focus, and without this the popup's hide-on-blur would close it mid-export.
+let popupExporting = false
 
 // Single instance — a tray app should never run twice.
 if (!app.requestSingleInstanceLock()) {
@@ -97,7 +100,7 @@ async function init() {
   // Per-project totals are also served live from the store (the hourly DB has
   // no project dimension).
   ipcMain.handle('report:projects', (_e, fromMs, toMs) => store?.projectStats({ fromMs, toMs }) ?? [])
-  ipcMain.handle('export-png', () => exportReportPng())
+  ipcMain.handle('export-png', (_e, opts) => exportPng(opts))
 
   // LiteLLM multi-provider Settings CRUD (see core/db.js's litellm_providers /
   // litellm_model_settings tables and core/migrateLitellm.js for background).
@@ -218,6 +221,8 @@ function createWindow() {
     }
   })
   win.on('blur', () => {
+    if (popupExporting) return
+    if (process.env.AIMON_NO_HIDE) return // dev/test convenience: keep the popup up
     if (!win.webContents.isDevToolsOpened()) win.hide()
   })
 
@@ -294,39 +299,56 @@ function openSettings() {
   settingsWin.on('closed', () => { settingsWin = null })
 }
 
-async function exportReportPng() {
-  if (!reportWin || reportWin.isDestroyed()) return { ok: false }
-  // Grow the window to fit its full content so the screenshot isn't clipped.
+// Screenshot a window as PNG, then either save it to disk or copy it to the
+// clipboard. `fullHeight` grows the window to fit its whole page first (used
+// by the report, whose content extends past the viewport); the tray popup is
+// captured as-is since its overflow lives in an inner scroll region.
+async function exportPng({ which = 'report', mode = 'save' } = {}) {
+  const targetWin = which === 'popup' ? win : reportWin
+  if (!targetWin || targetWin.isDestroyed()) return { ok: false }
+  const isPopup = which === 'popup'
   let restore = null
   try {
-    const h = await reportWin.webContents.executeJavaScript('document.body.scrollHeight')
-    const bounds = reportWin.getBounds()
-    const display = screen.getDisplayMatching(bounds)
-    const target = Math.min(Math.ceil(h) + 8, display.workArea.height)
-    if (target > bounds.height) {
-      restore = bounds
-      reportWin.setBounds({ ...bounds, height: target })
-      await new Promise((r) => setTimeout(r, 250))
+    if (!isPopup) {
+      // Grow the window to fit its full content so the screenshot isn't clipped.
+      const h = await targetWin.webContents.executeJavaScript('document.body.scrollHeight')
+      const bounds = targetWin.getBounds()
+      const display = screen.getDisplayMatching(bounds)
+      const target = Math.min(Math.ceil(h) + 8, display.workArea.height)
+      if (target > bounds.height) {
+        restore = bounds
+        targetWin.setBounds({ ...bounds, height: target })
+        await new Promise((r) => setTimeout(r, 250))
+      }
     }
-    const img = await reportWin.webContents.capturePage()
+    const img = await targetWin.webContents.capturePage()
+    if (mode === 'copy') {
+      clipboard.writeImage(img)
+      return { ok: true, copied: true }
+    }
     const defaultPath = path.join(
       app.getPath('pictures'),
-      `tokenstats-report-${new Date().toISOString().slice(0, 19).replace(/[:T]/g, '-')}.png`
+      `tokenstats-${which}-${new Date().toISOString().slice(0, 19).replace(/[:T]/g, '-')}.png`
     )
-    const { canceled, filePath } = await dialog.showSaveDialog(reportWin, {
-      title: 'Export report as PNG',
-      defaultPath,
-      filters: [{ name: 'PNG image', extensions: ['png'] }],
-    })
-    if (canceled || !filePath) return { ok: false }
-    fs.writeFileSync(filePath, img.toPNG())
-    shell.showItemInFolder(filePath)
-    return { ok: true, filePath }
+    if (isPopup) popupExporting = true
+    try {
+      const { canceled, filePath } = await dialog.showSaveDialog(targetWin, {
+        title: 'Export screenshot as PNG',
+        defaultPath,
+        filters: [{ name: 'PNG image', extensions: ['png'] }],
+      })
+      if (canceled || !filePath) return { ok: false }
+      fs.writeFileSync(filePath, img.toPNG())
+      shell.showItemInFolder(filePath)
+      return { ok: true, filePath }
+    } finally {
+      if (isPopup) popupExporting = false
+    }
   } catch (e) {
     console.error('export png failed:', e)
     return { ok: false, error: String(e) }
   } finally {
-    if (restore) reportWin.setBounds(restore)
+    if (restore) targetWin.setBounds(restore)
   }
 }
 

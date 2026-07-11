@@ -22,7 +22,8 @@ contextBridge.exposeInMainWorld('api', {
   reportRequests: (opts) => ipcRenderer.invoke('report:requests', opts),
   reportProjects: (fromMs, toMs) => ipcRenderer.invoke('report:projects', fromMs, toMs),
   reportSpan: () => ipcRenderer.invoke('report:span'),
-  exportPng: () => ipcRenderer.invoke('export-png'),
+  // opts: { which: 'report' | 'popup', mode: 'save' | 'copy' }
+  exportPng: (opts) => ipcRenderer.invoke('export-png', opts),
   onReportUpdated: (cb) => {
     const handler = () => cb()
     ipcRenderer.on('report-updated', handler)

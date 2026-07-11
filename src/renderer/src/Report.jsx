@@ -58,6 +58,7 @@ export default function Report() {
   const [reqCli, setReqCli] = useState('all') // 'all' | cli
   const [requests, setRequests] = useState({ rows: [], count: 0 })
   const [exporting, setExporting] = useState(false)
+  const [copied, setCopied] = useState(false)
 
   const today = floorDay(Date.now())
   const { fromMs, toMs } = useMemo(() => {
@@ -179,9 +180,15 @@ export default function Report() {
     return { total, cost, turns, activeHours }
   }, [shownDayModels, hourData])
 
-  async function doExport() {
+  async function doExport(mode) {
     setExporting(true)
-    try { await window.api.exportPng() } finally { setExporting(false) }
+    try {
+      const res = await window.api.exportPng({ which: 'report', mode })
+      if (res?.copied) {
+        setCopied(true)
+        setTimeout(() => setCopied(false), 1500)
+      }
+    } finally { setExporting(false) }
   }
 
   return (
@@ -203,7 +210,10 @@ export default function Report() {
               ))}
             </div>
           )}
-          <button className="btn primary" disabled={exporting} onClick={doExport}>
+          <button className="btn" disabled={exporting} onClick={() => doExport('copy')}>
+            {copied ? 'Copied ✓' : '⧉ Copy'}
+          </button>
+          <button className="btn primary" disabled={exporting} onClick={() => doExport('save')}>
             {exporting ? 'Exporting…' : '⤓ Export PNG'}
           </button>
         </div>
