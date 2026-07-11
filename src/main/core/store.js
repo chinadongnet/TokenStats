@@ -228,6 +228,10 @@ export class Store extends EventEmitter {
     // so a dynamic `litellm:<id>` cli id never hits a missing blank accumulator.
     const dynamicIds = this.pollers.map((p) => p.cli)
     const allCliIds = [...CLIS, ...dynamicIds]
+    // Poller (LiteLLM) records carry synthetic timestamps — noon UTC of the
+    // usage day, which can even sit in the local future — so they must never
+    // win the "live" race below; pollers report real sync times instead.
+    const pollerClis = new Set(dynamicIds)
     const blank = () => ({ total: 0, input: 0, output: 0, cacheRead: 0, cacheCreate: 0, reasoning: 0, cost: 0, count: 0 })
     const perCli = Object.fromEntries(allCliIds.map((c) => [c, blank()]))
     const todayPerCli = Object.fromEntries(allCliIds.map((c) => [c, blank()]))
@@ -255,7 +259,13 @@ export class Store extends EventEmitter {
       d[r.cli] += r.total
       d.total += r.total
 
-      if (!latest || r.ts > latest.ts) latest = r
+      if (!pollerClis.has(r.cli) && (!latest || r.ts > latest.ts)) latest = r
+    }
+
+    // Pollers compete for "live" via their real last-sync-with-new-usage time.
+    for (const p of this.pollers) {
+      const lc = p.liveCandidate?.()
+      if (lc && (!latest || lc.ts > latest.ts)) latest = lc
     }
 
     const todayRecords = records.filter((r) => dayKey(r.ts) === todayKey)

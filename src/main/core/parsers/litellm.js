@@ -134,7 +134,12 @@ function applyModelSettings(records, modelSettings) {
 // tick just because a settings map lookup happened to run again.
 export function createLitellmPoller({ id, name, baseUrl, apiKey, color, syncMinutes, getModelSettings }) {
   const intervalMs = Math.max(1, Number(syncMinutes) || DEFAULT_SYNC_MINUTES) * 60 * 1000
-  const cache = { raw: [], applied: [], fetchedAt: 0 }
+  const cache = { raw: [], applied: [], fetchedAt: 0, hasBaseline: false }
+  // Set when a fetch brings NEW usage (a bucket's total grew vs the previous
+  // fetch): { ts: <sync time>, model, project }. Record timestamps here are
+  // synthetic (noon UTC of the usage day — the API has no per-request times),
+  // so the store's "live" indicator uses this real sync time instead.
+  let lastChange = null
 
   function reapply() {
     cache.applied = applyModelSettings(cache.raw, getModelSettings ? getModelSettings() : null)
@@ -145,7 +150,20 @@ export function createLitellmPoller({ id, name, baseUrl, apiKey, color, syncMinu
     cache.fetchedAt = Date.now() // set before awaiting so overlapping triggers don't pile up calls
     try {
       const dayResults = await fetchRawRecords(baseUrl, apiKey)
-      cache.raw = flatten(dayResults, id)
+      const next = flatten(dayResults, id)
+      if (cache.hasBaseline) {
+        // Which bucket grew? Prefer the newest usage day, then the biggest jump.
+        const prevTotals = new Map(cache.raw.map((r) => [r.dedupKey, r.total]))
+        let best = null
+        for (const r of next) {
+          const delta = r.total - (prevTotals.get(r.dedupKey) || 0)
+          if (delta <= 0) continue
+          if (!best || r.ts > best.ts || (r.ts === best.ts && delta > best.delta)) best = { ...r, delta }
+        }
+        if (best) lastChange = { ts: Date.now(), model: best.model, project: best.project }
+      }
+      cache.raw = next
+      cache.hasBaseline = true // the first fetch only sets the comparison baseline
     } catch {
       // undocumented internal admin API: keep the previous cache on error
     }
@@ -169,6 +187,23 @@ export function createLitellmPoller({ id, name, baseUrl, apiKey, color, syncMinu
     return reapply()
   }
 
+  // The provider's claim to the popup's "live" footer: the model that last
+  // gained usage, stamped with the real sync time (never the synthetic record
+  // ts). Respects current model settings — hidden models never show as live,
+  // renamed ones show their display name.
+  function liveCandidate() {
+    if (!lastChange) return null
+    const settings = getModelSettings ? getModelSettings() : null
+    const s = settings?.get(lastChange.model)
+    if (s && s.visible === false) return null
+    return {
+      cli: `litellm:${id}`,
+      model: s?.displayName || lastChange.model,
+      project: lastChange.project,
+      ts: lastChange.ts,
+    }
+  }
+
   return {
     cli: `litellm:${id}`,
     providerId: id,
@@ -176,6 +211,7 @@ export function createLitellmPoller({ id, name, baseUrl, apiKey, color, syncMinu
     poll,
     forceRefresh,
     reapplySettings,
+    liveCandidate,
     meta: { label: name, color },
   }
 }
