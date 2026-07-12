@@ -47,14 +47,18 @@ export default function Report() {
   const [brands, setBrands] = useState(() => new Set(FIXED_ORDER))
   const [providers, setProviders] = useState([]) // dynamic LiteLLM providers
   const [day, setDay] = useState(floorDay(Date.now()))
+  const [dayBreakdown, setDayBreakdown] = useState('model') // model | project
   const [span, setSpan] = useState({ min: null, max: null })
   const [hourly, setHourly] = useState([])
   const [daily, setDaily] = useState([])
   const [models, setModels] = useState([])
   const [projects, setProjects] = useState([])
+  const [dayModels, setDayModels] = useState([])
+  const [dayProjects, setDayProjects] = useState([])
   const [reqCli, setReqCli] = useState('all') // 'all' | cli
   const [requests, setRequests] = useState({ rows: [], count: 0 })
   const [exporting, setExporting] = useState(false)
+  const [copied, setCopied] = useState(false)
 
   const today = floorDay(Date.now())
   const { fromMs, toMs } = useMemo(() => {
@@ -65,18 +69,22 @@ export default function Report() {
   }, [range, span.min, today])
 
   async function load() {
-    const [sp, h, d, m, p] = await Promise.all([
+    const [sp, h, d, m, p, dm, dp] = await Promise.all([
       window.api.reportSpan(),
       window.api.reportHourly(day),
       window.api.reportDaily(fromMs, toMs),
       window.api.reportModels(fromMs, toMs),
       window.api.reportProjects(fromMs, toMs),
+      window.api.reportModels(day, day + DAY),
+      window.api.reportProjects(day, day + DAY),
     ])
     setSpan(sp)
     setHourly(h)
     setDaily(d)
     setModels(m)
     setProjects(p)
+    setDayModels(dm)
+    setDayProjects(dp)
   }
 
   useEffect(() => { load() }, [day, fromMs, toMs])
@@ -160,14 +168,27 @@ export default function Report() {
     return { total, cost, turns, activeDays }
   }, [shownModels, dayData])
 
-  const maxModel = Math.max(1, ...shownModels.map((m) => m.total))
-
   const shownProjects = useMemo(() => projects.filter((p) => brands.has(p.cli)), [projects, brands])
-  const maxProject = Math.max(1, ...shownProjects.map((p) => p.total))
 
-  async function doExport() {
+  const shownDayModels = useMemo(() => dayModels.filter((m) => brands.has(m.cli)), [dayModels, brands])
+  const shownDayProjects = useMemo(() => dayProjects.filter((p) => brands.has(p.cli)), [dayProjects, brands])
+
+  const daySummary = useMemo(() => {
+    let total = 0, cost = 0, turns = 0
+    for (const m of shownDayModels) { total += m.total; cost += m.cost; turns += m.turns }
+    const activeHours = hourData.filter((h) => h.total > 0).length
+    return { total, cost, turns, activeHours }
+  }, [shownDayModels, hourData])
+
+  async function doExport(mode) {
     setExporting(true)
-    try { await window.api.exportPng() } finally { setExporting(false) }
+    try {
+      const res = await window.api.exportPng({ which: 'report', mode })
+      if (res?.copied) {
+        setCopied(true)
+        setTimeout(() => setCopied(false), 1500)
+      }
+    } finally { setExporting(false) }
   }
 
   return (
@@ -189,7 +210,10 @@ export default function Report() {
               ))}
             </div>
           )}
-          <button className="btn primary" disabled={exporting} onClick={doExport}>
+          <button className="btn" disabled={exporting} onClick={() => doExport('copy')}>
+            {copied ? 'Copied ✓' : '⧉ Copy'}
+          </button>
+          <button className="btn primary" disabled={exporting} onClick={() => doExport('save')}>
             {exporting ? 'Exporting…' : '⤓ Export PNG'}
           </button>
         </div>
@@ -211,6 +235,13 @@ export default function Report() {
 
       {view === 'hour' && (
       <>
+      <div className="tiles">
+        <Tile label={day === today ? "Today's tokens" : 'Tokens'} value={compact(daySummary.total)} sub={dayLabel(day)} />
+        <Tile label="Est. cost" value={usd(daySummary.cost)} sub="rough estimate" accent="#7ee0b8" />
+        <Tile label="Turns" value={daySummary.turns.toLocaleString()} sub="model responses" />
+        <Tile label="Active hours" value={String(daySummary.activeHours)} sub="with usage" />
+      </div>
+
       <Legend brands={brands} onToggle={toggleBrand} CLI={CLI} ORDER={ORDER} />
       <section className="card">
         <div className="card-head">
@@ -223,6 +254,15 @@ export default function Report() {
         </div>
         <StackedBars data={hourData} xLabel={(h) => (h % 3 === 0 ? h + ':00' : '')} height={260} CLI={CLI} ORDER={ORDER} />
       </section>
+
+      <Breakdown
+        mode={dayBreakdown}
+        setMode={setDayBreakdown}
+        models={shownDayModels}
+        projects={shownDayProjects}
+        CLI={CLI}
+        label={dayLabel(day)}
+      />
       </>
       )}
 
@@ -248,47 +288,19 @@ export default function Report() {
         />
       </section>
 
-      <section className="card">
-        <div className="card-head">
-          <div className="seg">
-            <button className={breakdown === 'model' ? 'on' : ''} onClick={() => setBreakdown('model')}>By model</button>
-            <button className={breakdown === 'project' ? 'on' : ''} onClick={() => setBreakdown('project')}>By project</button>
-          </div>
-          <span className="card-sub">{fmtRange(fromMs, toMs)}</span>
-        </div>
-        {breakdown === 'model' ? (
-          <div className="models">
-            {shownModels.length === 0 && <div className="empty">No usage in this range.</div>}
-            {shownModels.slice(0, 15).map((m) => (
-              <div className="mrow" key={m.cli + m.model}>
-                <span className="dot" style={{ background: metaFor(CLI, m.cli).color }} />
-                <span className="mname" title={m.model}>{m.model}</span>
-                <div className="mtrack"><div className="mfill" style={{ width: (100 * m.total) / maxModel + '%', background: metaFor(CLI, m.cli).color }} /></div>
-                <span className="mtok">{compact(m.total)}</span>
-                <span className="mcost">{usd(m.cost)}</span>
-              </div>
-            ))}
-          </div>
-        ) : (
-          <div className="models">
-            {shownProjects.length === 0 && <div className="empty">No usage in this range.</div>}
-            {shownProjects.slice(0, 15).map((p) => (
-              <div className="mrow" key={p.cli + p.project}>
-                <span className="dot" style={{ background: metaFor(CLI, p.cli).color }} />
-                <span className="mname" title={p.project + ' · ' + metaFor(CLI, p.cli).label + ' · ' + p.turns + ' turns'}>{p.project}</span>
-                <div className="mtrack"><div className="mfill" style={{ width: (100 * p.total) / maxProject + '%', background: metaFor(CLI, p.cli).color }} /></div>
-                <span className="mtok">{compact(p.total)}</span>
-                <span className="mcost">{usd(p.cost)}</span>
-              </div>
-            ))}
-          </div>
-        )}
-      </section>
+      <Breakdown
+        mode={breakdown}
+        setMode={setBreakdown}
+        models={shownModels}
+        projects={shownProjects}
+        CLI={CLI}
+        label={fmtRange(fromMs, toMs)}
+      />
       </>
       )}
 
       <footer className="rep-foot">
-        TokenStatus v{__APP_VERSION__} · built {__BUILD_TIME__} · SQLite {span.min ? 'since ' + new Date(span.min).toLocaleDateString() : '(empty)'} · ~/.tokenstatus/usage.sqlite
+        TokenStats v{__APP_VERSION__} · built {__BUILD_TIME__} · SQLite {span.min ? 'since ' + new Date(span.min).toLocaleDateString() : '(empty)'} · ~/.tokenstats/usage.sqlite
       </footer>
     </div>
   )
@@ -301,6 +313,50 @@ function Tile({ label, value, sub, accent }) {
       <div className="tile-value" style={accent ? { color: accent } : null}>{value}</div>
       <div className="tile-sub">{sub}</div>
     </div>
+  )
+}
+
+// By-model / by-project token+cost breakdown, shared by the Charts and By-hour tabs.
+function Breakdown({ mode, setMode, models, projects, CLI, label }) {
+  const maxModel = Math.max(1, ...models.map((m) => m.total))
+  const maxProject = Math.max(1, ...projects.map((p) => p.total))
+  return (
+    <section className="card">
+      <div className="card-head">
+        <div className="seg">
+          <button className={mode === 'model' ? 'on' : ''} onClick={() => setMode('model')}>By model</button>
+          <button className={mode === 'project' ? 'on' : ''} onClick={() => setMode('project')}>By project</button>
+        </div>
+        <span className="card-sub">{label}</span>
+      </div>
+      {mode === 'model' ? (
+        <div className="models">
+          {models.length === 0 && <div className="empty">No usage in this range.</div>}
+          {models.slice(0, 15).map((m) => (
+            <div className="mrow" key={m.cli + m.model}>
+              <span className="dot" style={{ background: metaFor(CLI, m.cli).color }} />
+              <span className="mname" title={m.model}>{m.model}</span>
+              <div className="mtrack"><div className="mfill" style={{ width: (100 * m.total) / maxModel + '%', background: metaFor(CLI, m.cli).color }} /></div>
+              <span className="mtok">{compact(m.total)}</span>
+              <span className="mcost">{usd(m.cost)}</span>
+            </div>
+          ))}
+        </div>
+      ) : (
+        <div className="models">
+          {projects.length === 0 && <div className="empty">No usage in this range.</div>}
+          {projects.slice(0, 15).map((p) => (
+            <div className="mrow" key={p.cli + p.project}>
+              <span className="dot" style={{ background: metaFor(CLI, p.cli).color }} />
+              <span className="mname" title={p.project + ' · ' + metaFor(CLI, p.cli).label + ' · ' + p.turns + ' turns'}>{p.project}</span>
+              <div className="mtrack"><div className="mfill" style={{ width: (100 * p.total) / maxProject + '%', background: metaFor(CLI, p.cli).color }} /></div>
+              <span className="mtok">{compact(p.total)}</span>
+              <span className="mcost">{usd(p.cost)}</span>
+            </div>
+          ))}
+        </div>
+      )}
+    </section>
   )
 }
 

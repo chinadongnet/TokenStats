@@ -32,7 +32,7 @@ const compact = (n) => {
 const usd = (n) => (n || 0).toFixed(2)
 const ago = (ts) => {
   if (!ts) return ''
-  const s = Math.round((Date.now() - ts) / 1000)
+  const s = Math.max(0, Math.round((Date.now() - ts) / 1000))
   if (s < 60) return s + 's ago'
   if (s < 3600) return Math.round(s / 60) + 'm ago'
   if (s < 86400) return Math.round(s / 3600) + 'h ago'
@@ -42,11 +42,25 @@ const ago = (ts) => {
 export default function App() {
   const [snap, setSnap] = useState(null)
   const [tab, setTab] = useState('today-models')
+  const [shotMenu, setShotMenu] = useState(false)
+  const [copied, setCopied] = useState(false)
 
   useEffect(() => {
     window.api.getSnapshot().then(setSnap)
     return window.api.onSnapshot(setSnap)
   }, [])
+
+  // Screenshot the popup itself. The menu must be gone from the frame first,
+  // so give React a beat to re-render before asking main to capture.
+  async function screenshot(mode) {
+    setShotMenu(false)
+    await new Promise((r) => setTimeout(r, 60))
+    const res = await window.api.exportPng({ which: 'popup', mode })
+    if (res?.copied) {
+      setCopied(true)
+      setTimeout(() => setCopied(false), 1500)
+    }
+  }
 
   // 5 fixed built-in CLIs + whatever LiteLLM providers are currently active
   // (from the live snapshot), so each shows up as its own labeled/colored row.
@@ -78,11 +92,21 @@ export default function App() {
       <header className="drag">
         <div className="brand">
           <span className="logo" />
-          <span>TokenStatus</span>
+          <span>TokenStats</span>
         </div>
         <div className="hwin">
           <button className="ghost" title="Usage report" onClick={() => window.api.openReport()}>▤</button>
           <button className="ghost" title="Settings" onClick={() => window.api.openSettings()}>⚙</button>
+          <div className="shot">
+            <button className="ghost" title="Screenshot" onClick={() => setShotMenu((v) => !v)}>⎙</button>
+            {shotMenu && (
+              <div className="shot-menu">
+                <button onClick={() => screenshot('copy')}>Copy to clipboard</button>
+                <button onClick={() => screenshot('save')}>Save as PNG…</button>
+              </div>
+            )}
+            {copied && <div className="shot-toast">Copied ✓</div>}
+          </div>
           <button className="ghost" title="Refresh" onClick={() => window.api.getSnapshot().then(setSnap)}>⟳</button>
           <button className="ghost" title="Hide" onClick={() => window.api.hide()}>—</button>
         </div>

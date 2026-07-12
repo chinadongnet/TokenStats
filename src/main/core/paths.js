@@ -4,19 +4,22 @@ import fs from 'node:fs'
 
 const home = os.homedir()
 
-export const CONFIG_DIR = path.join(home, '.tokenstatus')
-const LEGACY_CONFIG_DIR = path.join(home, '.aimonitor') // pre-rename location
+export const CONFIG_DIR = path.join(home, '.tokenstats')
+// Pre-rename locations, oldest first: AIMon -> TokenStatus -> TokenStats.
+const LEGACY_CONFIG_DIRS = [path.join(home, '.tokenstatus'), path.join(home, '.aimonitor')]
 // AIMON_CONFIG lets tests / portable installs point at a different config file.
 export const CONFIG_FILE = process.env.AIMON_CONFIG || path.join(CONFIG_DIR, 'config.json')
 
-// One-time migration from the old ~/.aimonitor folder so existing config
-// (extra device roots) and the usage DB carry over after the rename.
+// One-time migration from an old ~/.tokenstatus or ~/.aimonitor folder so existing
+// config (extra device roots) and the usage DB carry over after each rename.
 function migrateLegacyDir() {
   try {
-    if (fs.existsSync(CONFIG_DIR) || !fs.existsSync(LEGACY_CONFIG_DIR)) return
+    if (fs.existsSync(CONFIG_DIR)) return
+    const legacyDir = LEGACY_CONFIG_DIRS.find((dir) => fs.existsSync(dir))
+    if (!legacyDir) return
     fs.mkdirSync(CONFIG_DIR, { recursive: true })
     for (const name of ['config.json', 'usage.sqlite']) {
-      const from = path.join(LEGACY_CONFIG_DIR, name)
+      const from = path.join(legacyDir, name)
       const to = path.join(CONFIG_DIR, name)
       if (fs.existsSync(from) && !fs.existsSync(to)) fs.copyFileSync(from, to)
     }
@@ -127,7 +130,7 @@ export function ensureConfigFile() {
     const template = {
       _comment:
         'Merge usage from OTHER devices: copy that device\'s CLI data folder here, ' +
-        'then list the path under the matching CLI below. Restart TokenStatus after editing.',
+        'then list the path under the matching CLI below. Restart TokenStats after editing.',
       _examples: {
         codex: 'D:/from-laptop/.codex/sessions',
         gemini: 'D:/from-laptop/.gemini/tmp',

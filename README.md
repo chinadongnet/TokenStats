@@ -1,4 +1,4 @@
-# TokenStatus
+# TokenStats
 
 A Windows **system-tray** app that tracks token usage across your local AI coding
 tools — **Claude Code**, **Codex**, **Gemini**, **Antigravity**, and **Cursor** — plus
@@ -33,7 +33,7 @@ System tray:  [▮ AI] ◄ click
 - 🎨 Tray icon recolors to the most recently active CLI.
 - 📊 **Usage report** — a full window with **hour-by-hour** and daily charts, per-model
   breakdown, and a one-click **Export PNG**. Backed by a local **SQLite** database
-  (`~/.tokenstatus/usage.sqlite`) that records usage at hourly granularity per model.
+  (`~/.TokenStats/usage.sqlite`) that records usage at hourly granularity per model.
 - ⚙️ **LiteLLM Settings** — track any number of self-hosted LiteLLM proxies, each with
   its own name, color, sync frequency, and per-model show/hide + rename. See
   [LiteLLM providers](#litellm-providers) below.
@@ -53,7 +53,7 @@ System tray:  [▮ AI] ◄ click
 
 Cursor's local chat database (`state.vscdb`) writes every message's token count as
 zeros in current versions — real usage is tracked **server-side only**, on the
-cursor.com dashboard. So instead of parsing local files, TokenStatus:
+cursor.com dashboard. So instead of parsing local files, TokenStats:
 
 1. Reads the session token the Cursor **IDE itself already stores** after you log in
    (from `state.vscdb`) — no separate API key needed, just be logged into Cursor on
@@ -78,7 +78,7 @@ Trade-offs worth knowing:
 
 ## LiteLLM providers
 
-If you run a self-hosted [LiteLLM](https://docs.litellm.ai/) proxy, TokenStatus can
+If you run a self-hosted [LiteLLM](https://docs.litellm.ai/) proxy, TokenStats can
 track its usage too — unlike the other tools, LiteLLM has no local footprint at all
 (it's a server, not a CLI), so this polls its admin API instead of watching files.
 
@@ -88,7 +88,7 @@ the tray's right-click menu — to add a provider:
 - **Name** and **color**, shown as its own row in the popup and Report, just like a
   built-in CLI.
 - **Base URL** and an **admin/management API key** (not a per-user key).
-- **Sync frequency** (minutes) — how often TokenStatus polls that proxy.
+- **Sync frequency** (minutes) — how often TokenStats polls that proxy.
 - Per-model **show/hide** and **rename** — use "Load models" to see every model the
   key has usage for, then hide ones you don't want counted or give one a friendlier
   display name.
@@ -98,15 +98,15 @@ up as its own independent row everywhere the built-in CLIs do. Unlike every othe
 source here, LiteLLM's admin API reports **actual spend**, not a `pricing.js` estimate.
 
 Provider configuration (including the API key) is stored locally in
-`~/.tokenstatus/usage.sqlite`, never sent anywhere except to the proxy you configured.
+`~/.TokenStats/usage.sqlite`, never sent anywhere except to the proxy you configured.
 
 ## Multiple devices
 
 Token usage for Claude Code, Codex, Gemini, and Antigravity lives only in each
 device's local files — those CLIs don't expose a per-account usage API to pull from
 the cloud. To include usage from **other machines**, copy that machine's CLI data
-folder over (sync drive, network share, or manual copy) and point TokenStatus at it.
-Right-click the tray → **Edit data sources…**, or edit `~/.tokenstatus/config.json`:
+folder over (sync drive, network share, or manual copy) and point TokenStats at it.
+Right-click the tray → **Edit data sources…**, or edit `~/.TokenStats/config.json`:
 
 ```json
 {
@@ -121,7 +121,7 @@ Right-click the tray → **Edit data sources…**, or edit `~/.tokenstatus/confi
 ```
 
 These folders are scanned and merged into the totals (forward or back slashes both
-work). Restart TokenStatus after editing. Don't add your own local folders here — that
+work). Restart TokenStats after editing. Don't add your own local folders here — that
 would double-count. Session files are uniquely named per device, so genuine cross-device
 data merges cleanly.
 
