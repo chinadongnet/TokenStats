@@ -405,7 +405,7 @@ async function exportPng({ which = 'report', mode = 'save' } = {}) {
 
 function createTray() {
   tray = new Tray(makeTrayIcon({ color: [217, 119, 87] }))
-  tray.setToolTip('TokenStats')
+  tray.setToolTip(`TokenStats v${__APP_VERSION__} (${__BUILD_TIME__})`)
   tray.on('click', () => toggleWindow())
   tray.on('right-click', () => {
     const menu = Menu.buildFromTemplate([
@@ -427,7 +427,9 @@ function createTray() {
 function updateTray(snap) {
   if (!tray) return
   const today = snap?.totals?.today?.total || 0
-  tray.setToolTip(`TokenStats v${app.getVersion()} — today ${compact(today)} tokens`)
+  // Build time, not just version: dev iterates without bumping, so the version
+  // alone can't tell a fresh install from a stale one.
+  tray.setToolTip(`TokenStats v${__APP_VERSION__} (${__BUILD_TIME__}) — today ${compact(today)} tokens`)
   // Recolour by the most recently active CLI (built-in or a dynamic LiteLLM provider).
   const cli = snap?.live?.cli
   const meta = cli && (CLI_META[cli] || dynamicCliMeta[cli])
