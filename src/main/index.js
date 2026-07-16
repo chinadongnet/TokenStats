@@ -8,6 +8,7 @@ import { CLI_META, ensureConfigFile, CONFIG_FILE } from './core/paths.js'
 import { createLitellmPoller, listModels } from './core/parsers/litellm.js'
 import { computeAllSubscriptionStats, computePlanBreakdown, computePlanTimeline, computeResetWindows } from './core/subscriptions.js'
 import { migrateLegacyLitellmConfig } from './core/migrateLitellm.js'
+import { isAutoLaunch, setAutoLaunch, migrateLegacyRunKeys } from './autoLaunch.js'
 import { makeTrayIcon } from './trayIcon.js'
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url))
@@ -36,6 +37,10 @@ let popupExporting = false
 
 // Single instance — a tray app should never run twice.
 if (!app.requestSingleInstanceLock()) {
+  // Dev and the installed build share userData (%APPDATA%\tokenstats), so they
+  // share this lock: if the autostarted app is running, `npm run dev` exits here
+  // and the OLD window pops up instead. Quit TokenStats from the tray first.
+  console.error(`[tokenstats] another instance holds the lock (${app.getPath('userData')}) — exiting.`)
   app.quit()
 } else {
   app.on('second-instance', () => showWindow())
@@ -44,6 +49,7 @@ if (!app.requestSingleInstanceLock()) {
 
 async function init() {
   app.setAppUserModelId('com.tokenstats.app')
+  migrateLegacyRunKeys() // one-time: drop the pre-rename com.tokenstatus.app Run value
   ensureConfigFile() // create ~/.tokenstats/config.json template on first run
 
   createWindow()
@@ -416,21 +422,6 @@ function createTray() {
     ])
     tray.popUpContextMenu(menu)
   })
-}
-
-function isAutoLaunch() {
-  return app.getLoginItemSettings().openAtLogin
-}
-
-// Toggle "start with Windows" — writes/removes an HKCU\...\Run registry entry.
-function setAutoLaunch(enabled) {
-  const opts = { openAtLogin: enabled }
-  if (!app.isPackaged) {
-    // Dev: point the login item at electron + this project so it launches the app.
-    opts.path = process.execPath
-    opts.args = [path.resolve(process.argv[1] || '.')]
-  }
-  app.setLoginItemSettings(opts)
 }
 
 function updateTray(snap) {
