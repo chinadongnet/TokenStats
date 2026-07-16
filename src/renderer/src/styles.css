@@ -90,6 +90,17 @@ header {
 .fill { height: 100%; border-radius: 4px; transition: width .4s ease; min-width: 2px; }
 .row-meta { display: flex; justify-content: space-between; color: var(--muted); font-size: 11px; margin-top: 4px; }
 
+/* Quota-reset windows (popup): ONE line per plan, with that plan's windows
+   inlined on the right. The ring carries the remaining-time ratio, so no
+   full-width bar is needed — the popup is 380px wide and a plan can declare up
+   to 3 windows. Exact usage/cost lives in each window's tooltip. */
+.resets .reset { display: flex; align-items: center; gap: 7px; padding: 2px 0; font-size: 11px; }
+.resets .reset .ellipsis { color: var(--text); }
+.rwins { display: flex; align-items: center; gap: 10px; flex: none; }
+.rwin { display: flex; align-items: center; gap: 4px; color: var(--muted); cursor: default; }
+.rwin .ring { flex: none; }
+.rwin-t { color: var(--text); font-variant-numeric: tabular-nums; }
+
 .block { padding: 4px 12px 8px; }
 .block h3 {
   font-size: 11px; text-transform: uppercase; letter-spacing: .6px;
@@ -121,7 +132,10 @@ footer {
 ::-webkit-scrollbar-thumb { background: var(--panel2); border-radius: 4px; }
 
 /* ---------------- Report window ---------------- */
-.report { min-height: 100vh; padding: 16px 18px 24px; overflow-y: auto; }
+/* Fixed to the viewport with internal scrolling (body is overflow:hidden), so
+   long content — e.g. the Settings subscription form with a model list — is
+   reachable. exportPng measures .report's scrollHeight to un-clip screenshots. */
+.report { height: 100vh; padding: 16px 18px 24px; overflow-y: auto; }
 .rep-head { display: flex; align-items: center; justify-content: space-between; gap: 12px; margin-bottom: 14px; }
 .rep-title { display: flex; align-items: center; gap: 9px; font-size: 18px; font-weight: 700; }
 .rep-actions { display: flex; align-items: center; gap: 10px; }
@@ -134,7 +148,7 @@ footer {
 .btn.primary { background: var(--accent); border-color: var(--accent); color: #1a0f0a; font-weight: 600; }
 .btn.primary:hover:not(:disabled) { filter: brightness(1.08); }
 
-.tiles { display: grid; grid-template-columns: repeat(4, 1fr); gap: 12px; margin-bottom: 14px; }
+.tiles { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 12px; margin-bottom: 14px; }
 .tile { background: var(--panel); border: 1px solid var(--line); border-radius: 12px; padding: 12px 14px; }
 .tile-label { color: var(--muted); font-size: 11px; text-transform: uppercase; letter-spacing: .5px; }
 .tile-value { font-size: 26px; font-weight: 700; margin: 4px 0 2px; letter-spacing: -.5px; }
@@ -211,6 +225,79 @@ footer {
 }
 .model-row.hidden { opacity: .45; }
 .model-row input[type="checkbox"] { width: 14px; height: 14px; cursor: pointer; }
+
+/* --- settings: section headers + subscription plans --- */
+.group-head { display: flex; align-items: center; justify-content: space-between; margin: 16px 2px 10px; }
+.group-head h2 { margin: 0; font-size: 14px; font-weight: 700; }
+.check { display: flex; align-items: center; gap: 7px; font-size: 12px; cursor: pointer; user-select: none; }
+.check input[type="checkbox"] { width: 14px; height: 14px; cursor: pointer; flex: none; }
+.src-box { border: 1px solid var(--line); border-radius: 8px; padding: 8px 10px; margin-bottom: 6px; }
+.src-box.on { border-color: #39405a; background: var(--panel2); }
+.src-litellm { margin: 8px 0 2px 21px; }
+.model-picker {
+  display: grid; grid-template-columns: repeat(auto-fill, minmax(220px, 1fr));
+  gap: 4px 12px; max-height: 180px; overflow-y: auto;
+  border: 1px solid var(--line); border-radius: 8px; padding: 8px 10px;
+}
+.field select.sel { width: 100%; }
+
+/* --- report: subscriptions tab --- */
+.sub-status {
+  margin-left: 8px; font-size: 10px; font-weight: 600; text-transform: uppercase; letter-spacing: .5px;
+  border: 1px solid var(--line); border-radius: 999px; padding: 2px 8px; color: var(--muted); vertical-align: 1px;
+}
+.sub-status.on { color: #7ee0b8; border-color: rgba(126, 224, 184, .4); }
+.chips { display: flex; flex-wrap: wrap; gap: 6px; margin: 2px 0 10px; }
+.chip { border: 1px solid var(--line); border-radius: 999px; padding: 3px 10px; font-size: 11px; color: var(--muted); }
+.sub-totals { display: flex; flex-wrap: wrap; gap: 6px 18px; margin: 2px 0 12px; font-size: 12px; color: var(--muted); }
+.sub-totals b { color: var(--text); font-variant-numeric: tabular-nums; }
+.chart .blabel { fill: var(--text); font-size: 10px; font-weight: 600; }
+/* by-plan breakdown: one block per token plan, share bar = % of range usage worth */
+.plans { display: flex; flex-direction: column; gap: 10px; }
+.plan-block { border: 1px solid var(--line); border-radius: 10px; padding: 10px 12px; }
+.prow { display: flex; align-items: center; gap: 10px; font-size: 13px; }
+.prow .pname { font-weight: 600; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.prow .pmeta { color: var(--muted); font-size: 12px; margin-left: auto; white-space: nowrap; }
+.prow .pmeta b { color: var(--text); font-variant-numeric: tabular-nums; font-weight: 600; }
+.ptrack { width: 110px; height: 8px; background: var(--panel2); border-radius: 4px; overflow: hidden; flex: none; }
+.pfill { height: 100%; border-radius: 4px; min-width: 2px; }
+.pshare { width: 36px; text-align: right; font-variant-numeric: tabular-nums; font-weight: 600; font-size: 12px; flex: none; }
+.pmodels { margin-top: 8px; padding-left: 19px; }
+/* token-plans tab: per-plan comparison rows (fees/worth on one USD scale,
+   tokens on their own scale, unit price) */
+.cmp-row {
+  display: grid; grid-template-columns: minmax(110px, 150px) 1fr 52px minmax(120px, 170px) 72px;
+  gap: 12px; align-items: center; padding: 8px 0; border-bottom: 1px solid var(--line);
+}
+.cmp-row:last-of-type { border-bottom: none; }
+.cmp-row.cmp-head {
+  color: var(--muted); font-size: 11px; text-transform: uppercase; letter-spacing: .4px;
+  font-weight: 600; padding: 0 0 6px;
+}
+.cmp-name { font-weight: 600; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.cmp-bars { display: flex; flex-direction: column; gap: 3px; }
+.cmp-bar { display: flex; align-items: center; gap: 8px; }
+.cmp-track { flex: 1; height: 7px; background: var(--panel2); border-radius: 4px; overflow: hidden; }
+.cmp-fill { height: 100%; border-radius: 4px; min-width: 2px; }
+.cmp-num { font-variant-numeric: tabular-nums; font-size: 11px; width: 62px; text-align: right; flex: none; }
+.cmp-r { text-align: right; font-variant-numeric: tabular-nums; font-weight: 600; font-size: 12px; }
+/* token-plans tab: zoomable subscription timeline */
+.tl-wrap { cursor: grab; user-select: none; touch-action: none; }
+.tl-wrap.dragging { cursor: grabbing; }
+.chart .tl-label { fill: var(--text); font-size: 14px; font-weight: 600; }
+.chart .tl-fee { fill: #fff; font-size: 12px; font-weight: 600; opacity: .95; pointer-events: none; }
+/* The timeline svg scales with the card, so at the report window's min width
+   everything shrinks ~0.75x. Size its text up from the shared .chart defaults
+   so the labels stay legible when the window is small. */
+.chart.tl .ytick { font-size: 13px; }
+.chart.tl .xtick { font-size: 12px; }
+.chart .tl-now { stroke: var(--accent); stroke-width: 1; stroke-dasharray: 3 3; opacity: .8; }
+/* per-cycle value bar: fill = worth relative to fee, capped at 150%; the
+   ::after tick marks the 100% (break-even) point */
+.vwrap { display: flex; align-items: center; gap: 8px; justify-content: flex-end; }
+.vtrack { position: relative; width: 64px; height: 6px; background: var(--panel2); border-radius: 3px; flex: none; }
+.vfill { height: 100%; border-radius: 3px; max-width: 100%; }
+.vtrack::after { content: ''; position: absolute; left: 66.67%; top: -2px; bottom: -2px; width: 1px; background: var(--muted); opacity: .8; }
 
 .provider-title { display: flex; align-items: center; gap: 8px; font-weight: 600; font-size: 13px; }
 .provider-title input[type="text"] {

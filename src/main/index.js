@@ -6,6 +6,7 @@ import { Store } from './core/store.js'
 import { UsageDb } from './core/db.js'
 import { CLI_META, ensureConfigFile, CONFIG_FILE } from './core/paths.js'
 import { createLitellmPoller, listModels } from './core/parsers/litellm.js'
+import { computeAllSubscriptionStats, computePlanBreakdown, computePlanTimeline, computeResetWindows } from './core/subscriptions.js'
 import { migrateLegacyLitellmConfig } from './core/migrateLitellm.js'
 import { makeTrayIcon } from './trayIcon.js'
 
@@ -128,6 +129,46 @@ async function init() {
       return { ok: false, error: String(e) }
     }
   })
+  // Subscription plans (monthly flat fees vs actual usage cost). Stats are
+  // computed live from the store's deduped records — the hourly DB has no
+  // project (key-alias) dimension, which the LiteLLM key filter needs.
+  ipcMain.handle('subs:list', () => db?.listSubscriptions() ?? [])
+  // A save/delete pings the report window AND re-broadcasts the snapshot: the
+  // popup's Quota windows section refetches `subs:resets` on each snapshot, so
+  // without this an edit here wouldn't reach it until some CLI happened to write
+  // a log file (the only other thing that fires an update).
+  ipcMain.handle('subs:save', (_e, payload) => {
+    if (!db) return null
+    const saved = db.upsertSubscription(payload)
+    if (reportWin && !reportWin.isDestroyed()) reportWin.webContents.send('report-updated')
+    broadcastSnapshot()
+    return saved
+  })
+  ipcMain.handle('subs:delete', (_e, id) => {
+    if (!db) return
+    db.deleteSubscription(id)
+    if (reportWin && !reportWin.isDestroyed()) reportWin.webContents.send('report-updated')
+    broadcastSnapshot()
+  })
+  ipcMain.handle('subs:stats', () =>
+    db && store ? computeAllSubscriptionStats(db.listSubscriptions(), store.dedupedRecords(), Date.now()) : []
+  )
+  // Quota-reset windows for the tray popup. Recomputed per call (cheap) so the
+  // popup's countdown always reflects the newest records.
+  ipcMain.handle('subs:resets', () =>
+    db && store ? computeResetWindows(db.listSubscriptions(), store.dedupedRecords(), Date.now()) : []
+  )
+  ipcMain.handle('subs:timeline', (_e, fromMs, toMs) =>
+    db && store
+      ? computePlanTimeline(db.listSubscriptions(), store.dedupedRecords(), fromMs, toMs, Date.now())
+      : null
+  )
+  ipcMain.handle('subs:breakdown', (_e, fromMs, toMs) =>
+    db && store
+      ? computePlanBreakdown(db.listSubscriptions(), store.dedupedRecords(), fromMs, toMs, Date.now())
+      : { totalCost: 0, plans: [], unplanned: { fees: 0, cost: 0, tokens: 0, turns: 0, models: [] } }
+  )
+
   ipcMain.handle('litellm:get-model-settings', (_e, providerId) => db?.listModelSettings(providerId) ?? [])
   ipcMain.handle('litellm:save-model-setting', (_e, payload) => {
     if (!db) return
@@ -244,7 +285,7 @@ function openReport() {
     minHeight: 560,
     show: false,
     backgroundColor: '#0e0f13',
-    title: 'TokenStats — Usage Report',
+    title: 'TokenStats — Token Report',
     autoHideMenuBar: true,
     webPreferences: {
       preload: path.join(__dirname, '../preload/index.cjs'),
@@ -311,7 +352,11 @@ async function exportPng({ which = 'report', mode = 'save' } = {}) {
   try {
     if (!isPopup) {
       // Grow the window to fit its full content so the screenshot isn't clipped.
-      const h = await targetWin.webContents.executeJavaScript('document.body.scrollHeight')
+      // The .report container scrolls internally (body is overflow:hidden), so
+      // its scrollHeight — not body's — carries the true content height.
+      const h = await targetWin.webContents.executeJavaScript(
+        "Math.max(document.body.scrollHeight, document.querySelector('.report')?.scrollHeight ?? 0)"
+      )
       const bounds = targetWin.getBounds()
       const display = screen.getDisplayMatching(bounds)
       const target = Math.min(Math.ceil(h) + 8, display.workArea.height)
@@ -359,7 +404,7 @@ function createTray() {
   tray.on('right-click', () => {
     const menu = Menu.buildFromTemplate([
       { label: 'Open TokenStats', click: () => showWindow() },
-      { label: 'Usage report…', click: () => openReport() },
+      { label: 'Token report…', click: () => openReport() },
       { label: 'Settings…', click: () => openSettings() },
       { type: 'separator' },
       { label: 'Refresh now', click: async () => { await store.scanAll(); await Promise.all(store.pollers.map((p) => store.forcePoll(p.cli))); broadcastSnapshot() } },

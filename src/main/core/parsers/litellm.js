@@ -121,7 +121,9 @@ function applyModelSettings(records, modelSettings) {
   for (const r of records) {
     const s = modelSettings.get(r.model)
     if (s && s.visible === false) continue
-    out.push(s?.displayName ? { ...r, model: s.displayName } : r)
+    // Keep the raw id alongside a rename so anything matching on model
+    // identity (subscription-plan model filters) survives a display rename.
+    out.push(s?.displayName ? { ...r, model: s.displayName, rawModel: r.model } : r)
   }
   return out
 }
