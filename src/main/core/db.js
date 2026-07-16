@@ -4,6 +4,7 @@ import crypto from 'node:crypto'
 import { createRequire } from 'node:module'
 import { CONFIG_DIR } from './paths.js'
 import { costFor } from './pricing.js'
+import { RESET_PERIODS, ANCHORED_PERIODS } from './subscriptions.js'
 
 const require = createRequire(import.meta.url)
 
@@ -50,7 +51,61 @@ CREATE TABLE IF NOT EXISTS litellm_model_settings (
   PRIMARY KEY (provider_id, model)
 );
 CREATE INDEX IF NOT EXISTS idx_lms_provider ON litellm_model_settings(provider_id);
+
+CREATE TABLE IF NOT EXISTS subscriptions (
+  id          TEXT    PRIMARY KEY,
+  name        TEXT    NOT NULL,
+  monthly_usd REAL    NOT NULL DEFAULT 0,
+  start_date  TEXT    NOT NULL,   -- 'YYYY-MM-DD' (local), billing anchor
+  active      INTEGER NOT NULL DEFAULT 1,
+  end_date    TEXT,               -- 'YYYY-MM-DD' set on deactivation; billing stops after
+  bindings    TEXT    NOT NULL DEFAULT '[]',  -- JSON [{cli, keyAlias?, models?}]
+  reset_periods TEXT,             -- JSON subset of RESET_PERIODS, e.g. ["5h","weekly"] — quota windows
+  reset_anchors TEXT,             -- JSON per-period anchor, {"weekly":"YYYY-MM-DDTHH:mm","monthly":"YYYY-MM-DD"}
+  reset_anchor  TEXT,             -- DEAD: pre-multi-anchor single monthly anchor, migrated into reset_anchors
+  created_at  INTEGER NOT NULL,
+  updated_at  INTEGER NOT NULL
+);
 `
+
+// sql.js gives us no migration framework, and SCHEMA above only CREATEs tables
+// that don't exist yet — so a column added to a table an existing install
+// already has needs an explicit ALTER. Additive-only and idempotent: safe to
+// run on every open, and an older build reading the newer file just ignores it.
+function migrateSchema(db) {
+  const columns = (table) => {
+    const res = db.exec(`PRAGMA table_info(${table})`)
+    return new Set(res[0] ? res[0].values.map((v) => v[1]) : [])
+  }
+  const subs = columns('subscriptions')
+  if (!subs.has('reset_periods')) {
+    db.run('ALTER TABLE subscriptions ADD COLUMN reset_periods TEXT')
+    // Quota windows were briefly a single-select `reset_period` column before
+    // becoming a multi-select set (a plan can have both a 5h and a weekly cap).
+    // Carry any value over so the choice isn't silently lost. SQLite can't drop
+    // a column on older versions, so the dead one is just left in place.
+    if (subs.has('reset_period')) {
+      db.run(
+        `UPDATE subscriptions SET reset_periods = '["' || reset_period || '"]'
+         WHERE reset_period IS NOT NULL AND reset_period <> 'none'`
+      )
+    }
+  }
+  if (!subs.has('reset_anchor')) db.run('ALTER TABLE subscriptions ADD COLUMN reset_anchor TEXT')
+  if (!subs.has('reset_anchors')) {
+    db.run('ALTER TABLE subscriptions ADD COLUMN reset_anchors TEXT')
+    // The single `reset_anchor` only ever drove the monthly window; weekly needs
+    // its own now, so anchors became a per-period map. Carry the old value into
+    // the monthly slot. (String-concat rather than json_object() — the JSON1
+    // extension isn't guaranteed in this sql.js build.)
+    if (subs.has('reset_anchor')) {
+      db.run(
+        `UPDATE subscriptions SET reset_anchors = '{"monthly":"' || reset_anchor || '"}'
+         WHERE reset_anchor IS NOT NULL AND reset_anchors IS NULL`
+      )
+    }
+  }
+}
 
 export class UsageDb {
   constructor({ dbPath, wasmPath } = {}) {
@@ -71,6 +126,7 @@ export class UsageDb {
     }
     this.db = bytes ? new this.SQL.Database(bytes) : new this.SQL.Database()
     this.db.run(SCHEMA)
+    migrateSchema(this.db)
     return this
   }
 
@@ -182,6 +238,64 @@ export class UsageDb {
     this.persist()
   }
 
+  // ---- subscription plans (monthly flat-fee tracking) ---------------------
+
+  listSubscriptions() {
+    return this.rows('SELECT * FROM subscriptions ORDER BY created_at ASC').map(mapSubscriptionRow)
+  }
+
+  getSubscription(id) {
+    const r = this.rows('SELECT * FROM subscriptions WHERE id = ?', [id])[0]
+    return r ? mapSubscriptionRow(r) : null
+  }
+
+  // id absent -> insert (uuid generated here); id present -> update in place.
+  upsertSubscription({ id, name, monthlyUsd, startDate, active, endDate, bindings, resetPeriods, resetAnchors }) {
+    const now = Date.now()
+    const existing = id ? this.getSubscription(id) : null
+    // Filtered through RESET_PERIODS and de-duped, in canonical order, so the
+    // stored set can't carry junk a hand-edited row (or an older build) put there.
+    const periods = RESET_PERIODS.filter((p) => (Array.isArray(resetPeriods) ? resetPeriods : []).includes(p))
+    // Anchors are kept only for the periods that actually use one ('5h' is
+    // rolling and has none), so a stale anchor can't linger after a period is
+    // unticked and silently come back if it's re-ticked later.
+    const anchors = {}
+    for (const p of periods) {
+      const v = resetAnchors && resetAnchors[p]
+      if (ANCHORED_PERIODS.includes(p) && typeof v === 'string' && v) anchors[p] = v
+    }
+    const row = {
+      id: existing ? id : id || crypto.randomUUID(),
+      name,
+      monthlyUsd: Number(monthlyUsd) || 0,
+      startDate,
+      active: active !== false ? 1 : 0,
+      endDate: endDate || null,
+      bindings: JSON.stringify(Array.isArray(bindings) ? bindings : []),
+      // no windows is stored as NULL so "not tracked" has one representation
+      resetPeriods: periods.length ? JSON.stringify(periods) : null,
+      resetAnchors: Object.keys(anchors).length ? JSON.stringify(anchors) : null,
+    }
+    if (existing) {
+      this.db.run(
+        'UPDATE subscriptions SET name=?, monthly_usd=?, start_date=?, active=?, end_date=?, bindings=?, reset_periods=?, reset_anchors=?, updated_at=? WHERE id=?',
+        [row.name, row.monthlyUsd, row.startDate, row.active, row.endDate, row.bindings, row.resetPeriods, row.resetAnchors, now, row.id]
+      )
+    } else {
+      this.db.run(
+        'INSERT INTO subscriptions (id,name,monthly_usd,start_date,active,end_date,bindings,reset_periods,reset_anchors,created_at,updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?)',
+        [row.id, row.name, row.monthlyUsd, row.startDate, row.active, row.endDate, row.bindings, row.resetPeriods, row.resetAnchors, now, now]
+      )
+    }
+    this.persist()
+    return this.getSubscription(row.id)
+  }
+
+  deleteSubscription(id) {
+    this.db.run('DELETE FROM subscriptions WHERE id = ?', [id])
+    this.persist()
+  }
+
   // ---- queries for the report ---------------------------------------------
 
   rows(sql, params = []) {
@@ -265,4 +379,55 @@ function mapProviderRow(r) {
 
 function mapSettingRow(r) {
   return { model: r.model, visible: !!r.visible, displayName: r.display_name || null }
+}
+
+// Always a canonically-ordered, valid subset — a malformed or hand-edited value
+// degrades to "no quota windows" rather than throwing on the popup's hot path.
+function parseResetPeriods(raw) {
+  if (!raw) return []
+  try {
+    const parsed = JSON.parse(raw)
+    if (!Array.isArray(parsed)) return []
+    return RESET_PERIODS.filter((p) => parsed.includes(p))
+  } catch {
+    return []
+  }
+}
+
+// Always an object keyed by anchored periods only; malformed JSON degrades to
+// "no anchors" rather than throwing on the popup's hot path.
+function parseResetAnchors(raw) {
+  if (!raw) return {}
+  try {
+    const parsed = JSON.parse(raw)
+    if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) return {}
+    const out = {}
+    for (const p of ANCHORED_PERIODS) if (typeof parsed[p] === 'string' && parsed[p]) out[p] = parsed[p]
+    return out
+  } catch {
+    return {}
+  }
+}
+
+function mapSubscriptionRow(r) {
+  let bindings = []
+  try {
+    const parsed = JSON.parse(r.bindings)
+    if (Array.isArray(parsed)) bindings = parsed
+  } catch {
+    // malformed JSON in a hand-edited DB: treat as no bindings
+  }
+  return {
+    id: r.id,
+    name: r.name,
+    monthlyUsd: r.monthly_usd,
+    startDate: r.start_date,
+    active: !!r.active,
+    endDate: r.end_date || null,
+    bindings,
+    resetPeriods: parseResetPeriods(r.reset_periods),
+    resetAnchors: parseResetAnchors(r.reset_anchors),
+    createdAt: r.created_at,
+    updatedAt: r.updated_at,
+  }
 }

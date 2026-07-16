@@ -6,12 +6,13 @@ TokenStats is an Electron/Vite desktop app. Main-process code lives in `src/main
 
 ## Build, Test, and Development Commands
 
-- `npm run dev` starts the Electron app with Vite hot reload for local development.
+- `npm run dev` starts the Electron app with Vite hot reload for local development. Quit the installed TokenStats from the tray first — it shares the single-instance lock, so otherwise dev exits immediately and the installed app's window pops up instead.
 - `npm run build` compiles the app into `out`.
 - `npm start` previews the built app.
 - `npm run test:parsers` runs parser checks against local CLI transcript data and prints totals.
 - `npm run test:db` exercises the local SQLite/sql.js database flow.
-- `npm run package` builds an unpacked Electron package in `dist`; `npm run package:nsis` builds the Windows installer.
+- `npm run package` builds an unpacked Electron package in `dist` — a debug aid, not an installer.
+- `npm run release` is the only way to build an installer: it refuses a dirty tree, bumps the patch version, builds, packages the NSIS installer, silently reinstalls over the running app, and relaunches. `npm run release -- -NoInstall` stops after writing the installer. Note `dev`/`build` only refresh `out/` and never touch the installed app that Windows autostarts.
 
 ## Coding Style & Naming Conventions
 

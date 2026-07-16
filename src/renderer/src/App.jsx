@@ -30,6 +30,48 @@ const compact = (n) => {
   return String(Math.round(n))
 }
 const usd = (n) => (n || 0).toFixed(2)
+// Mirrors core/subscriptions.js's RESET_PERIODS (renderer can't import from main).
+const RESET_LABEL = { '5h': '5h', weekly: 'wk', monthly: 'mo' }
+const RESET_FULL = { '5h': '5-hour', weekly: 'weekly', monthly: 'monthly' }
+// The billing-renewal ring is money, not tokens, so it gets the report's fee
+// color rather than the plan's brand color — the two clocks are unrelated and
+// shouldn't read as the same thing.
+const FEE_COLOR = '#6478cf'
+// Coarse duration for the reset countdown — minute granularity is plenty, and
+// it keeps the label from jittering on every tick.
+const dur = (ms) => {
+  const s = Math.max(0, Math.round(ms / 1000))
+  const d = Math.floor(s / 86400)
+  const h = Math.floor((s % 86400) / 3600)
+  const m = Math.floor((s % 3600) / 60)
+  if (d) return `${d}d ${h}h`
+  if (h) return `${h}h ${m}m`
+  return m ? `${m}m` : '<1m'
+}
+// Wall-clock time the window resets at; weekly windows need the date too.
+const atTime = (ts, periodMs) => {
+  const d = new Date(ts)
+  const t = d.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })
+  return periodMs >= 86400000 ? `${d.toLocaleDateString([], { month: 'short', day: 'numeric' })} ${t}` : t
+}
+// Minimal ratio icon: a ring showing how much of a quota window is LEFT. The
+// popup is only 380px wide, so this replaces a full-width progress bar.
+function Ring({ frac, color, size = 12 }) {
+  const r = (size - 2.5) / 2
+  const c = 2 * Math.PI * r
+  const mid = size / 2
+  return (
+    <svg className="ring" width={size} height={size} viewBox={`0 0 ${size} ${size}`} aria-hidden="true">
+      <circle cx={mid} cy={mid} r={r} fill="none" stroke="var(--panel2)" strokeWidth="2.5" />
+      <circle
+        cx={mid} cy={mid} r={r} fill="none" stroke={color} strokeWidth="2.5"
+        strokeDasharray={`${frac * c} ${c}`}
+        transform={`rotate(-90 ${mid} ${mid})`}
+      />
+    </svg>
+  )
+}
+
 const ago = (ts) => {
   if (!ts) return ''
   const s = Math.max(0, Math.round((Date.now() - ts) / 1000))
@@ -44,10 +86,29 @@ export default function App() {
   const [tab, setTab] = useState('today-models')
   const [shotMenu, setShotMenu] = useState(false)
   const [copied, setCopied] = useState(false)
+  const [resets, setResets] = useState([])
+  const [now, setNow] = useState(() => Date.now())
 
   useEffect(() => {
+    // Quota windows only change when time passes (handled by the ticker below)
+    // or when new usage lands — which is exactly when a snapshot arrives. So
+    // refetch on snapshot rather than polling, and the popup stays quiet while
+    // hidden.
+    const loadResets = () => window.api.subsResets().then(setResets)
     window.api.getSnapshot().then(setSnap)
-    return window.api.onSnapshot(setSnap)
+    loadResets()
+    return window.api.onSnapshot((s) => {
+      setSnap(s)
+      loadResets()
+    })
+  }, [])
+
+  // Keeps the countdown moving between snapshots. Remaining time is derived
+  // locally from each window's `end`, so a window expiring while idle flips to
+  // "no open window" on its own without another IPC round-trip.
+  useEffect(() => {
+    const h = setInterval(() => setNow(Date.now()), 30000)
+    return () => clearInterval(h)
   }, [])
 
   // Screenshot the popup itself. The menu must be gone from the frame first,
@@ -95,7 +156,7 @@ export default function App() {
           <span>TokenStats</span>
         </div>
         <div className="hwin">
-          <button className="ghost" title="Usage report" onClick={() => window.api.openReport()}>▤</button>
+          <button className="ghost" title="Token report" onClick={() => window.api.openReport()}>▤</button>
           <button className="ghost" title="Settings" onClick={() => window.api.openSettings()}>⚙</button>
           <div className="shot">
             <button className="ghost" title="Screenshot" onClick={() => setShotMenu((v) => !v)}>⎙</button>
@@ -125,6 +186,67 @@ export default function App() {
         <div className="hero-num">{compact(totalTok)}</div>
         <div className="hero-sub">tokens · <span className="cost">{usd(totalCost)}</span> est.</div>
       </div>
+
+      {resets.length > 0 && (
+        <section className="block resets">
+          <h3>Quota windows</h3>
+          {resets.map((r) => {
+            const cli = r.bindings?.[0]?.cli
+            const color = cli ? (CLI[cli] || FALLBACK_META(cli)).color : '#5b6172'
+            return (
+              <div className="reset" key={r.id}>
+                <span className="dot sm" style={{ background: color }} />
+                <span className="ellipsis">{r.name}</span>
+                <span className="rwins">
+                  {r.windows.map((w) => {
+                    // `open` came from main at fetch time; re-check against the
+                    // live clock so an expiry mid-tick shows without a refetch.
+                    const open = w.open && w.end > now
+                    const left = open ? w.end - now : 0
+                    const frac = open ? Math.min(1, Math.max(0, left / w.periodMs)) : 0
+                    return (
+                      <span
+                        className="rwin"
+                        key={w.period}
+                        title={
+                          open
+                            ? `${r.name} · ${RESET_FULL[w.period]} quota\n` +
+                              `${dur(left)} left — resets ${atTime(w.end, w.periodMs)}\n` +
+                              `${compact(w.tokens)} tokens · $${usd(w.cost)} · ${w.turns} turns this window`
+                            : `${r.name} · ${RESET_FULL[w.period]} quota\nno open window — your next request starts one`
+                        }
+                      >
+                        <Ring frac={frac} color={open ? color : '#5b6172'} />
+                        <span className="rwin-p">{RESET_LABEL[w.period] || w.period}</span>
+                        <span className="rwin-t">{open ? dur(left) : 'idle'}</span>
+                      </span>
+                    )
+                  })}
+                  {/* Subscription renewal — a separate clock off startDate (when
+                      the fee is charged), not a token quota. */}
+                  {r.renewal && r.monthlyUsd > 0 && (
+                    <span
+                      className="rwin"
+                      title={
+                        `${r.name} · subscription renewal\n` +
+                        `$${usd(r.monthlyUsd)} bills again ${atTime(r.renewal.end, r.renewal.periodMs)}\n` +
+                        `${dur(Math.max(0, r.renewal.end - now))} away — billing date, not a token quota`
+                      }
+                    >
+                      <Ring
+                        frac={Math.min(1, Math.max(0, (r.renewal.end - now) / r.renewal.periodMs))}
+                        color={FEE_COLOR}
+                      />
+                      <span className="rwin-p">bill</span>
+                      <span className="rwin-t">{dur(Math.max(0, r.renewal.end - now))}</span>
+                    </span>
+                  )}
+                </span>
+              </div>
+            )
+          })}
+        </section>
+      )}
 
       <section className="bars">
         {visibleCliOrder.map((c) => {

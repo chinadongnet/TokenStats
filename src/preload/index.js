@@ -37,4 +37,14 @@ contextBridge.exposeInMainWorld('api', {
   litellmListModels: (conn) => ipcRenderer.invoke('litellm:list-models', conn),
   litellmGetModelSettings: (providerId) => ipcRenderer.invoke('litellm:get-model-settings', providerId),
   litellmSaveModelSetting: (setting) => ipcRenderer.invoke('litellm:save-model-setting', setting),
+
+  // subscription plans — monthly flat fees vs actual usage cost
+  subsList: () => ipcRenderer.invoke('subs:list'),
+  subsSave: (sub) => ipcRenderer.invoke('subs:save', sub),
+  subsDelete: (id) => ipcRenderer.invoke('subs:delete', id),
+  subsStats: () => ipcRenderer.invoke('subs:stats'),
+  // rolling quota-reset windows (popup countdown)
+  subsResets: () => ipcRenderer.invoke('subs:resets'),
+  subsBreakdown: (fromMs, toMs) => ipcRenderer.invoke('subs:breakdown', fromMs, toMs),
+  subsTimeline: (fromMs, toMs) => ipcRenderer.invoke('subs:timeline', fromMs, toMs),
 })

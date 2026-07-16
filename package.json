@@ -1,6 +1,6 @@
 {
   "name": "tokenstats",
-  "version": "0.1.1",
+  "version": "0.2.7",
   "description": "TokenStats — tray-based token usage monitor for Claude Code, Codex, and Gemini CLIs",
   "type": "module",
   "main": "out/main/index.js",
@@ -13,7 +13,6 @@
     "test:parsers": "node scripts/test-parsers.mjs",
     "test:db": "node scripts/test-db.mjs",
     "package": "electron-vite build && electron-builder --dir",
-    "package:nsis": "electron-vite build && electron-builder --win",
     "release": "powershell -ExecutionPolicy Bypass -File scripts/release.ps1"
   },
   "dependencies": {

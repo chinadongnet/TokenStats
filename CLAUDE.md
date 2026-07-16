@@ -29,6 +29,17 @@ color, sync-minutes, per-model show/hide + rename), stored in `usage.sqlite` (no
 (`litellm:<providerId>`) and shows up as its own row everywhere a built-in CLI would
 — see "Dynamic LiteLLM providers" under Conventions below.
 
+The Settings window also manages **subscription plans** — user-entered monthly flat
+fees (Claude, ChatGPT, Google AI, Cursor, a LiteLLM token plan, …) compared against
+what the covered usage would actually have cost. See `core/subscriptions.js` below
+and the report window's "Subscriptions" tab. An active plan can also declare **token
+quota resets** — any subset of 5h / weekly / monthly, since Claude caps a 5h and a
+weekly window while Cursor and Mimo only have a monthly allowance — which the tray
+popup surfaces as live countdowns. A plan therefore carries **several independent
+clocks**: each quota window has its own user-set anchor, and the *billing* renewal
+runs off the plan's start date. They are unrelated (quota can reset on the 20th while
+the fee bills on the 5th) and must never be derived from one another.
+
 ## Commands
 
 ```bash
@@ -38,7 +49,9 @@ npm run build          # bundle main + preload + renderer into out/
 npm start              # preview the production build
 npm run test:parsers   # HEADLESS: parse real local CLI data, print a snapshot to stdout
 npm run test:db        # HEADLESS: ingest real data into a temp .sqlite, run report queries
-npm run package        # build + electron-builder -> Windows NSIS installer
+npm run package        # build + electron-builder --dir -> UNPACKED dir in dist/win-unpacked (debug aid, not an installer)
+npm run release        # bump + build + NSIS installer + silent reinstall + relaunch  (see below)
+npm run release -- -NoInstall   # same, but stop after writing the installer to dist/
 ```
 
 `npm run test:parsers` is the fastest feedback loop — it runs the entire parsing/
@@ -48,6 +61,25 @@ Electron/GUI, and prints totals. Use it after any change to `src/main/core/**`.
 To smoke-test the actual app headlessly (boots Electron, then exits): launch
 `node_modules/electron/dist/electron.exe . --no-sandbox`, wait a few seconds, confirm
 the process stays alive and stderr is empty, then kill it.
+
+### Releasing (and why dev changes don't reach the tray)
+
+- `npm run dev` and `npm run build` only refresh `out/`. The tray icon you see after a
+  reboot is the **installed** copy at `%LOCALAPPDATA%\Programs\tokenstats\TokenStats.exe`,
+  which is replaced only by running the NSIS installer. **`npm run release` is the only
+  thing that closes that loop.** There is no auto-update.
+- **Quit the installed TokenStats from the tray before `npm run dev`.** Dev and the
+  installed build share `userData` (`%APPDATA%\tokenstats` — package.json `name` is
+  `tokenstats` and `productName` lives only under the `build` key, so `app.getName()`
+  resolves the same in both), so they share the single-instance lock. Dev will exit and
+  the *installed* app's window will pop up instead — looking exactly like "my changes
+  didn't load". The lock is correct: two instances would both ingest into one
+  `usage.sqlite`, and sql.js rewrites the whole file. `index.js` logs before quitting.
+- Ground truth for what's running: version **and build time**, in the tray tooltip /
+  popup footer / report footer. **Version alone is not enough** — dev iterates without
+  bumping, so two different builds routinely share one version number.
+- `release.ps1` refuses to run on a dirty tree and auto-bumps the patch version, so every
+  installer maps to one tagged commit. Don't build installers any other way.
 
 ## Architecture
 
@@ -151,9 +183,101 @@ testable via `npm run test:parsers`.
     `listModelSettings(providerId)`, `getModelSettingsMap(providerId)` (hot path —
     called on every poller `poll()`/`reapplySettings()`), `saveModelSetting({...})`
     (upsert via `ON CONFLICT`).
+  - **subscription plans** — `subscriptions` (id, name, monthly_usd, start_date,
+    active, end_date, bindings-as-JSON, reset_period). CRUD: `listSubscriptions()`,
+    `getSubscription(id)`, `upsertSubscription({id?, ...})`,
+    `deleteSubscription(id)`. A binding is `{cli, keyAlias?, models?}` — see
+    `subscriptions.js` below. `reset_periods` (JSON **subset** of `RESET_PERIODS`,
+    filtered + canonically ordered on both read and write, empty → NULL) and
+    `reset_anchors` (JSON per-period map, e.g.
+    `{"weekly":"2026-07-13T09:00","monthly":"2026-06-05"}`, kept only for ticked
+    `ANCHORED_PERIODS` so a stale anchor can't resurface) are the **quota**-reset
+    windows, unrelated to the monthly *billing* anchor — see `subscriptions.js`.
+    `reset_anchor` (singular) is dead — migrated into `reset_anchors.monthly`.
   Every mutating method ends with `persist()` (whole-file re-export + write, same as
   `ingest()` — no WAL). Stays pure-Node (loads the wasm via `wasmBinary`), so it's
   testable with `node scripts/test-db.mjs`.
+  **Schema changes need an explicit migration**: `SCHEMA` only `CREATE TABLE IF NOT
+  EXISTS`, so a column added to a table an existing install already has is invisible
+  to it. `migrateSchema(db)` (run from `open()` right after `SCHEMA`) does the
+  `ALTER TABLE ADD COLUMN`s, guarded by `PRAGMA table_info`. Additive-only and
+  idempotent — add to it rather than editing `SCHEMA` alone. It also back-fills where
+  a shape changed (single-select `reset_period` → `reset_periods`; single
+  `reset_anchor` → `reset_anchors.monthly`), leaving the superseded columns in place
+  as dead weight — SQLite can't reliably drop a column on older versions. Back-fill
+  SQL uses string concat, not `json_object()`: the JSON1 extension isn't guaranteed
+  in this sql.js build.
+- **`subscriptions.js`** — pure billing math for subscription plans, no Electron/DB
+  imports. `computeAllSubscriptionStats(subs, records, now)` turns DB subscription
+  rows plus the store's **deduped records** (must be deduped — this re-aggregates
+  token cost) into per-plan stats: billed monthly cycles anchored to the start date
+  (day-of-month clamped in short months, so a Jan 31 start bills Feb 28), total
+  paid (one charge per cycle start; while `active` cycles accrue to "now",
+  deactivated plans bill only cycles starting on/before `end_date`, and their
+  final cycle's coverage — usage ownership, timeline lane, cycle labels — is
+  clipped to the `end_date` day while keeping its full fee), and the
+  actual cost of covered usage per cycle (`costFor()`, so LiteLLM's real spend is
+  used where present), plus a calendar-month series (`months`: fee lands in the
+  month its cycle starts, usage in its record's month) that the report's
+  fee-vs-worth chart uses so months align across plans with different anchors.
+  `computePlanBreakdown(subs, records, fromMs, toMs)` groups a time range's
+  usage by the plan covering it, with per-plan in-range fees, usage worth,
+  tokens, and a per-model breakdown — served via the `subs:breakdown` IPC for
+  the report's "By plan" view and its "Plan fees" tile. **Record→plan
+  ownership is time-aware and exclusive** (`planAssigner`): a plan owns a
+  record only when its bindings match AND the record falls inside the plan's
+  billed coverage (first cycle start → last billed cycle end); when coverages
+  overlap — an ended "Pro" whose last paid cycle runs past the start of its
+  replacement "Plus" over the same sources — the most recently *started* plan
+  wins, so upgrade chains split at the switch date instead of the older plan
+  starving the newer one. `computeAllSubscriptionStats` pre-assigns records
+  through the same assigner, so overlapping plans never double-count usage in
+  the Token Plans tab either; records no plan owns land in `unplanned`.
+  `computePlanTimeline(subs, records, fromMs, toMs)` (IPC `subs:timeline`)
+  feeds the report's zoomable timeline: per plan the billing-cycle segments
+  overlapping the window (each with fee + the usage cost/tokens inside it),
+  in-window totals + models (PlanBreakdown-compatible shape), a per-local-day
+  stacked usage series keyed by owning plan (`'un'` = unplanned), and the
+  overall data span for zoom clamping. A plan's `bindings` select which records count: each is
+  `{cli}` (a fixed CLI or `litellm:<providerId>`) optionally narrowed by
+  `keyAlias` (matches `record.project`, i.e. the LiteLLM key alias — how a token
+  plan like Mimo sharing a proxy with other keys is isolated) and `models` (a
+  model-id allowlist, matched against `rawModel` first so Settings renames don't
+  unbind it; null = all models). Stats are served live via the `subs:stats` IPC
+  from `store.dedupedRecords()` — not the hourly DB, which lacks the project/key
+  dimension the keyAlias filter needs.
+  `computeResetWindows(subs, records, now)` (IPC `subs:resets`) covers the **quota**
+  windows — orthogonal to all the billing math above. A plan declares a **set** of
+  them (`resetPeriods`, any subset of `RESET_PERIODS` = `['5h','weekly','monthly']`),
+  because real plans differ: Claude caps 5h *and* weekly, Cursor and a Mimo token
+  plan only have a monthly allowance. Returns
+  `{id, name, monthlyUsd, bindings, windows[], renewal}` per active plan, windows in
+  canonical order. The two window kinds are **not** the same shape:
+  - **`5h` is ROLLING** (`ROLLING_PERIOD_MS`), modelling Claude's rate limit: the
+    window opens on the first request made *after the previous one expired* and
+    resets 5h later — **not** a clock-aligned schedule, so it can't be derived from
+    the wall clock and has no anchor to configure. `rollingWindow()` replays the
+    chain forward from the plan's first record (where window N ends decides where
+    N+1 may open). Idle past the last window's end = no open window (`open: false`)
+    until the next request.
+  - **`weekly`/`monthly` are ANCHORED** (`ANCHORED_PERIODS`), each reading its **own**
+    entry from the plan's `resetAnchors` map (falling back to `startDate`) — they
+    reset on unrelated dates, so one shared anchor would be wrong. Weekly repeats
+    every 7d from a date+**time** (`parseWhenLocal` accepts `YYYY-MM-DDTHH:mm`;
+    fixed-ms stepping means DST shifts it an hour until re-set). Monthly runs
+    anchor-day to anchor-day via `cycleStart`'s short-month clamping. Both are always
+    open, and monthly's length varies, so `periodMs` is `end - start`, not a constant.
+  **`renewal` is a third, independent clock**: the plan's BILLING cycle off
+  `startDate` (when the fee is charged again) — the one place startDate drives a
+  countdown. A plan's quota can reset on the 20th while its fee bills on the 5th;
+  both are reported and neither derives from the other. Don't conflate them.
+  Future-stamped records (LiteLLM's noon-UTC day buckets) can't *open* a rolling
+  window, but **do** still count toward anchored ones — dropping them would
+  undercount exactly the plans (Mimo) that use a monthly quota. Only **active** plans
+  with at least one period are returned (a plan tracking no window stays hidden even
+  though it has a renewal date), and ownership goes through the same exclusive
+  `planAssigner`, so overlapping plans never double-count. Consumed by the tray
+  popup, not the report.
 - **`paths.js`** — resolves the data roots and reads user config. Each of the 5 fixed
   CLIs has an array of roots (`CLI_ROOTS[cli]`): the local dir first (overridable via
   `AIMON_*_ROOT` env vars), then any **extra dirs** listed under `extraRoots` in
@@ -195,7 +319,9 @@ components don't double-count `cacheRead`.
 
 Records may also carry an optional **`dedupKey`** — see de-duplication below — and an
 optional **`cost`**, which overrides the `pricing.js` estimate with a real dollar
-figure (currently only LiteLLM sets this).
+figure (currently only LiteLLM sets this). A LiteLLM record whose model was renamed
+via Settings additionally carries **`rawModel`** (the original API model id) so
+identity-based matching (subscription model filters) survives the rename.
 
 ### Electron shell — `src/main/`
 
@@ -220,17 +346,28 @@ figure (currently only LiteLLM sets this).
   `store.forcePoll()` (new/edited connection — bypasses the fetch throttle) or
   `store.reapplyPoller()` (model visibility/rename — no network call), then
   `broadcastSnapshot()` to push the change to the popup/tray/DB immediately instead of
-  waiting for the next poll timer tick. `dynamicCliMeta` (module-level, kept in sync
+  waiting for the next poll timer tick. The `subs:*` IPC handlers (`list`, `save`,
+  `delete`, `stats`, `resets`) also live here — `subs:stats`/`subs:resets` compute
+  live from `store.dedupedRecords()` (see `core/subscriptions.js`), and a
+  save/delete pings the report window (`report-updated`) so its Subscriptions tab
+  refreshes. `dynamicCliMeta` (module-level, kept in sync
   by `refreshLitellmPollers()`) is consulted alongside the static `CLI_META` wherever
   a lookup needs to resolve a `litellm:<id>` (tray recolor in `updateTray()`,
   `open-data-dir`'s `shell.openExternal(provider.baseUrl)` fallback for providers).
 - **`trayIcon.js`** — renders the tray icon at runtime as a raw BGRA bitmap
   (`nativeImage.createFromBitmap`) so no image asset files are needed; recolored by the
   most recently active CLI (built-in or dynamic LiteLLM provider).
+- **`autoLaunch.js`** — the "Start at login" tray checkbox, plus `migrateLegacyRunKeys()`
+  (one-time removal of the pre-rename `com.tokenstatus.app` Run value). Sits here rather
+  than in `core/` because it imports `electron`. On Windows `getLoginItemSettings`
+  matches by path+args while `setLoginItemSettings` writes by registry value name, so
+  both go through one `loginItemOpts()` — when they disagreed, the checkbox reported a
+  state the app had never written and autostart couldn't be turned off.
 - **`src/preload/index.js`** — CommonJS (`require`) contextBridge exposing
   `window.api`: `getSnapshot`, `onSnapshot`, `openDataDir`, `hide`, `quit`,
-  `openSettings`, plus the `litellm*` methods mirroring the IPC handlers above. Built
-  to `out/preload/index.cjs`; `index.js` references it by the `.cjs` extension.
+  `openSettings`, plus the `litellm*` and `subs*` methods (incl. `subsResets`)
+  mirroring the IPC handlers above. Built to `out/preload/index.cjs`; `index.js` references it by the `.cjs`
+  extension.
 
   Main also owns the **SQLite ingest** (throttled to ≤ once / 4s via `scheduleIngest`,
   forced on report open and manual refresh), the **report window** (`openReport` — a
@@ -244,15 +381,69 @@ React + Vite, three views selected by URL hash in `main.jsx`:
 - **`App.jsx`** — the tray popup. Reads the snapshot via `window.api`, subscribes to live
   updates, renders the hero total, per-CLI bars, top models, recent sessions, live
   indicator. Header has Report/Settings buttons (`window.api.openReport()`/
-  `openSettings()`). Header, tabs and footer are pinned; the middle sits in a
+  `openSettings()`). Under the hero sits the **Quota windows** section
+  (`window.api.subsResets()`): **one line per active plan** — name on the left, that
+  plan's clocks inlined on the right, each a `<Ring>` (minimal SVG donut showing the
+  **remaining**-time fraction) + short label + countdown. Quota windows
+  (`5h`/`wk`/`mo`) use the plan's brand color; the **`bill`** chip (billing renewal,
+  from `renewal`, shown only when `monthlyUsd > 0`) uses the report's fee color
+  `#6478cf` — it's money, not tokens, and the two clocks are unrelated, so they must
+  not read as the same thing. Space is the whole constraint: the popup is 380px wide
+  and a plan can show up to 4 chips, so a full-width bar (and even a line per window)
+  was too much — exact tokens/cost/turns and wall-clock reset/bill times live in each
+  chip's `title` tooltip instead. Idle rolling windows render greyed as "idle".
+  Hidden entirely when no plan configures a window. Refetched on each **snapshot**
+  (usage changes are the only thing besides time that can alter a window) rather
+  than polled, so a hidden popup stays quiet; a 30s `setInterval` re-renders the
+  countdown, and remaining time is derived locally from each window's `end` so an
+  expiry mid-tick needs no IPC round-trip. Header, tabs and footer are pinned; the middle sits in a
   `.scroll` region (`flex:1; min-height:0; overflow-y:auto`) so the content is never
   clipped when the window is shorter than the content — which is what makes the
   height-capping in `index.js` safe.
-- **`Report.jsx`** (`#report`) — the usage report window. Pulls hourly/daily/model data
-  from the SQLite DB via IPC and draws hand-rolled **SVG stacked-bar charts** (no chart
-  lib): by-hour for a chosen day, daily trend over a range (7d/30d/all), per-model
-  breakdown, summary tiles. The **Export PNG** button calls `window.api.exportPng()`.
-- **`Settings.jsx`** (`#settings`) — LiteLLM provider management: add/edit/delete
+- **`Report.jsx`** (`#report`) — the "Token Report" window. Pulls hourly/daily/model
+  data from the SQLite DB via IPC and draws hand-rolled **SVG stacked-bar charts** (no
+  chart lib): by-hour for a chosen day, daily trend over a range (7d/30d/all),
+  summary tiles (incl. a "Plan fees" tile — actual subscription money billed in the
+  range, from `subs:breakdown`), and a breakdown card with **By plan** (default —
+  usage grouped under the token plan covering it, each plan showing in-range fees vs
+  worth, value %, and a share-of-total bar; unmatched usage lands in a "No plan"
+  bucket) / By model / By project modes. Tab labels: Charts, By hour, **Logs** (the
+  per-request table), **Token Plans**. The **Export PNG** button calls
+  `window.api.exportPng()`.
+  The **Token Plans** tab (`SubsView`) renders `window.api.subsStats()` — summary
+  tiles (active $/mo, total paid, usage worth, value %), a **zoomable
+  subscription timeline** (`PlanTimeline`: Gantt lane per plan with one fee-
+  labeled segment per billing cycle, alternating opacity marking cycle
+  boundaries; a per-day stacked token-usage band colored by owning plan; a
+  today marker; and the visible window's per-plan/model breakdown underneath,
+  reusing `PlanBreakdown`. Stock-chart interaction — wheel zooms around the
+  cursor via a NON-passive native listener (React's synthetic onWheel is
+  passive, preventDefault would be ignored), pointer-drag pans, both clamped
+  to the data span; every window move re-fetches `subs:timeline` debounced
+  120ms), a **plan comparison**
+  card (`PlanCompare`: per plan, fees-paid vs usage-worth horizontal bars on one
+  shared USD scale, value %, token consumption on its own scale, and the
+  effective paid-$/1M-tokens unit price), a paired-bar chart of
+  fees-paid vs usage-worth per calendar month merged across all plans
+  (`PairedBars`; fee `#6478cf` / worth `#1fa87c`, a CVD-validated 2-slot pair
+  distinct from every CLI brand color), and a per-plan card with a
+  per-billing-cycle fee-vs-usage table whose Value column carries an inline
+  ratio bar with a tick at 100% (break-even). The `.report` container scrolls
+  internally (`height: 100vh; overflow-y: auto` — body is `overflow: hidden`),
+  which is what makes long Settings/Report pages reachable; `exportPng` in
+  `index.js` therefore measures `.report`'s `scrollHeight`, not body's.
+- **`Settings.jsx`** (`#settings`) — two sections. **Subscription plans**:
+  add/edit/delete plan cards (name, USD/month, start date, active toggle — deactivating
+  stamps `endDate` = today, reactivating clears it) with preset templates
+  (Claude/ChatGPT/Google AI/Cursor/Mimo) and per-source binding checkboxes; a LiteLLM
+  binding additionally offers a key-alias input and a load-models checkbox picker for
+  the model filter. An active plan also ticks any subset of **token quota resets**
+  (`RESET_OPTIONS` — 5h / weekly / monthly), which drives the popup's Quota windows
+  section; the control is hidden for inactive plans since only active ones are
+  tracked. Each ticked *anchored* period (`o.anchor` — weekly, monthly) reveals its
+  own input: weekly a `datetime-local` (it needs a time of day), monthly a `date`,
+  both defaulting to the start date via `defaultAnchor()`. 5h shows none — it's
+  rolling, so there is nothing to set. **LiteLLM providers**: add/edit/delete
   provider cards (name, color, base URL, admin key, sync minutes), a "Test
   connection"/"Models" action that calls `litellmListModels()` (throttle-free, works
   for an unsaved draft), and per-model checkboxes (visible) + rename inputs that call
