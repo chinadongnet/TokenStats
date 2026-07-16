@@ -49,7 +49,9 @@ npm run build          # bundle main + preload + renderer into out/
 npm start              # preview the production build
 npm run test:parsers   # HEADLESS: parse real local CLI data, print a snapshot to stdout
 npm run test:db        # HEADLESS: ingest real data into a temp .sqlite, run report queries
-npm run package        # build + electron-builder -> Windows NSIS installer
+npm run package        # build + electron-builder --dir -> UNPACKED dir in dist/win-unpacked (debug aid, not an installer)
+npm run release        # bump + build + NSIS installer + silent reinstall + relaunch  (see below)
+npm run release -- -NoInstall   # same, but stop after writing the installer to dist/
 ```
 
 `npm run test:parsers` is the fastest feedback loop — it runs the entire parsing/
@@ -59,6 +61,25 @@ Electron/GUI, and prints totals. Use it after any change to `src/main/core/**`.
 To smoke-test the actual app headlessly (boots Electron, then exits): launch
 `node_modules/electron/dist/electron.exe . --no-sandbox`, wait a few seconds, confirm
 the process stays alive and stderr is empty, then kill it.
+
+### Releasing (and why dev changes don't reach the tray)
+
+- `npm run dev` and `npm run build` only refresh `out/`. The tray icon you see after a
+  reboot is the **installed** copy at `%LOCALAPPDATA%\Programs\tokenstats\TokenStats.exe`,
+  which is replaced only by running the NSIS installer. **`npm run release` is the only
+  thing that closes that loop.** There is no auto-update.
+- **Quit the installed TokenStats from the tray before `npm run dev`.** Dev and the
+  installed build share `userData` (`%APPDATA%\tokenstats` — package.json `name` is
+  `tokenstats` and `productName` lives only under the `build` key, so `app.getName()`
+  resolves the same in both), so they share the single-instance lock. Dev will exit and
+  the *installed* app's window will pop up instead — looking exactly like "my changes
+  didn't load". The lock is correct: two instances would both ingest into one
+  `usage.sqlite`, and sql.js rewrites the whole file. `index.js` logs before quitting.
+- Ground truth for what's running: version **and build time**, in the tray tooltip /
+  popup footer / report footer. **Version alone is not enough** — dev iterates without
+  bumping, so two different builds routinely share one version number.
+- `release.ps1` refuses to run on a dirty tree and auto-bumps the patch version, so every
+  installer maps to one tagged commit. Don't build installers any other way.
 
 ## Architecture
 
@@ -336,6 +357,12 @@ identity-based matching (subscription model filters) survives the rename.
 - **`trayIcon.js`** — renders the tray icon at runtime as a raw BGRA bitmap
   (`nativeImage.createFromBitmap`) so no image asset files are needed; recolored by the
   most recently active CLI (built-in or dynamic LiteLLM provider).
+- **`autoLaunch.js`** — the "Start at login" tray checkbox, plus `migrateLegacyRunKeys()`
+  (one-time removal of the pre-rename `com.tokenstatus.app` Run value). Sits here rather
+  than in `core/` because it imports `electron`. On Windows `getLoginItemSettings`
+  matches by path+args while `setLoginItemSettings` writes by registry value name, so
+  both go through one `loginItemOpts()` — when they disagreed, the checkbox reported a
+  state the app had never written and autostart couldn't be turned off.
 - **`src/preload/index.js`** — CommonJS (`require`) contextBridge exposing
   `window.api`: `getSnapshot`, `onSnapshot`, `openDataDir`, `hide`, `quit`,
   `openSettings`, plus the `litellm*` and `subs*` methods (incl. `subsResets`)
