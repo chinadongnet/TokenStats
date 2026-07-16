@@ -13,7 +13,6 @@
     "test:parsers": "node scripts/test-parsers.mjs",
     "test:db": "node scripts/test-db.mjs",
     "package": "electron-vite build && electron-builder --dir",
-    "package:nsis": "electron-vite build && electron-builder --win",
     "release": "powershell -ExecutionPolicy Bypass -File scripts/release.ps1"
   },
   "dependencies": {
