@@ -7,6 +7,7 @@ import { UsageDb } from './core/db.js'
 import { CLI_META, ensureConfigFile, CONFIG_FILE } from './core/paths.js'
 import { createLitellmPoller, listModels } from './core/parsers/litellm.js'
 import { codexResetWindows } from './core/parsers/codex.js'
+import { claudeResetWindows, primeClaudeLimits } from './core/claudeLimits.js'
 import { computeAllSubscriptionStats, computePlanBreakdown, computePlanTimeline, computeResetWindows, mergeLiveLimits } from './core/subscriptions.js'
 import { migrateLegacyLitellmConfig } from './core/migrateLitellm.js'
 import { isAutoLaunch, setAutoLaunch, migrateLegacyRunKeys } from './autoLaunch.js'
@@ -171,7 +172,7 @@ async function init() {
     if (!db || !store) return []
     const now = Date.now()
     const entries = computeResetWindows(db.listSubscriptions(), store.dedupedRecords(), now)
-    const liveByCli = { codex: codexResetWindows() }
+    const liveByCli = { codex: codexResetWindows(), claude: claudeResetWindows() }
     const labels = Object.fromEntries(Object.entries(CLI_META).map(([k, v]) => [k, v.label]))
     return mergeLiveLimits(entries, liveByCli, now, labels)
   })
@@ -196,6 +197,10 @@ async function init() {
   refreshLitellmPollers() // populate store.pollers before the initial scan/poll
   await store.start()
   ingestNow() // first full ingest after the initial scan
+  // Prime Claude's live plan-quota (spawns `claude -p /usage` once) so the
+  // popup's Quota-windows section can show it without waiting for the first
+  // 15-min refresh. Fire-and-forget; a snapshot after it lands shows the data.
+  primeClaudeLimits().then(() => broadcastSnapshot()).catch(() => {})
   if (process.env.AIMON_AUTO_REPORT) openReport() // dev/test convenience
   if ('AIMON_SET_AUTOLAUNCH' in process.env) setAutoLaunch(process.env.AIMON_SET_AUTOLAUNCH === '1') // headless toggle
 }

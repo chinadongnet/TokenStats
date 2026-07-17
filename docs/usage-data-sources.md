@@ -14,10 +14,10 @@ Code lives in `src/main/core/parsers/*.js`; the store/watch/poll plumbing is in
 
 | Source      | Transport   | Where the data comes from                                   | Token counts | Quota / limits |
 |-------------|-------------|-------------------------------------------------------------|--------------|----------------|
-| Claude Code | local files | `~/.claude/projects/**/*.jsonl` per-message `usage`         | ✅ accurate  | see below |
-| Codex       | local files | `~/.codex/sessions/**/rollout-*.jsonl` `token_count` events | ✅ accurate  | ✅ **already in the logs** (`rate_limits`) |
-| Gemini      | local files | `~/.gemini/tmp/**/chats/session-*.jsonl`                    | ✅ accurate  | ❌ not present |
-| Antigravity | local files | `~/.gemini/antigravity-cli/conversations/<uuid>.db`         | ✅ accurate  | ❌ not present |
+| Claude Code | local files | `~/.claude/projects/**/*.jsonl` per-message `usage`         | ✅ accurate  | ✅ live via `claude -p /usage` |
+| Codex       | local files | `~/.codex/sessions/**/rollout-*.jsonl` `token_count` events | ✅ accurate  | ✅ live from the logs (`rate_limits`) |
+| Gemini      | local files | `~/.gemini/tmp/**/chats/session-*.jsonl`                    | ✅ accurate  | ❌ CLI deprecated for individuals |
+| Antigravity | local files | `~/.gemini/antigravity-cli/conversations/<uuid>.db`         | ✅ accurate  | ⚠️ TUI-only, not wired |
 | Cursor      | **network** | cursor.com dashboard CSV export (real usage is server-only) | ✅ accurate  | n/a (usage only) |
 | LiteLLM     | **network** | your proxy's admin API                                      | ✅ actual $  | n/a |
 
@@ -157,49 +157,62 @@ Concretely: a "Chat GPT Plus" plan bound to `codex` shows its **weekly** window 
 from Codex's report (e.g. "24% left, resets Jul 23") with a **live** badge, while its
 $20 billing renewal countdown is unchanged.
 
-### Gemini — not feasible from local data ❌
-`gemini --help` exposes no usage/quota subcommand, and the session jsonl carries no
-quota/limit/reset fields. The only account-level material on disk is raw OAuth
-credentials (`~/.gemini/oauth_creds.json`, `google_accounts.json`). Getting Google
-account quota would mean reverse-engineering an authenticated Google endpoint with
-those creds — fragile, and Google's free-tier quota isn't cleanly exposed the way
-Cursor's dashboard export is. Not pursued.
+### Claude Code — done, via the CLI's own `/usage` in print mode ✅
+Token counts are already accurate from the local jsonl. The extra thing `/usage`
+shows — Pro/Max **5-hour session** and **weekly** window consumption + reset times —
+is server-side plan state, and there is no documented API for it (the Analytics /
+Usage-Cost / Rate-Limits APIs need an Admin key and return historical consumption or
+*configured* TPM/RPM, not the rolling-window balance). **But** the CLI's own built-in
+is reachable non-interactively: piping `/usage` into `claude -p` runs it and prints
+text (verified empirically — this corrects an earlier "not feasible" reading based on
+docs alone):
 
-### Antigravity — not feasible ❌
-Antigravity stores per-conversation SQLite DBs (token usage decoded from a protobuf
-blob) but exposes no usage/quota surface and isn't even on `PATH` as a CLI. No
-accessible `/usage`-style source. Not pursued.
+```
+$ printf '/usage\n' | claude -p --output-format text
+Current session: 20% used · resets Jul 18, 2:20am (Asia/Singapore)
+Current week (all models): 11% used · resets Jul 22, 4pm (Asia/Singapore)
+Current week (Fable): 12% used · resets Jul 22, 4pm (Asia/Singapore)
+```
 
-### Claude Code — not feasible via any documented/authorized path ❌
-Token counts are already accurate from the local jsonl, so nothing there needs a
-sync. The extra thing `/usage` shows — Pro/Max **5-hour and weekly window**
-consumption and reset times — is subscription-plan state on Anthropic's servers and
-is **not** reachable non-interactively:
+`src/main/core/claudeLimits.js` shells out to that (finding the binary at
+`~/.local/bin/claude[.exe]` or on `PATH`), parses "session" → 5h and "week (all
+models)" → weekly into the standard window shape, and feeds `mergeLiveLimits()` under
+`liveByCli.claude`. So a plan bound to `claude` (e.g. "Claude Max 5X") shows its 5h +
+weekly windows **live**. Because each call spawns the CLI and hits the network, it's
+throttled to once / 15 min and the accessor returns cached data while a stale refresh
+runs in the background (the IPC handler stays synchronous). Per-model weekly lines
+(e.g. Fable) are skipped to avoid clutter.
 
-- `/usage` is **interactive-only**; there is no `claude usage --json` / `--print`
-  subcommand.
-- The Agent SDK exposes only client-side `total_cost_usd` estimates (documented as
-  non-authoritative), not plan limits.
-- The **Analytics API** (`/v1/organizations/usage_report/claude_code`), **Usage/Cost
-  API**, and **Rate Limits API** all require an Admin API key and return historical
-  consumption or *configured* TPM/RPM limits — **none** return the 5-hour/weekly
-  rolling-window allocations, remaining balance, or reset times that `/usage` shows.
-- OpenTelemetry export (`CLAUDE_CODE_ENABLE_TELEMETRY=1`) streams token/cost events —
-  same limitation, consumption only.
-- Credentials exist on disk (`~/.claude/.credentials.json`, or the macOS Keychain;
-  also `ANTHROPIC_API_KEY` / `CLAUDE_CODE_OAUTH_TOKEN` env vars), but there is **no
-  documented endpoint** that `/usage` calls to fetch the window data, so there is
-  nothing to authorize against — unlike Cursor's dashboard export.
+### Gemini — CLI deprecated for individuals ❌
+`gemini --help` has no usage subcommand, and driving it now fails auth outright:
+`IneligibleTierError: This client is no longer supported for Gemini Code Assist for
+individuals — migrate to the Antigravity suite`. So the old Gemini CLI is a dead end;
+its successor is Antigravity (below).
 
-Conclusion: no Cursor-style sync is possible today. If Anthropic later ships a
-non-interactive `/usage` flag or a public subscription-limits endpoint, revisit.
+### Antigravity (`agy`) — capturable but too fragile to automate ⚠️
+`agy` **is** a real CLI (`%LOCALAPPDATA%\agy\bin\agy.exe`), the successor to the Gemini
+CLI. Two paths were tried:
+
+- `agy -p "/usage"` (print mode) does **not** run the built-in — it treats the slash
+  command as an *agent prompt* (given `/status` it went and ran `git status` on a
+  nearby repo). So unlike Claude, print mode can't surface the usage view.
+- Driving the **interactive TUI** over a pty (winpty, not the GUI) *does* work: after a
+  ~30 s sign-in it renders "Models & Quota" — per-model bars like
+  `Gemini 3.5 Flash (High) — 9% remaining · Refreshes in 3m`, 38 models across separate
+  Gemini-Pro / Flash / Claude-GPT pools, in a scrollable alternate-screen buffer.
+
+So the data exists, but automating it for a background tray app is a poor trade: every
+poll would need a fresh ~30 s interactive sign-in, then alternate-screen scraping with
+pagination across 38 model lines, and it breaks on any TUI change. Left unwired; a
+cleaner route would be the local `agy agentapi` server (see `bin/agentapi.bat`) if it
+exposes quota programmatically — a future investigation.
 
 ## Verdict
 
-Only **Codex** gains real value from a `/usage`-style sync, and it needs **no
-network** — the `rate_limits` snapshot is already in the rollout logs we parse, and it
-now drives the live overlay on its plan's Quota window. Claude / Gemini / Antigravity
-already report accurate token counts from local files, and their plan-quota data has no
-accessible source, so their Quota windows stay on the manual estimate (badged
-**manual**). If Claude ever ships a non-interactive limits endpoint, plug it into
-`mergeLiveLimits()` as another `liveByCli` source — the UI already handles it.
+**Codex** and **Claude** now drive live overlays on their plans' Quota windows —
+Codex from the `rate_limits` in its local logs (real-time, no network), Claude by
+shelling out to `claude -p /usage` (throttled 15 min). **Gemini** is deprecated, and
+**Antigravity** exposes its quota only through a fragile interactive TUI, so both stay
+on the manual estimate (badged **manual**). Any future clean source (e.g. `agy
+agentapi`) plugs into `mergeLiveLimits()` as another `liveByCli` entry — the UI already
+handles it.
