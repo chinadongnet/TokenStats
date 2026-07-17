@@ -69,12 +69,18 @@ Trade-offs worth knowing:
 - Cursor doesn't expose which project/conversation each request belongs to via this
   endpoint, so all Cursor usage is shown under one combined bucket rather than broken
   out per project.
-- Fetches are cached and throttled to at most once every 15 minutes.
+- Fetches are cached and throttled to at most once every 15 minutes, and are
+  re-run on app startup, on a 5-minute timer, and from the tray's **Refresh now**
+  (so new Cursor usage shows up without needing the Cursor IDE to touch its files).
 - If your Cursor session expires, log into the Cursor IDE again to refresh it.
 - Cursor's own official **Admin/Analytics API** (`cursor.com/docs/api`) does expose
   proper usage endpoints, but only to **Team/Organization** API keys — an individual
   account's personal API key can't reach them, which is why this endpoint is used
   instead.
+
+For the full technical mechanism (exact endpoint, CSV columns, caching, refresh
+cadence) and how the other CLIs compare — including whether their `/usage` quota
+data can be synced — see [`docs/usage-data-sources.md`](docs/usage-data-sources.md).
 
 ## LiteLLM providers
 
