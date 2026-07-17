@@ -1,6 +1,6 @@
 {
   "name": "tokenstats",
-  "version": "0.2.8",
+  "version": "0.2.9",
   "description": "TokenStats — tray-based token usage monitor for Claude Code, Codex, and Gemini CLIs",
   "type": "module",
   "main": "out/main/index.js",
