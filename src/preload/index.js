@@ -43,10 +43,9 @@ contextBridge.exposeInMainWorld('api', {
   subsSave: (sub) => ipcRenderer.invoke('subs:save', sub),
   subsDelete: (id) => ipcRenderer.invoke('subs:delete', id),
   subsStats: () => ipcRenderer.invoke('subs:stats'),
-  // rolling quota-reset windows (popup countdown)
+  // rolling quota-reset windows (popup countdown); live CLI quota (Codex) is
+  // already overlaid into these entries by the main process
   subsResets: () => ipcRenderer.invoke('subs:resets'),
-  // Codex's own reported plan-quota windows (used %, reset time) from its logs
-  codexLimits: () => ipcRenderer.invoke('codex:limits'),
   subsBreakdown: (fromMs, toMs) => ipcRenderer.invoke('subs:breakdown', fromMs, toMs),
   subsTimeline: (fromMs, toMs) => ipcRenderer.invoke('subs:timeline', fromMs, toMs),
 })

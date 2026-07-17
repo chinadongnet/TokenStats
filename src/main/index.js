@@ -7,7 +7,7 @@ import { UsageDb } from './core/db.js'
 import { CLI_META, ensureConfigFile, CONFIG_FILE } from './core/paths.js'
 import { createLitellmPoller, listModels } from './core/parsers/litellm.js'
 import { codexResetWindows } from './core/parsers/codex.js'
-import { computeAllSubscriptionStats, computePlanBreakdown, computePlanTimeline, computeResetWindows } from './core/subscriptions.js'
+import { computeAllSubscriptionStats, computePlanBreakdown, computePlanTimeline, computeResetWindows, mergeLiveLimits } from './core/subscriptions.js'
 import { migrateLegacyLitellmConfig } from './core/migrateLitellm.js'
 import { isAutoLaunch, setAutoLaunch, migrateLegacyRunKeys } from './autoLaunch.js'
 import { makeTrayIcon } from './trayIcon.js'
@@ -161,14 +161,20 @@ async function init() {
     db && store ? computeAllSubscriptionStats(db.listSubscriptions(), store.dedupedRecords(), Date.now()) : []
   )
   // Quota-reset windows for the tray popup. Recomputed per call (cheap) so the
-  // popup's countdown always reflects the newest records.
-  ipcMain.handle('subs:resets', () =>
-    db && store ? computeResetWindows(db.listSubscriptions(), store.dedupedRecords(), Date.now()) : []
-  )
-  // Codex's own plan-quota windows (used %, reset time), read from the rate_limits
-  // snapshot in its rollout logs — the same numbers `/status` shows. Live account
-  // state, so it's served straight from the parser, not the token DB.
-  ipcMain.handle('codex:limits', () => codexResetWindows())
+  // popup's countdown always reflects the newest records. Where a plan is bound
+  // to a CLI that reports its OWN quota (Codex, via the rate_limits snapshot in
+  // its logs — the same numbers `/status` shows), those live used%/reset values
+  // are overlaid onto the plan's estimated windows; plans/CLIs without a live
+  // source fall back to the estimate. Codex is local, so it's effectively
+  // real-time; any future network source would self-throttle (cf. Cursor's 15m).
+  ipcMain.handle('subs:resets', () => {
+    if (!db || !store) return []
+    const now = Date.now()
+    const entries = computeResetWindows(db.listSubscriptions(), store.dedupedRecords(), now)
+    const liveByCli = { codex: codexResetWindows() }
+    const labels = Object.fromEntries(Object.entries(CLI_META).map(([k, v]) => [k, v.label]))
+    return mergeLiveLimits(entries, liveByCli, now, labels)
+  })
   ipcMain.handle('subs:timeline', (_e, fromMs, toMs) =>
     db && store
       ? computePlanTimeline(db.listSubscriptions(), store.dedupedRecords(), fromMs, toMs, Date.now())

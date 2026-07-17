@@ -87,7 +87,6 @@ export default function App() {
   const [shotMenu, setShotMenu] = useState(false)
   const [copied, setCopied] = useState(false)
   const [resets, setResets] = useState([])
-  const [codexLimits, setCodexLimits] = useState([])
   const [now, setNow] = useState(() => Date.now())
 
   useEffect(() => {
@@ -95,10 +94,7 @@ export default function App() {
     // or when new usage lands — which is exactly when a snapshot arrives. So
     // refetch on snapshot rather than polling, and the popup stays quiet while
     // hidden.
-    const loadResets = () => {
-      window.api.subsResets().then(setResets)
-      window.api.codexLimits().then(setCodexLimits)
-    }
+    const loadResets = () => window.api.subsResets().then(setResets)
     window.api.getSnapshot().then(setSnap)
     loadResets()
     return window.api.onSnapshot((s) => {
@@ -191,68 +187,56 @@ export default function App() {
         <div className="hero-sub">tokens · <span className="cost">{usd(totalCost)}</span> est.</div>
       </div>
 
-      {(resets.length > 0 || codexLimits.length > 0) && (
+      {resets.length > 0 && (
         <section className="block resets">
           <h3>Quota windows</h3>
-          {codexLimits.length > 0 && (
-            <div className="reset" key="codex-live">
-              <span className="dot sm" style={{ background: (CLI.codex || FALLBACK_META('codex')).color }} />
-              <span className="ellipsis">Codex</span>
-              <span className="rwins">
-                {codexLimits.map((w) => {
-                  // Real provider-reported numbers: the ring shows USAGE left
-                  // (100 − used_percent), the label shows TIME left to reset.
-                  const color = (CLI.codex || FALLBACK_META('codex')).color
-                  const frac = Math.min(1, Math.max(0, w.remainingPercent / 100))
-                  const left = w.resetsAt ? Math.max(0, w.resetsAt - now) : null
-                  return (
-                    <span
-                      className="rwin"
-                      key={w.label}
-                      title={
-                        `Codex · ${w.label} limit\n` +
-                        `${Math.round(w.usedPercent)}% used — ${Math.round(w.remainingPercent)}% left\n` +
-                        (w.resetsAt ? `resets ${atTime(w.resetsAt, (w.windowMinutes || 0) * 60000)} (${dur(left)})` : 'no reset time reported')
-                      }
-                    >
-                      <Ring frac={frac} color={color} />
-                      <span className="rwin-p">{w.label}</span>
-                      <span className="rwin-t">{left != null ? dur(left) : `${Math.round(w.remainingPercent)}%`}</span>
-                    </span>
-                  )
-                })}
-              </span>
-            </div>
-          )}
           {resets.map((r) => {
             const cli = r.bindings?.[0]?.cli
             const color = cli ? (CLI[cli] || FALLBACK_META(cli)).color : '#5b6172'
+            const isLive = r.source === 'live'
             return (
               <div className="reset" key={r.id}>
                 <span className="dot sm" style={{ background: color }} />
                 <span className="ellipsis">{r.name}</span>
+                {/* Source badge: live = real numbers from the CLI's own logs;
+                    manual = estimated from tracked usage vs the plan config. */}
+                <span
+                  className={`qsrc ${isLive ? 'live' : 'est'}`}
+                  title={
+                    isLive
+                      ? `Live quota read from ${cli}'s own usage report — refreshed as ${cli} runs`
+                      : 'Estimated from tracked token usage against your manually-configured plan'
+                  }
+                >
+                  {isLive ? 'live' : 'manual'}
+                </span>
                 <span className="rwins">
                   {r.windows.map((w) => {
-                    // `open` came from main at fetch time; re-check against the
-                    // live clock so an expiry mid-tick shows without a refetch.
-                    const open = w.open && w.end > now
-                    const left = open ? w.end - now : 0
-                    const frac = open ? Math.min(1, Math.max(0, left / w.periodMs)) : 0
+                    const live = w.source === 'live'
+                    // Estimate windows: ring = TIME left / period. Live windows:
+                    // ring = USAGE left (100 − used_percent) from the CLI itself.
+                    // `open` re-checks the live clock so a mid-tick expiry shows.
+                    const open = live ? (w.end == null || w.end > now) : (w.open && w.end > now)
+                    const left = w.end ? Math.max(0, w.end - now) : 0
+                    const frac = live
+                      ? Math.min(1, Math.max(0, (w.remainingPercent || 0) / 100))
+                      : open ? Math.min(1, Math.max(0, left / w.periodMs)) : 0
+                    const title = live
+                      ? `${r.name} · ${RESET_FULL[w.period] || w.period} quota (live)\n` +
+                        `${Math.round(w.usedPercent)}% used — ${Math.round(w.remainingPercent)}% left\n` +
+                        (w.end ? `resets ${atTime(w.end, w.periodMs)} (${dur(left)})` : 'no reset time reported')
+                      : open
+                        ? `${r.name} · ${RESET_FULL[w.period] || w.period} quota\n` +
+                          `${dur(left)} left — resets ${atTime(w.end, w.periodMs)}\n` +
+                          `${compact(w.tokens)} tokens · $${usd(w.cost)} · ${w.turns} turns this window`
+                        : `${r.name} · ${RESET_FULL[w.period] || w.period} quota\nno open window — your next request starts one`
                     return (
-                      <span
-                        className="rwin"
-                        key={w.period}
-                        title={
-                          open
-                            ? `${r.name} · ${RESET_FULL[w.period]} quota\n` +
-                              `${dur(left)} left — resets ${atTime(w.end, w.periodMs)}\n` +
-                              `${compact(w.tokens)} tokens · $${usd(w.cost)} · ${w.turns} turns this window`
-                            : `${r.name} · ${RESET_FULL[w.period]} quota\nno open window — your next request starts one`
-                        }
-                      >
+                      <span className="rwin" key={w.period} title={title}>
                         <Ring frac={frac} color={open ? color : '#5b6172'} />
                         <span className="rwin-p">{RESET_LABEL[w.period] || w.period}</span>
-                        <span className="rwin-t">{open ? dur(left) : 'idle'}</span>
+                        <span className="rwin-t">
+                          {live ? (w.end ? dur(left) : `${Math.round(w.remainingPercent)}%`) : open ? dur(left) : 'idle'}
+                        </span>
                       </span>
                     )
                   })}

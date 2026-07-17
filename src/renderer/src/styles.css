@@ -100,6 +100,11 @@ header {
 .rwin { display: flex; align-items: center; gap: 4px; color: var(--muted); cursor: default; }
 .rwin .ring { flex: none; }
 .rwin-t { color: var(--text); font-variant-numeric: tabular-nums; }
+/* Quota-source badge: whether a plan's windows are live (from the CLI's own
+   usage report) or estimated from tracked usage against the manual config. */
+.resets .qsrc { flex: none; font-size: 8.5px; text-transform: uppercase; letter-spacing: 0.05em; padding: 1px 4px; border-radius: 4px; line-height: 1.4; cursor: default; }
+.resets .qsrc.live { background: rgba(16, 163, 127, 0.16); color: #12a884; }
+.resets .qsrc.est { background: var(--panel2); color: var(--muted); }
 
 .block { padding: 4px 12px 8px; }
 .block h3 {

@@ -118,7 +118,7 @@ The open question is the *other* thing those tools' `/usage` (Claude) and `/stat
 and weekly rate-limit windows), which are NOT derivable from token logs alone.
 Feasibility per CLI:
 
-### Codex — feasible with zero network (data is already local) ✅
+### Codex — done, zero network (data is already local) ✅
 Codex writes its rate-limit snapshot straight into the rollout jsonl that TokenStats
 already parses. Each `token_count` event carries a `rate_limits` object, e.g.:
 
@@ -132,10 +132,30 @@ already parses. Each `token_count` event carries a `rate_limits` object, e.g.:
 ```
 
 `window_minutes: 10080` is the weekly window; `used_percent` and `resets_at` are the
-same numbers Codex's `/status` shows. The current codex parser only reads the token
-fields and ignores `rate_limits`. **Plan:** extend `parsers/codex.js` to also surface
-the newest `rate_limits` snapshot per account, and show it in the Report's quota
-section. No network, no auth handling — just read a field we already stream past.
+same numbers Codex's `/status` shows. `parsers/codex.js` keeps the newest snapshot
+module-side (NOT as a usage record — it's live account state, not per-request usage)
+and exposes it via `codexResetWindows()`.
+
+**How it surfaces — live overlay on the plan's Quota window.** The popup's
+*Quota windows* section prefers this live data over the token-based estimate:
+
+- `mergeLiveLimits()` (in `subscriptions.js`) overlays live per-CLI windows onto the
+  estimated ones from `computeResetWindows()`. For a plan **bound to** a live-capable
+  CLI, each live window **replaces** the plan's same-period estimate (`source:'live'`);
+  the plan's other windows and its billing `renewal` are untouched. A plan bound to no
+  live source keeps its estimate (`source:'estimate'`). Live data for a CLI no plan
+  covers becomes its own synthetic entry so it still shows.
+- The UI badges each plan **live** (real numbers from the CLI's own report) vs
+  **manual** (estimate against the configured plan). For a live window the ring shows
+  **usage** remaining (100 − used_percent) and the label shows **time** to reset; for
+  an estimate window the ring stays time-based as before.
+- Codex is local, so this is effectively real-time (refreshed whenever its logs change
+  and the popup re-fetches on the next snapshot). A future network-backed live source
+  would self-throttle the way Cursor does (≤ once / 15 min).
+
+Concretely: a "Chat GPT Plus" plan bound to `codex` shows its **weekly** window straight
+from Codex's report (e.g. "24% left, resets Jul 23") with a **live** badge, while its
+$20 billing renewal countdown is unchanged.
 
 ### Gemini — not feasible from local data ❌
 `gemini --help` exposes no usage/quota subcommand, and the session jsonl carries no
@@ -176,8 +196,10 @@ non-interactive `/usage` flag or a public subscription-limits endpoint, revisit.
 
 ## Verdict
 
-Only **Codex** can gain real value from a `/usage`-style sync, and it needs **no
-network** — the `rate_limits` snapshot is already in the rollout logs we parse.
-Claude / Gemini / Antigravity already report accurate token counts from local files,
-and their plan-quota data has no accessible source, so there is nothing to sync for
-them.
+Only **Codex** gains real value from a `/usage`-style sync, and it needs **no
+network** — the `rate_limits` snapshot is already in the rollout logs we parse, and it
+now drives the live overlay on its plan's Quota window. Claude / Gemini / Antigravity
+already report accurate token counts from local files, and their plan-quota data has no
+accessible source, so their Quota windows stay on the manual estimate (badged
+**manual**). If Claude ever ships a non-interactive limits endpoint, plug it into
+`mergeLiveLimits()` as another `liveByCli` source — the UI already handles it.

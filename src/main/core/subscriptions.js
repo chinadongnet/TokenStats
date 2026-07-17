@@ -495,6 +495,79 @@ export function computeResetWindows(subs, records, nowMs = Date.now()) {
   })
 }
 
+// ---- live CLI limits overlay ------------------------------------------------
+
+// Some CLIs report their OWN plan quota (currently just Codex, from the
+// `rate_limits` snapshot in its logs) — real used%/reset numbers, no estimate.
+// Convert one such window into the same display shape computeResetWindows()
+// emits, tagged `source:'live'` so the UI can badge it and swap the ring from
+// time-based to usage-based.
+function toLiveWindow(w, nowMs) {
+  return {
+    period: w.label,
+    source: 'live',
+    open: w.resetsAt == null || w.resetsAt > nowMs,
+    start: null,
+    end: w.resetsAt ?? null,
+    periodMs: (w.windowMinutes || 0) * 60000,
+    msToReset: w.resetsAt != null ? Math.max(0, w.resetsAt - nowMs) : null,
+    usedPercent: w.usedPercent,
+    remainingPercent: w.remainingPercent,
+    tokens: 0,
+    cost: 0,
+    turns: 0,
+  }
+}
+
+// Overlay live per-CLI quota onto the estimated reset windows. For a plan bound
+// to a CLI that reports live data, each live window REPLACES that plan's
+// same-period estimate (unmatched live windows are appended); the plan's other
+// windows stay estimates. Plans bound to no live-capable CLI come back unchanged
+// with every window tagged `source:'estimate'`. Live data for a CLI that no plan
+// covers becomes its own synthetic entry so it still shows even before the user
+// configures a subscription. Billing `renewal` is never touched.
+//
+//   liveByCli — { <cli>: [ window, … ] } as returned by e.g. codexResetWindows()
+//   labels    — { <cli>: 'Display Name' } for the synthetic entries' names
+export function mergeLiveLimits(entries, liveByCli = {}, nowMs = Date.now(), labels = {}) {
+  const covered = new Set()
+  const out = (entries || []).map((e) => {
+    const live = []
+    for (const b of e.bindings || []) {
+      const ws = b.cli && liveByCli[b.cli]
+      if (ws && ws.length) {
+        live.push(...ws)
+        covered.add(b.cli)
+      }
+    }
+    if (!live.length) {
+      return { ...e, windows: (e.windows || []).map((w) => ({ ...w, source: 'estimate' })), source: 'estimate' }
+    }
+    const byPeriod = new Map(live.map((w) => [w.label, w]))
+    const windows = (e.windows || []).map((w) =>
+      byPeriod.has(w.period) ? toLiveWindow(byPeriod.get(w.period), nowMs) : { ...w, source: 'estimate' }
+    )
+    const estPeriods = new Set((e.windows || []).map((w) => w.period))
+    for (const w of live) if (!estPeriods.has(w.label)) windows.push(toLiveWindow(w, nowMs))
+    windows.sort((a, b) => (a.periodMs || 0) - (b.periodMs || 0))
+    return { ...e, windows, source: 'live' }
+  })
+  for (const [cli, ws] of Object.entries(liveByCli)) {
+    if (!ws || !ws.length || covered.has(cli)) continue
+    out.push({
+      id: `live:${cli}`,
+      name: labels[cli] || cli,
+      monthlyUsd: 0,
+      bindings: [{ cli }],
+      windows: ws.map((w) => toLiveWindow(w, nowMs)),
+      renewal: null,
+      source: 'live',
+      live: true,
+    })
+  }
+  return out
+}
+
 // Usage in [fromMs, toMs) grouped by the plan that covers it — the report's
 // "By plan" breakdown. Ownership is time-aware via planAssigner (bindings must
 // match AND the record must fall inside the plan's billed coverage; overlaps
