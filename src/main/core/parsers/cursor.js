@@ -146,8 +146,49 @@ async function fetchUsageCsv(token) {
   return parseUsageCsv(await res.text())
 }
 
+// Cursor's monthly included-usage quota, from the same surface the dashboard's
+// Spending page (cursor.com/dashboard/spending) uses. Unlike the CSV export this
+// carries the plan's billing cycle and % consumed — `totalPercentUsed` is the
+// "Total" figure on that page (auto/api are its sub-breakdowns). Returned in the
+// standard live-window shape so it can overlay the Cursor plan's monthly window.
+function parseUsageSummary(json) {
+  const p = json?.individualUsage?.plan
+  if (!p || typeof p.totalPercentUsed !== 'number') return []
+  const used = Math.max(0, Math.min(100, p.totalPercentUsed))
+  const start = Date.parse(json.billingCycleStart)
+  const end = Date.parse(json.billingCycleEnd)
+  return [
+    {
+      label: 'monthly',
+      windowMinutes: Number.isFinite(start) && Number.isFinite(end) ? Math.round((end - start) / 60000) : 43200,
+      usedPercent: used,
+      remainingPercent: Math.max(0, 100 - used),
+      resetsAt: Number.isFinite(end) ? end : null,
+    },
+  ]
+}
+
+async function fetchUsageSummary(token) {
+  const payload = decodeJwt(token)
+  if (!payload?.sub) return []
+  if (payload.exp && payload.exp * 1000 < Date.now()) return []
+  const userId = String(payload.sub).split('|').pop()
+  const cookie = `WorkosCursorSessionToken=${encodeURIComponent(userId + '::' + token)}`
+  const res = await fetch('https://cursor.com/api/usage-summary', { headers: { Cookie: cookie, Accept: 'application/json' } })
+  if (!res.ok) throw new Error(`cursor usage-summary HTTP ${res.status}`)
+  return parseUsageSummary(await res.json())
+}
+
 const MIN_FETCH_INTERVAL_MS = 15 * 60 * 1000
 const cacheByUser = new Map() // userId -> { records, fetchedAt }
+
+// Newest monthly quota window (used %, reset), refreshed on the same 15-min
+// cadence as the CSV fetch. Read by the `cursor:limits` path (via index.js) to
+// overlay the Cursor plan's Quota window.
+let latestWindows = []
+export function cursorResetWindows() {
+  return latestWindows
+}
 
 async function getCloudRecords(token) {
   const payload = decodeJwt(token)
@@ -160,6 +201,11 @@ async function getCloudRecords(token) {
     entry.records = await fetchUsageCsv(token)
   } catch {
     // undocumented endpoint: keep the previous cache on rate-limit/expired-session/network errors
+  }
+  try {
+    latestWindows = await fetchUsageSummary(token)
+  } catch {
+    // keep the previous quota window on error (same reasoning as the CSV fetch)
   }
   return entry.records
 }

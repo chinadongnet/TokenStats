@@ -7,6 +7,7 @@ import { UsageDb } from './core/db.js'
 import { CLI_META, ensureConfigFile, CONFIG_FILE } from './core/paths.js'
 import { createLitellmPoller, listModels } from './core/parsers/litellm.js'
 import { codexResetWindows } from './core/parsers/codex.js'
+import { cursorResetWindows } from './core/parsers/cursor.js'
 import { claudeResetWindows, primeClaudeLimits } from './core/claudeLimits.js'
 import { computeAllSubscriptionStats, computePlanBreakdown, computePlanTimeline, computeResetWindows, mergeLiveLimits } from './core/subscriptions.js'
 import { migrateLegacyLitellmConfig } from './core/migrateLitellm.js'
@@ -172,7 +173,7 @@ async function init() {
     if (!db || !store) return []
     const now = Date.now()
     const entries = computeResetWindows(db.listSubscriptions(), store.dedupedRecords(), now)
-    const liveByCli = { codex: codexResetWindows(), claude: claudeResetWindows() }
+    const liveByCli = { codex: codexResetWindows(), claude: claudeResetWindows(), cursor: cursorResetWindows() }
     const labels = Object.fromEntries(Object.entries(CLI_META).map(([k, v]) => [k, v.label]))
     return mergeLiveLimits(entries, liveByCli, now, labels)
   })

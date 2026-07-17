@@ -18,7 +18,7 @@ Code lives in `src/main/core/parsers/*.js`; the store/watch/poll plumbing is in
 | Codex       | local files | `~/.codex/sessions/**/rollout-*.jsonl` `token_count` events | ✅ accurate  | ✅ live from the logs (`rate_limits`) |
 | Gemini      | local files | `~/.gemini/tmp/**/chats/session-*.jsonl`                    | ✅ accurate  | ❌ CLI deprecated for individuals |
 | Antigravity | local files | `~/.gemini/antigravity-cli/conversations/<uuid>.db`         | ✅ accurate  | ⚠️ TUI-only, not wired |
-| Cursor      | **network** | cursor.com dashboard CSV export (real usage is server-only) | ✅ accurate  | n/a (usage only) |
+| Cursor      | **network** | cursor.com dashboard CSV export (real usage is server-only) | ✅ accurate  | ✅ live via `/api/usage-summary` |
 | LiteLLM     | **network** | your proxy's admin API                                      | ✅ actual $  | n/a |
 
 ---
@@ -100,6 +100,36 @@ and re-run on a timer. It refreshes on:
 > file stopped changing, so requests made after launch were never picked up and the
 > totals silently went stale. The `network: true` flag + `refreshNetworkParsers()`
 > timer fixed that.
+
+### Monthly quota (Spending page) — live overlay
+Separately from the token CSV, Cursor's **Spending** page
+(`cursor.com/dashboard/spending`) shows the plan's included-usage quota, and it is
+backed by a clean authenticated endpoint:
+
+```
+GET https://cursor.com/api/usage-summary
+Cookie: WorkosCursorSessionToken=<userId>::<jwt>
+```
+
+```json
+{
+  "billingCycleStart": "2026-07-04T15:50:55Z",
+  "billingCycleEnd":   "2026-08-04T15:50:55Z",
+  "membershipType": "pro",
+  "individualUsage": { "plan": {
+    "autoPercentUsed": 7.36,      // "First-Party" on the page
+    "apiPercentUsed": 100,        // "API" on the page
+    "totalPercentUsed": 19.84     // "Total" on the page
+  } }
+}
+```
+
+`parseUsageSummary()` in `cursor.js` maps `totalPercentUsed` → used%, and
+`billingCycleEnd` → reset, into a `monthly` live window. It's fetched on the same
+15-min cadence as the CSV (piggybacked in `getCloudRecords`) and exposed via
+`cursorResetWindows()`, so the **Cursor** plan's monthly Quota window shows live (e.g.
+"80% left, resets Aug 4") instead of the token estimate. This is a plain GET, so
+unlike the POST dashboard endpoints it needs no `Origin` header.
 
 ### Why not Cursor's official API
 Cursor's official Admin/Analytics API (`cursor.com/docs/api`) does expose proper
@@ -209,10 +239,10 @@ exposes quota programmatically — a future investigation.
 
 ## Verdict
 
-**Codex** and **Claude** now drive live overlays on their plans' Quota windows —
-Codex from the `rate_limits` in its local logs (real-time, no network), Claude by
-shelling out to `claude -p /usage` (throttled 15 min). **Gemini** is deprecated, and
-**Antigravity** exposes its quota only through a fragile interactive TUI, so both stay
-on the manual estimate (badged **manual**). Any future clean source (e.g. `agy
-agentapi`) plugs into `mergeLiveLimits()` as another `liveByCli` entry — the UI already
-handles it.
+**Codex**, **Claude**, and **Cursor** now drive live overlays on their plans' Quota
+windows — Codex from the `rate_limits` in its local logs (real-time, no network),
+Claude by shelling out to `claude -p /usage`, and Cursor from `/api/usage-summary`
+(both throttled ~15 min). **Gemini** is deprecated, and **Antigravity** exposes its
+quota only through a fragile interactive TUI, so both stay on the manual estimate
+(badged **manual**). Any future clean source (e.g. `agy agentapi`) plugs into
+`mergeLiveLimits()` as another `liveByCli` entry — the UI already handles it.
