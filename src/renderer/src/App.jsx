@@ -54,20 +54,28 @@ const atTime = (ts, periodMs) => {
   const t = d.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })
   return periodMs >= 86400000 ? `${d.toLocaleDateString([], { month: 'short', day: 'numeric' })} ${t}` : t
 }
-// Minimal ratio icon: a ring showing how much of a quota window is LEFT. The
-// popup is only 380px wide, so this replaces a full-width progress bar.
-function Ring({ frac, color, size = 12 }) {
-  const r = (size - 2.5) / 2
+// Ratio gauge: a ring showing how much of a quota window is LEFT, with the
+// remaining number printed inside it (when `label` is given). The popup is only
+// 380px wide, so this replaces a full-width progress bar. Stroke scales with
+// size so a bigger ring still looks right.
+function Ring({ frac, color, size = 12, label }) {
+  const stroke = Math.max(2.5, Math.round(size * 0.12))
+  const r = (size - stroke) / 2
   const c = 2 * Math.PI * r
   const mid = size / 2
   return (
     <svg className="ring" width={size} height={size} viewBox={`0 0 ${size} ${size}`} aria-hidden="true">
-      <circle cx={mid} cy={mid} r={r} fill="none" stroke="var(--panel2)" strokeWidth="2.5" />
+      <circle cx={mid} cy={mid} r={r} fill="none" stroke="var(--panel2)" strokeWidth={stroke} />
       <circle
-        cx={mid} cy={mid} r={r} fill="none" stroke={color} strokeWidth="2.5"
+        cx={mid} cy={mid} r={r} fill="none" stroke={color} strokeWidth={stroke} strokeLinecap="round"
         strokeDasharray={`${frac * c} ${c}`}
         transform={`rotate(-90 ${mid} ${mid})`}
       />
+      {label != null && (
+        <text x={mid} y={mid} textAnchor="middle" dominantBaseline="central" fontSize={size * 0.36} fontWeight="700" fill={color}>
+          {label}
+        </text>
+      )}
     </svg>
   )
 }
@@ -232,10 +240,17 @@ export default function App() {
                         : `${r.name} · ${RESET_FULL[w.period] || w.period} quota\nno open window — your next request starts one`
                     return (
                       <span className="rwin" key={w.period} title={title}>
-                        <Ring frac={frac} color={open ? color : '#5b6172'} />
-                        <span className="rwin-p">{RESET_LABEL[w.period] || w.period}</span>
-                        <span className="rwin-t">
-                          {live ? (w.end ? dur(left) : `${Math.round(w.remainingPercent)}%`) : open ? dur(left) : 'idle'}
+                        <Ring
+                          frac={frac}
+                          color={open ? color : '#5b6172'}
+                          size={26}
+                          label={live ? Math.round(w.remainingPercent) : undefined}
+                        />
+                        <span className="rwin-meta">
+                          <span className="rwin-p">{RESET_LABEL[w.period] || w.period}</span>
+                          <span className="rwin-t">
+                            {live ? (w.end ? dur(left) : `${Math.round(w.remainingPercent)}%`) : open ? dur(left) : 'idle'}
+                          </span>
                         </span>
                       </span>
                     )
@@ -254,9 +269,12 @@ export default function App() {
                       <Ring
                         frac={Math.min(1, Math.max(0, (r.renewal.end - now) / r.renewal.periodMs))}
                         color={FEE_COLOR}
+                        size={26}
                       />
-                      <span className="rwin-p">bill</span>
-                      <span className="rwin-t">{dur(Math.max(0, r.renewal.end - now))}</span>
+                      <span className="rwin-meta">
+                        <span className="rwin-p">bill</span>
+                        <span className="rwin-t">{dur(Math.max(0, r.renewal.end - now))}</span>
+                      </span>
                     </span>
                   )}
                 </span>

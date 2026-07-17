@@ -96,10 +96,12 @@ header {
    to 3 windows. Exact usage/cost lives in each window's tooltip. */
 .resets .reset { display: flex; align-items: center; gap: 7px; padding: 2px 0; font-size: 11px; }
 .resets .reset .ellipsis { color: var(--text); }
-.rwins { display: flex; align-items: center; gap: 10px; flex: none; }
-.rwin { display: flex; align-items: center; gap: 4px; color: var(--muted); cursor: default; }
+.rwins { display: flex; align-items: center; gap: 9px; flex: none; flex-wrap: wrap; justify-content: flex-end; row-gap: 4px; }
+.rwin { display: flex; align-items: center; gap: 5px; color: var(--muted); cursor: default; }
 .rwin .ring { flex: none; }
-.rwin-t { color: var(--text); font-variant-numeric: tabular-nums; }
+.rwin-meta { display: flex; flex-direction: column; line-height: 1.15; }
+.rwin-p { font-size: 9px; text-transform: uppercase; letter-spacing: 0.03em; color: var(--muted); }
+.rwin-t { color: var(--text); font-variant-numeric: tabular-nums; font-size: 11px; }
 /* Quota-source badge: whether a plan's windows are live (from the CLI's own
    usage report) or estimated from tracked usage against the manual config. */
 .resets .qsrc { flex: none; font-size: 8.5px; text-transform: uppercase; letter-spacing: 0.05em; padding: 1px 4px; border-radius: 4px; line-height: 1.4; cursor: default; }
