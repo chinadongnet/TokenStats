@@ -15,6 +15,44 @@ import { CLI_ROOTS } from '../paths.js'
 // cumulative reproduces the session's final total exactly while still giving
 // per-turn granularity for the day/model breakdown.
 // Model / cwd are announced earlier in `session_meta` / `turn_context`.
+//
+// Besides token counts, each `token_count` payload also carries a `rate_limits`
+// snapshot — the same plan-quota numbers Codex's `/status` shows (per-window
+// `used_percent`, `window_minutes`, and a `resets_at` epoch-seconds). That is
+// live account state, not per-request usage, so it is NOT turned into a record;
+// instead the newest snapshot seen across all rollouts is kept module-side and
+// exposed via codexResetWindows() for the popup's Quota-windows section.
+
+let latestLimits = null // { ts, rate_limits }
+
+function windowLabel(min) {
+  if (!min || min <= 0) return '?'
+  if (min === 300) return '5h'
+  if (min === 10080) return 'weekly'
+  if (min % 1440 === 0) return `${min / 1440}d`
+  if (min % 60 === 0) return `${min / 60}h`
+  return `${min}m`
+}
+
+function normalizeWindow(w) {
+  if (!w || typeof w.used_percent !== 'number') return null
+  const used = Math.max(0, Math.min(100, w.used_percent))
+  return {
+    label: windowLabel(w.window_minutes),
+    windowMinutes: w.window_minutes || 0,
+    usedPercent: used,
+    remainingPercent: Math.max(0, 100 - used),
+    resetsAt: typeof w.resets_at === 'number' ? w.resets_at * 1000 : null, // s -> ms
+  }
+}
+
+// Newest known plan-quota windows (5h / weekly), or [] if Codex never reported
+// any. Read by the `codex:limits` IPC handler.
+export function codexResetWindows() {
+  const rl = latestLimits?.rate_limits
+  if (!rl) return []
+  return [rl.primary, rl.secondary].map(normalizeWindow).filter(Boolean)
+}
 
 export const codex = {
   cli: 'codex',
@@ -41,6 +79,14 @@ export const codex = {
       if (p.model) state.model = p.model
       if (p.cwd) state.cwd = p.cwd
       return null
+    }
+    if (obj.type === 'event_msg' && p.type === 'token_count') {
+      // Keep the newest rate-limit snapshot regardless of whether this event
+      // also carries token deltas (an errored/empty turn can still refresh it).
+      if (p.rate_limits) {
+        const ts = obj.timestamp ? Date.parse(obj.timestamp) : Date.now()
+        if (!latestLimits || ts >= latestLimits.ts) latestLimits = { ts, rate_limits: p.rate_limits }
+      }
     }
     if (obj.type === 'event_msg' && p.type === 'token_count' && p.info && p.info.total_token_usage) {
       const cum = p.info.total_token_usage

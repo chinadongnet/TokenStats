@@ -45,6 +45,8 @@ contextBridge.exposeInMainWorld('api', {
   subsStats: () => ipcRenderer.invoke('subs:stats'),
   // rolling quota-reset windows (popup countdown)
   subsResets: () => ipcRenderer.invoke('subs:resets'),
+  // Codex's own reported plan-quota windows (used %, reset time) from its logs
+  codexLimits: () => ipcRenderer.invoke('codex:limits'),
   subsBreakdown: (fromMs, toMs) => ipcRenderer.invoke('subs:breakdown', fromMs, toMs),
   subsTimeline: (fromMs, toMs) => ipcRenderer.invoke('subs:timeline', fromMs, toMs),
 })

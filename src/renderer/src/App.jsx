@@ -87,6 +87,7 @@ export default function App() {
   const [shotMenu, setShotMenu] = useState(false)
   const [copied, setCopied] = useState(false)
   const [resets, setResets] = useState([])
+  const [codexLimits, setCodexLimits] = useState([])
   const [now, setNow] = useState(() => Date.now())
 
   useEffect(() => {
@@ -94,7 +95,10 @@ export default function App() {
     // or when new usage lands — which is exactly when a snapshot arrives. So
     // refetch on snapshot rather than polling, and the popup stays quiet while
     // hidden.
-    const loadResets = () => window.api.subsResets().then(setResets)
+    const loadResets = () => {
+      window.api.subsResets().then(setResets)
+      window.api.codexLimits().then(setCodexLimits)
+    }
     window.api.getSnapshot().then(setSnap)
     loadResets()
     return window.api.onSnapshot((s) => {
@@ -187,9 +191,39 @@ export default function App() {
         <div className="hero-sub">tokens · <span className="cost">{usd(totalCost)}</span> est.</div>
       </div>
 
-      {resets.length > 0 && (
+      {(resets.length > 0 || codexLimits.length > 0) && (
         <section className="block resets">
           <h3>Quota windows</h3>
+          {codexLimits.length > 0 && (
+            <div className="reset" key="codex-live">
+              <span className="dot sm" style={{ background: (CLI.codex || FALLBACK_META('codex')).color }} />
+              <span className="ellipsis">Codex</span>
+              <span className="rwins">
+                {codexLimits.map((w) => {
+                  // Real provider-reported numbers: the ring shows USAGE left
+                  // (100 − used_percent), the label shows TIME left to reset.
+                  const color = (CLI.codex || FALLBACK_META('codex')).color
+                  const frac = Math.min(1, Math.max(0, w.remainingPercent / 100))
+                  const left = w.resetsAt ? Math.max(0, w.resetsAt - now) : null
+                  return (
+                    <span
+                      className="rwin"
+                      key={w.label}
+                      title={
+                        `Codex · ${w.label} limit\n` +
+                        `${Math.round(w.usedPercent)}% used — ${Math.round(w.remainingPercent)}% left\n` +
+                        (w.resetsAt ? `resets ${atTime(w.resetsAt, (w.windowMinutes || 0) * 60000)} (${dur(left)})` : 'no reset time reported')
+                      }
+                    >
+                      <Ring frac={frac} color={color} />
+                      <span className="rwin-p">{w.label}</span>
+                      <span className="rwin-t">{left != null ? dur(left) : `${Math.round(w.remainingPercent)}%`}</span>
+                    </span>
+                  )
+                })}
+              </span>
+            </div>
+          )}
           {resets.map((r) => {
             const cli = r.bindings?.[0]?.cli
             const color = cli ? (CLI[cli] || FALLBACK_META(cli)).color : '#5b6172'

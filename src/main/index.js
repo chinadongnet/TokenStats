@@ -6,6 +6,7 @@ import { Store } from './core/store.js'
 import { UsageDb } from './core/db.js'
 import { CLI_META, ensureConfigFile, CONFIG_FILE } from './core/paths.js'
 import { createLitellmPoller, listModels } from './core/parsers/litellm.js'
+import { codexResetWindows } from './core/parsers/codex.js'
 import { computeAllSubscriptionStats, computePlanBreakdown, computePlanTimeline, computeResetWindows } from './core/subscriptions.js'
 import { migrateLegacyLitellmConfig } from './core/migrateLitellm.js'
 import { isAutoLaunch, setAutoLaunch, migrateLegacyRunKeys } from './autoLaunch.js'
@@ -164,6 +165,10 @@ async function init() {
   ipcMain.handle('subs:resets', () =>
     db && store ? computeResetWindows(db.listSubscriptions(), store.dedupedRecords(), Date.now()) : []
   )
+  // Codex's own plan-quota windows (used %, reset time), read from the rate_limits
+  // snapshot in its rollout logs — the same numbers `/status` shows. Live account
+  // state, so it's served straight from the parser, not the token DB.
+  ipcMain.handle('codex:limits', () => codexResetWindows())
   ipcMain.handle('subs:timeline', (_e, fromMs, toMs) =>
     db && store
       ? computePlanTimeline(db.listSubscriptions(), store.dedupedRecords(), fromMs, toMs, Date.now())
