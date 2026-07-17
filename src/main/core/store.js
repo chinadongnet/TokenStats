@@ -148,6 +148,35 @@ export class Store extends EventEmitter {
     }
   }
 
+  // Force-refresh the network-backed file parsers (currently just Cursor, whose
+  // "file" is only a token store — the real usage is fetched from cursor.com).
+  // ingestFile normally short-circuits when a file's mtime/size is unchanged,
+  // which is correct for genuine on-disk formats but wrong here: Cursor's cloud
+  // usage keeps growing while state.vscdb sits untouched, so we clear the cached
+  // stat to force a re-parse (and thus a re-fetch). The parser self-throttles
+  // the actual HTTP call to every 15 min, so calling this on a timer or from
+  // "Refresh now" is cheap. Returns true if any record set actually changed.
+  async refreshNetworkParsers() {
+    let changed = false
+    for (const parser of PARSERS) {
+      if (!parser.network) continue
+      for (const root of parser.roots) {
+        for (const file of await walk(root, parser.match)) {
+          const entry = this.files.get(file)
+          const before = entry ? entry.records.length : -1
+          if (entry) {
+            entry.mtimeMs = 0
+            entry.size = 0
+          }
+          await this.ingestFile(file)
+          const after = this.files.get(file)?.records.length ?? -1
+          if (after !== before) changed = true
+        }
+      }
+    }
+    return changed
+  }
+
   // All normalized records across every file, newest last. Includes the
   // on-disk duplicates (Claude content-block lines, Gemini re-appends); use
   // dedupedRecords() for anything that aggregates token counts.
@@ -314,6 +343,14 @@ export class Store extends EventEmitter {
       if (await this.pollAll()) this.emit('update', this.snapshot())
     }, 60 * 1000)
     this._pollTimers.push(timer)
+    // Separate, slower timer for network-backed file parsers (Cursor). Kept
+    // apart from the poll timer above because each tick re-reads the whole
+    // state.vscdb to pull the token, so 5 min (well under the parser's own
+    // 15-min HTTP throttle) is a better cadence than the 60 s poll loop.
+    const netTimer = setInterval(async () => {
+      if (await this.refreshNetworkParsers()) this.emit('update', this.snapshot())
+    }, 5 * 60 * 1000)
+    this._pollTimers.push(netTimer)
     const chokidar = (await import('chokidar')).default
     const roots = [...new Set(PARSERS.flatMap((p) => p.roots))]
     for (const root of roots) {

@@ -168,6 +168,14 @@ export const cursor = {
   cli: 'cursor',
   roots: CLI_ROOTS.cursor,
   kind: 'binary',
+  // Usage is fetched over the network (see header comment), not read from the
+  // local file — so it must be re-run on a timer, not only when state.vscdb
+  // changes on disk. The IDE stops rewriting state.vscdb once it goes idle, so
+  // without a timer the last fetch (often the app-startup one) goes stale and
+  // newer cloud usage never shows up. This flag opts the parser into the
+  // store's periodic refreshNetworkParsers() sweep; the getCloudRecords cache
+  // still throttles the real HTTP call to once every 15 min.
+  network: true,
   match: (file) => path.basename(file) === 'state.vscdb',
   async parseFile(buf) {
     const SQL = await getSql()

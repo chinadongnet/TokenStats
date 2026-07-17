@@ -413,7 +413,7 @@ function createTray() {
       { label: 'Token report…', click: () => openReport() },
       { label: 'Settings…', click: () => openSettings() },
       { type: 'separator' },
-      { label: 'Refresh now', click: async () => { await store.scanAll(); await Promise.all(store.pollers.map((p) => store.forcePoll(p.cli))); broadcastSnapshot() } },
+      { label: 'Refresh now', click: async () => { await store.scanAll(); await store.refreshNetworkParsers(); await Promise.all(store.pollers.map((p) => store.forcePoll(p.cli))); broadcastSnapshot() } },
       { label: 'Edit data sources… (other devices)', click: () => { ensureConfigFile(); shell.openPath(CONFIG_FILE) } },
       { type: 'separator' },
       { label: 'Start at login', type: 'checkbox', checked: isAutoLaunch(), click: (item) => setAutoLaunch(item.checked) },
