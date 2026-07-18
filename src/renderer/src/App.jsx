@@ -75,12 +75,35 @@ function tints(hex, n) {
 }
 
 const WEEK_MS = 7 * 86400000
-const ClockIcon = () => (
-  <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" aria-hidden="true">
-    <circle cx="12" cy="12" r="9" />
-    <path d="M12 7v5l3 2" />
-  </svg>
-)
+// SVG path for a pie wedge from 12 o'clock, sweeping clockwise by `frac` of a
+// full turn. Used to "drain" the clock face as a window counts down.
+function pieSlice(cx, cy, r, frac) {
+  const f = Math.max(0, Math.min(1, frac))
+  if (f <= 0) return ''
+  if (f >= 1) return `M ${cx} ${cy - r} A ${r} ${r} 0 1 1 ${cx - 0.001} ${cy - r} Z`
+  const a = f * 2 * Math.PI
+  const ex = cx + r * Math.sin(a)
+  const ey = cy - r * Math.cos(a)
+  return `M ${cx} ${cy} L ${cx} ${cy - r} A ${r} ${r} 0 ${f > 0.5 ? 1 : 0} 1 ${ex.toFixed(3)} ${ey.toFixed(3)} Z`
+}
+// Clock glyph. With `frac` (0..1) it becomes a dial filled proportionally to the
+// time REMAINING in the window, tinted with the subscription's own color; the
+// wedge shrinks as the countdown runs down. Without `frac` it's the plain clock.
+const ClockIcon = ({ frac = null, color = 'currentColor' }) => {
+  if (frac == null)
+    return (
+      <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" aria-hidden="true">
+        <circle cx="12" cy="12" r="9" />
+        <path d="M12 7v5l3 2" />
+      </svg>
+    )
+  return (
+    <svg width="13" height="13" viewBox="0 0 24 24" aria-hidden="true">
+      <circle cx="12" cy="12" r="9" fill="none" stroke="currentColor" strokeWidth="1.5" opacity="0.35" />
+      <path d={pieSlice(12, 12, 8, frac)} fill={color} />
+    </svg>
+  )
+}
 const BillIcon = () => (
   <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" aria-hidden="true">
     <rect x="3" y="5" width="18" height="14" rx="2" />
@@ -101,11 +124,13 @@ function levelColor(frac) {
 // shown at all. Each live window gets two headroom bars: usage remaining (流量)
 // and time-to-reset, both on the green→red scale. Billing renewal is a slim
 // line below. Returns null if the plan has no live window.
-function QuotaBig({ plan, now }) {
+function QuotaBig({ plan, now, color }) {
   const cells = []
   for (const w of plan.windows) {
     if (w.source !== 'live') continue
     const left = w.end ? Math.max(0, w.end - now) : 0
+    // Fraction of the window's length still remaining — drives the clock dial.
+    const tFrac = w.end && w.periodMs ? Math.min(1, Math.max(0, left / w.periodMs)) : 0
     const uFrac = Math.min(1, Math.max(0, (w.remainingPercent || 0) / 100))
     const uPct = Math.round(uFrac * 100)
     const next = w.end ? (w.periodMs >= WEEK_MS ? atTime(w.end, w.periodMs) : dur(left)) : '—'
@@ -119,7 +144,7 @@ function QuotaBig({ plan, now }) {
         {/* time is a rounded countdown chip, NOT a bar, so it never reads as a
             second usage meter */}
         <span className="qtime" title={w.end ? `next cycle ${atTime(w.end, w.periodMs)} (${dur(left)})` : 'no reset time'}>
-          <ClockIcon />
+          <ClockIcon frac={tFrac} color={color} />
           <b>{next}</b>
         </span>
       </React.Fragment>
@@ -310,7 +335,7 @@ export default function App() {
                     <span className="pc">${usd(d.cost)}</span>
                   </span>
                 </div>
-                {live && <QuotaBig plan={plan} now={now} />}
+                {live && <QuotaBig plan={plan} now={now} color={meta.color} />}
                 {ms.length > 0 && <ModelBar models={ms} color={meta.color} />}
               </div>
             )
