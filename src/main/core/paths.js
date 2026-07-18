@@ -90,6 +90,36 @@ function loadLitellmConfig() {
 
 export const LITELLM_CONFIG = loadLitellmConfig()
 
+// UI language ('en' | 'zh'), persisted in config.json so the native tray menu
+// (main process) can read it too. The renderer keeps its own localStorage copy
+// for instant switching; setLanguage() below keeps config.json in sync.
+export function loadLanguage() {
+  try {
+    const cfg = JSON.parse(fs.readFileSync(CONFIG_FILE, 'utf8'))
+    return cfg.language === 'zh' ? 'zh' : 'en'
+  } catch {
+    return 'en'
+  }
+}
+
+export function saveLanguage(lang) {
+  const l = lang === 'zh' ? 'zh' : 'en'
+  try {
+    let cfg = {}
+    try {
+      cfg = JSON.parse(fs.readFileSync(CONFIG_FILE, 'utf8'))
+    } catch {
+      // no/invalid file yet — write a fresh one below
+    }
+    cfg.language = l
+    fs.mkdirSync(path.dirname(CONFIG_FILE), { recursive: true })
+    fs.writeFileSync(CONFIG_FILE, JSON.stringify(cfg, null, 2))
+  } catch {
+    // best-effort; ignore if the dir isn't writable
+  }
+  return l
+}
+
 // Default color for the LiteLLM Settings UI's "add provider" form and for the
 // one-time config.json migration — the single canonical source other than the
 // (necessarily duplicated) literal copies in App.jsx/Report.jsx/Settings.jsx.

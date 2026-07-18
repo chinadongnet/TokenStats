@@ -15,6 +15,16 @@ contextBridge.exposeInMainWorld('api', {
   openReport: () => ipcRenderer.send('open-report'),
   openSettings: () => ipcRenderer.send('open-settings'),
 
+  // UI language (persisted for the native tray menu; renderer also caches it in
+  // localStorage for instant switching). onLanguage broadcasts cross-window.
+  getLanguage: () => ipcRenderer.invoke('get-language'),
+  setLanguage: (lang) => ipcRenderer.invoke('set-language', lang),
+  onLanguage: (cb) => {
+    const handler = (_e, lang) => cb(lang)
+    ipcRenderer.on('language', handler)
+    return () => ipcRenderer.removeListener('language', handler)
+  },
+
   // report window
   reportHourly: (dayStartMs) => ipcRenderer.invoke('report:hourly', dayStartMs),
   reportDaily: (fromMs, toMs) => ipcRenderer.invoke('report:daily', fromMs, toMs),

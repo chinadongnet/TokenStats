@@ -1,4 +1,5 @@
 import React, { useEffect, useMemo, useRef, useState } from 'react'
+import { t, useLang } from './i18n.js'
 
 // The 5 fixed built-in CLIs. LiteLLM providers are NOT listed here — they're
 // dynamic, DB-backed entries (`litellm:<providerId>`) fetched via
@@ -14,7 +15,7 @@ const FIXED_CLI = {
 const FIXED_ORDER = ['claude', 'codex', 'gemini', 'agy', 'cursor']
 // The hourly SQLite table can carry a `cli` for a provider deleted since it
 // was ingested — never let a lookup render `undefined`.
-const FALLBACK_META = (id) => ({ label: id?.startsWith?.('litellm:') ? '(deleted provider)' : id, color: '#5b6172' })
+const FALLBACK_META = (id) => ({ label: id?.startsWith?.('litellm:') ? t('common.deletedProvider') : id, color: '#5b6172' })
 const metaFor = (CLI, id) => CLI[id] || FALLBACK_META(id)
 
 const DAY = 86400000
@@ -37,6 +38,7 @@ const timeLabel = (ms) => {
 }
 
 export default function Report() {
+  useLang() // re-render whole report on language switch
   const [view, setView] = useState('charts') // charts | hour | requests | subs
   const [breakdown, setBreakdown] = useState('plan') // plan | model | project
   const [range, setRange] = useState('30d') // 7d | 30d | all
@@ -203,28 +205,28 @@ export default function Report() {
   return (
     <div className="report">
       <header className="rep-head">
-        <div className="rep-title"><span className="logo" /> Token Report</div>
+        <div className="rep-title"><span className="logo" /> {t('rep.title')}</div>
         <div className="rep-actions">
           <div className="seg">
-            <button className={view === 'charts' ? 'on' : ''} onClick={() => setView('charts')}>Charts</button>
-            <button className={view === 'hour' ? 'on' : ''} onClick={() => setView('hour')}>By hour</button>
-            <button className={view === 'requests' ? 'on' : ''} onClick={() => setView('requests')}>Logs</button>
-            <button className={view === 'subs' ? 'on' : ''} onClick={() => setView('subs')}>Token Plans</button>
+            <button className={view === 'charts' ? 'on' : ''} onClick={() => setView('charts')}>{t('rep.charts')}</button>
+            <button className={view === 'hour' ? 'on' : ''} onClick={() => setView('hour')}>{t('rep.byHour')}</button>
+            <button className={view === 'requests' ? 'on' : ''} onClick={() => setView('requests')}>{t('rep.logs')}</button>
+            <button className={view === 'subs' ? 'on' : ''} onClick={() => setView('subs')}>{t('rep.tokenPlans')}</button>
           </div>
           {view === 'charts' && (
             <div className="seg">
               {['7d', '30d', 'all'].map((r) => (
                 <button key={r} className={range === r ? 'on' : ''} onClick={() => setRange(r)}>
-                  {r === 'all' ? 'All' : 'Last ' + r.replace('d', 'd')}
+                  {r === 'all' ? t('common.all') : t('rep.last', { r })}
                 </button>
               ))}
             </div>
           )}
           <button className="btn" disabled={exporting} onClick={() => doExport('copy')}>
-            {copied ? 'Copied ✓' : '⧉ Copy'}
+            {copied ? t('rep.copied') : t('rep.copy')}
           </button>
           <button className="btn primary" disabled={exporting} onClick={() => doExport('save')}>
-            {exporting ? 'Exporting…' : '⤓ Export PNG'}
+            {exporting ? t('rep.exporting') : t('rep.exportPng')}
           </button>
         </div>
       </header>
@@ -248,19 +250,19 @@ export default function Report() {
       {view === 'hour' && (
       <>
       <div className="tiles">
-        <Tile label={day === today ? "Today's tokens" : 'Tokens'} value={compact(daySummary.total)} sub={dayLabel(day)} />
-        <Tile label="Est. cost" value={usd(daySummary.cost)} sub="rough estimate" accent="#7ee0b8" />
-        <Tile label="Turns" value={daySummary.turns.toLocaleString()} sub="model responses" />
-        <Tile label="Active hours" value={String(daySummary.activeHours)} sub="with usage" />
+        <Tile label={day === today ? t('rep.todaysTokens') : t('rep.tokens')} value={compact(daySummary.total)} sub={dayLabel(day)} />
+        <Tile label={t('rep.estCost')} value={usd(daySummary.cost)} sub={t('rep.roughEstimate')} accent="#7ee0b8" />
+        <Tile label={t('rep.turns')} value={daySummary.turns.toLocaleString()} sub={t('rep.modelResponses')} />
+        <Tile label={t('rep.activeHours')} value={String(daySummary.activeHours)} sub={t('rep.withUsage')} />
       </div>
 
       <Legend brands={brands} onToggle={toggleBrand} CLI={CLI} ORDER={ORDER} />
       <section className="card">
         <div className="card-head">
-          <h3>By hour — {dayLabel(day)}</h3>
+          <h3>{t('rep.byHourTitle', { label: dayLabel(day) })}</h3>
           <div className="daynav">
             <button className="btn" onClick={() => setDay(day - DAY)}>‹</button>
-            <button className="btn" onClick={() => setDay(today)} disabled={day === today}>Today</button>
+            <button className="btn" onClick={() => setDay(today)} disabled={day === today}>{t('common.today')}</button>
             <button className="btn" onClick={() => setDay(Math.min(today, day + DAY))} disabled={day >= today}>›</button>
           </div>
         </div>
@@ -281,22 +283,22 @@ export default function Report() {
       {view === 'charts' && (
       <>
       <div className="tiles">
-        <Tile label="Tokens (range)" value={compact(summary.total)} sub={fmtRange(fromMs, toMs)} />
-        <Tile label="Est. cost" value={'$' + usd(summary.cost)} sub="usage worth, rough estimate" accent="#7ee0b8" />
+        <Tile label={t('rep.tokensRange')} value={compact(summary.total)} sub={fmtRange(fromMs, toMs)} />
+        <Tile label={t('rep.estCost')} value={'$' + usd(summary.cost)} sub={t('rep.usageWorthEst')} accent="#7ee0b8" />
         <Tile
-          label="Plan fees"
+          label={t('rep.planFees')}
           value={'$' + usd(rangeFees)}
-          sub="subscriptions billed in range"
+          sub={t('rep.subsBilledRange')}
           accent={FEE_COLOR}
         />
-        <Tile label="Turns" value={summary.turns.toLocaleString()} sub="model responses" />
-        <Tile label="Active days" value={String(summary.activeDays)} sub="with usage" />
+        <Tile label={t('rep.turns')} value={summary.turns.toLocaleString()} sub={t('rep.modelResponses')} />
+        <Tile label={t('rep.activeDays')} value={String(summary.activeDays)} sub={t('rep.withUsage')} />
       </div>
 
       <Legend brands={brands} onToggle={toggleBrand} CLI={CLI} ORDER={ORDER} />
 
       <section className="card">
-        <div className="card-head"><h3>Daily trend — {fmtRange(fromMs, toMs)}</h3></div>
+        <div className="card-head"><h3>{t('rep.dailyTrend', { label: fmtRange(fromMs, toMs) })}</h3></div>
         <StackedBars
           data={dayData}
           xLabel={(d, i) => (dayData.length <= 14 || i % Math.ceil(dayData.length / 12) === 0 ? dayLabel(d) : '')}
@@ -319,7 +321,7 @@ export default function Report() {
       )}
 
       <footer className="rep-foot">
-        TokenStats v{__APP_VERSION__} · built {__BUILD_TIME__} · SQLite {span.min ? 'since ' + new Date(span.min).toLocaleDateString() : '(empty)'} · ~/.tokenstats/usage.sqlite
+        {t('rep.footer', { ver: __APP_VERSION__, built: __BUILD_TIME__, span: span.min ? t('rep.spanSince', { date: new Date(span.min).toLocaleDateString() }) : t('rep.spanEmpty') })}
       </footer>
     </div>
   )
@@ -345,9 +347,9 @@ function Breakdown({ mode, setMode, models, projects, CLI, label, plans }) {
     <section className="card">
       <div className="card-head">
         <div className="seg">
-          {plans && <button className={mode === 'plan' ? 'on' : ''} onClick={() => setMode('plan')}>By plan</button>}
-          <button className={mode === 'model' ? 'on' : ''} onClick={() => setMode('model')}>By model</button>
-          <button className={mode === 'project' ? 'on' : ''} onClick={() => setMode('project')}>By project</button>
+          {plans && <button className={mode === 'plan' ? 'on' : ''} onClick={() => setMode('plan')}>{t('rep.byPlan')}</button>}
+          <button className={mode === 'model' ? 'on' : ''} onClick={() => setMode('model')}>{t('rep.byModel')}</button>
+          <button className={mode === 'project' ? 'on' : ''} onClick={() => setMode('project')}>{t('rep.byProject')}</button>
         </div>
         <span className="card-sub">{label}</span>
       </div>
@@ -355,7 +357,7 @@ function Breakdown({ mode, setMode, models, projects, CLI, label, plans }) {
         <PlanBreakdown bd={plans} CLI={CLI} />
       ) : mode !== 'project' ? (
         <div className="models">
-          {models.length === 0 && <div className="empty">No usage in this range.</div>}
+          {models.length === 0 && <div className="empty">{t('rep.noUsageRange')}</div>}
           {models.slice(0, 15).map((m) => (
             <div className="mrow" key={m.cli + m.model}>
               <span className="dot" style={{ background: metaFor(CLI, m.cli).color }} />
@@ -368,11 +370,11 @@ function Breakdown({ mode, setMode, models, projects, CLI, label, plans }) {
         </div>
       ) : (
         <div className="models">
-          {projects.length === 0 && <div className="empty">No usage in this range.</div>}
+          {projects.length === 0 && <div className="empty">{t('rep.noUsageRange')}</div>}
           {projects.slice(0, 15).map((p) => (
             <div className="mrow" key={p.cli + p.project}>
               <span className="dot" style={{ background: metaFor(CLI, p.cli).color }} />
-              <span className="mname" title={p.project + ' · ' + metaFor(CLI, p.cli).label + ' · ' + p.turns + ' turns'}>{p.project}</span>
+              <span className="mname" title={p.project + ' · ' + metaFor(CLI, p.cli).label + ' · ' + p.turns + ' ' + t('rep.turns')}>{p.project}</span>
               <div className="mtrack"><div className="mfill" style={{ width: (100 * p.total) / maxProject + '%', background: metaFor(CLI, p.cli).color }} /></div>
               <span className="mtok">{compact(p.total)}</span>
               <span className="mcost">{usd(p.cost)}</span>
@@ -393,7 +395,7 @@ function PlanBreakdown({ bd, CLI }) {
   const buckets = [...(bd.plans || [])].sort((a, b) => b.cost - a.cost)
   if (bd.unplanned && (bd.unplanned.cost > 0 || bd.unplanned.tokens > 0)) buckets.push(bd.unplanned)
   const shown = buckets.filter((b) => b.cost > 0 || b.tokens > 0 || b.fees > 0)
-  if (shown.length === 0) return <div className="empty">No usage in this range. Add token plans in Settings to group usage by plan.</div>
+  if (shown.length === 0) return <div className="empty">{t('rep.noUsageAddPlans')}</div>
   const totalCost = Math.max(bd.totalCost, 1e-9)
   const maxModel = Math.max(1, ...shown.flatMap((b) => b.models.map((m) => m.total)))
   return (
@@ -408,26 +410,26 @@ function PlanBreakdown({ bd, CLI }) {
             <div className="prow">
               <span className="dot" style={{ background: color }} />
               <span className="pname">
-                {isPlan ? b.name : 'No plan · pay-as-you-go'}
-                {isPlan && !b.active && <span className="muted small"> (ended)</span>}
+                {isPlan ? b.name : t('rep.noPlanPayg')}
+                {isPlan && !b.active && <span className="muted small"> {t('rep.endedTag')}</span>}
               </span>
               <span className="pmeta">
-                {isPlan && <>fees <b>${usd(b.fees)}</b> · </>}
-                worth <b className="mcost">${usd(b.cost)}</b>
-                {val != null && <> · value <b style={{ color: val >= 100 ? '#7ee0b8' : '#e0c97e' }}>{val}%</b></>}
-                {isPlan && b.fees === 0 && b.monthlyUsd > 0 && <> · <span title="no billing cycle started inside this range">no charge in range</span></>}
+                {isPlan && <>{t('rep.fees')} <b>${usd(b.fees)}</b> · </>}
+                {t('rep.worth')} <b className="mcost">${usd(b.cost)}</b>
+                {val != null && <> · {t('rep.value')} <b style={{ color: val >= 100 ? '#7ee0b8' : '#e0c97e' }}>{val}%</b></>}
+                {isPlan && b.fees === 0 && b.monthlyUsd > 0 && <> · <span title={t('rep.noChargeTip')}>{t('rep.noChargeRange')}</span></>}
               </span>
-              <div className="ptrack" title={share + '% of all usage worth in this range'}>
+              <div className="ptrack" title={t('rep.shareOfWorth', { share })}>
                 <div className="pfill" style={{ width: share + '%', background: color }} />
               </div>
               <span className="pshare">{share}%</span>
             </div>
             <div className="models pmodels">
-              {b.models.length === 0 && <div className="empty mini">No usage in this range.</div>}
+              {b.models.length === 0 && <div className="empty mini">{t('rep.noUsageRange')}</div>}
               {b.models.map((m) => (
                 <div className="mrow" key={m.cli + m.model}>
                   <span className="dot sm" style={{ background: metaFor(CLI, m.cli).color }} />
-                  <span className="mname" title={m.model + ' · ' + metaFor(CLI, m.cli).label + ' · ' + m.turns + ' turns'}>{m.model}</span>
+                  <span className="mname" title={m.model + ' · ' + metaFor(CLI, m.cli).label + ' · ' + m.turns + ' ' + t('rep.turns')}>{m.model}</span>
                   <div className="mtrack"><div className="mfill" style={{ width: (100 * m.total) / maxModel + '%', background: metaFor(CLI, m.cli).color }} /></div>
                   <span className="mtok">{compact(m.total)}</span>
                   <span className="mcost">{usd(m.cost)}</span>
@@ -453,7 +455,7 @@ function Legend({ brands, onToggle, CLI, ORDER }) {
             type="button"
             className={'leg' + (on ? '' : ' off')}
             onClick={() => onToggle(c)}
-            title={on ? 'Click to hide ' + meta.label : 'Click to show ' + meta.label}
+            title={on ? t('rep.clickHide', { label: meta.label }) : t('rep.clickShow', { label: meta.label })}
           >
             <span className="dot" style={{ background: meta.color }} />{meta.label}
           </button>
@@ -509,9 +511,9 @@ function SubsView({ CLI }) {
     return [...map.values()].sort((a, b) => a.month.localeCompare(b.month)).slice(-12)
   }, [stats])
 
-  if (stats === null) return <div className="empty">Loading…</div>
+  if (stats === null) return <div className="empty">{t('common.loading')}</div>
   if (stats.length === 0) {
-    return <div className="empty">No token plans yet — add them in Settings (tray menu → Settings… → Token plans).</div>
+    return <div className="empty">{t('rep.noPlansAdd')}</div>
   }
 
   const pct = (cost, paid) => (paid > 0 ? Math.round((100 * cost) / paid) : null)
@@ -519,13 +521,13 @@ function SubsView({ CLI }) {
   return (
     <>
       <div className="tiles">
-        <Tile label="Active plans" value={'$' + usd(summary.monthly)} sub="USD / month" />
-        <Tile label="Total paid" value={'$' + usd(summary.paid)} sub="all billed months" />
-        <Tile label="Usage worth" value={'$' + usd(summary.cost)} sub="est. API cost of covered usage" accent="#7ee0b8" />
+        <Tile label={t('rep.activePlans')} value={'$' + usd(summary.monthly)} sub={t('rep.usdPerMonth')} />
+        <Tile label={t('rep.totalPaid')} value={'$' + usd(summary.paid)} sub={t('rep.allBilledMonths')} />
+        <Tile label={t('rep.usageWorth')} value={'$' + usd(summary.cost)} sub={t('rep.estApiCost')} accent="#7ee0b8" />
         <Tile
-          label="Value"
+          label={t('rep.valueLabel')}
           value={pct(summary.cost, summary.paid) != null ? pct(summary.cost, summary.paid) + '%' : '—'}
-          sub="usage worth ÷ paid"
+          sub={t('rep.worthDivPaid')}
           accent={summary.cost >= summary.paid ? '#7ee0b8' : '#e0c97e'}
         />
       </div>
@@ -537,10 +539,10 @@ function SubsView({ CLI }) {
       {monthly.length > 0 && (
         <section className="card">
           <div className="card-head">
-            <h3>Fees paid vs usage worth — by month, all plans</h3>
+            <h3>{t('rep.feesVsWorthMonth')}</h3>
             <div className="legend" style={{ margin: 0 }}>
-              <span className="leg"><span className="dot" style={{ background: FEE_COLOR }} />Fee paid</span>
-              <span className="leg"><span className="dot" style={{ background: WORTH_COLOR }} />Usage worth</span>
+              <span className="leg"><span className="dot" style={{ background: FEE_COLOR }} />{t('rep.feePaid')}</span>
+              <span className="leg"><span className="dot" style={{ background: WORTH_COLOR }} />{t('rep.usageWorthLegend')}</span>
             </div>
           </div>
           <PairedBars data={monthly} />
@@ -554,9 +556,9 @@ function SubsView({ CLI }) {
             <div className="card-head">
               <h3>
                 {s.name}
-                <span className={'sub-status' + (s.active ? ' on' : '')}>{s.active ? 'active' : 'ended ' + (s.endDate || '')}</span>
+                <span className={'sub-status' + (s.active ? ' on' : '')}>{s.active ? t('rep.active') : t('rep.endedOn', { date: s.endDate || '' })}</span>
               </h3>
-              <span className="card-sub">${usd(s.monthlyUsd)}/mo · since {s.startDate}</span>
+              <span className="card-sub">{t('rep.moSince', { usd: usd(s.monthlyUsd), date: s.startDate })}</span>
             </div>
             <div className="chips">
               {(s.bindings || []).map((b, i) => (
@@ -564,17 +566,17 @@ function SubsView({ CLI }) {
                   <span className="dot sm" style={{ background: metaFor(CLI, b.cli).color, display: 'inline-block', marginRight: 5 }} />
                   {metaFor(CLI, b.cli).label}
                   {b.keyAlias ? ` · ${b.keyAlias}` : ''}
-                  {b.models?.length ? ` · ${b.models.length} model${b.models.length === 1 ? '' : 's'}` : ''}
+                  {b.models?.length ? ` · ${b.models.length} ${b.models.length === 1 ? t('common.model') : t('common.models')}` : ''}
                 </span>
               ))}
-              {(s.bindings || []).length === 0 && <span className="chip">no sources bound</span>}
+              {(s.bindings || []).length === 0 && <span className="chip">{t('rep.noSourcesBound')}</span>}
             </div>
             <div className="sub-totals">
-              <span>billed <b>{s.monthsBilled}</b> month{s.monthsBilled === 1 ? '' : 's'}</span>
-              <span>paid <b>${usd(s.totalPaid)}</b></span>
-              <span>usage worth <b className="mcost">${usd(s.totalCost)}</b> ({compact(s.totalTokens)} tokens)</span>
+              <span>{t('rep.billedMonths')} <b>{s.monthsBilled}</b> {s.monthsBilled === 1 ? t('common.month') : t('common.months')}</span>
+              <span>{t('rep.paidLabel')} <b>${usd(s.totalPaid)}</b></span>
+              <span>{t('rep.usageWorthInline')} <b className="mcost">${usd(s.totalCost)}</b> {t('rep.tokensParen', { tokens: compact(s.totalTokens) })}</span>
               {ratio != null && (
-                <span>value <b style={{ color: ratio >= 100 ? '#7ee0b8' : '#e0c97e' }}>{ratio}%</b></span>
+                <span>{t('rep.valueInline')} <b style={{ color: ratio >= 100 ? '#7ee0b8' : '#e0c97e' }}>{ratio}%</b></span>
               )}
             </div>
 
@@ -583,11 +585,11 @@ function SubsView({ CLI }) {
                 <table className="reqtable">
                   <thead>
                     <tr>
-                      <th>Billing cycle</th>
-                      <th className="r">Fee</th>
-                      <th className="r">Usage worth</th>
-                      <th className="r">Tokens</th>
-                      <th className="r">Value</th>
+                      <th>{t('rep.billingCycle')}</th>
+                      <th className="r">{t('rep.fee')}</th>
+                      <th className="r">{t('rep.usageWorthCol')}</th>
+                      <th className="r">{t('rep.tokensCol')}</th>
+                      <th className="r">{t('rep.valueCol')}</th>
                     </tr>
                   </thead>
                   <tbody>
@@ -597,7 +599,7 @@ function SubsView({ CLI }) {
                         <tr key={c.start}>
                           <td className="mono">
                             {dayLabel(c.start)} – {dayLabel(c.end - DAY)}
-                            {i === 0 && s.active && <span className="muted"> (current)</span>}
+                            {i === 0 && s.active && <span className="muted"> {t('rep.current')}</span>}
                           </td>
                           <td className="r">{usd(c.fee)}</td>
                           <td className="r cost">{usd(c.cost)}</td>
@@ -608,7 +610,7 @@ function SubsView({ CLI }) {
                                 {cr != null ? cr + '%' : '—'}
                               </span>
                               {cr != null && (
-                                <div className="vtrack" title={`usage worth is ${cr}% of the fee (tick = 100%)`}>
+                                <div className="vtrack" title={t('rep.valueTickTip', { cr })}>
                                   <div
                                     className="vfill"
                                     style={{
@@ -632,8 +634,7 @@ function SubsView({ CLI }) {
       })}
 
       <div className="empty small">
-        Usage worth is the pricing.js estimate (real spend for LiteLLM sources). Older cycles may be incomplete —
-        only locally available history is counted (LiteLLM syncs the last 35 days).
+        {t('rep.worthFootnote')}
       </div>
     </>
   )
@@ -766,7 +767,7 @@ function PlanTimeline({ CLI }) {
   const colorOf = Object.fromEntries(plans.map((p) => [p.id, planColor(p)]))
   colorOf.un = '#5b6172'
   const nameOf = Object.fromEntries(plans.map((p) => [p.id, p.name]))
-  nameOf.un = 'No plan'
+  nameOf.un = t('rep.noPlan')
   const dayMax = Math.max(1, ...days.map((d) => Object.values(d.perPlan).reduce((a, s) => a + s.tokens, 0)))
   const usageY = padT + lanesH + gap
   const yTok = (v) => usageY + (usageH - 14) * (1 - v / dayMax) + 14
@@ -781,20 +782,20 @@ function PlanTimeline({ CLI }) {
   return (
     <section className="card">
       <div className="card-head">
-        <h3>Subscription timeline — {rangeLabel}</h3>
+        <h3>{t('rep.subTimeline', { label: rangeLabel })}</h3>
         <div className="rep-actions">
-          <span className="card-sub">wheel = zoom · drag = pan</span>
+          <span className="card-sub">{t('rep.wheelZoom')}</span>
           <div className="seg">
             <button onClick={() => preset(30)}>1M</button>
             <button onClick={() => preset(90)}>3M</button>
             <button onClick={() => preset(180)}>6M</button>
-            <button onClick={() => preset(null)}>All</button>
+            <button onClick={() => preset(null)}>{t('common.all')}</button>
           </div>
         </div>
       </div>
 
       {data && plans.length === 0 && (
-        <div className="empty">No token plans yet — add them in Settings to see their timeline.</div>
+        <div className="empty">{t('rep.noPlansTimeline')}</div>
       )}
 
       <div
@@ -834,8 +835,8 @@ function PlanTimeline({ CLI }) {
                     <g key={c.start}>
                       <rect x={sx} y={laneY + 4} width={w} height={laneH - 9} rx="2.5" fill={color} opacity={ci % 2 ? 0.5 : 0.85}>
                         <title>
-                          {p.name + '\n' + dayLabel(c.start) + ' – ' + dayLabel(c.end - 1) + '\nfee $' + usd(c.fee) +
-                            ' · usage worth $' + usd(c.cost) + (val != null ? ' (' + val + '%)' : '') +
+                          {p.name + '\n' + dayLabel(c.start) + ' – ' + dayLabel(c.end - 1) + '\n' + t('rep.feeWord') + ' $' + usd(c.fee) +
+                            ' · ' + t('rep.usageWorthWord') + ' $' + usd(c.cost) + (val != null ? ' (' + val + '%)' : '') +
                             '\n' + compact(c.tokens) + ' tokens'}
                         </title>
                       </rect>
@@ -892,8 +893,8 @@ function PlanTimeline({ CLI }) {
       {data && (
         <>
           <div className="sub-totals" style={{ margin: '10px 0' }}>
-            <span>in view: fees <b>${usd(inViewFees)}</b></span>
-            <span>usage worth <b className="mcost">${usd(data.totalCost)}</b></span>
+            <span>{t('rep.inViewFees')} <b>${usd(inViewFees)}</b></span>
+            <span>{t('rep.usageWorthInline')} <b className="mcost">${usd(data.totalCost)}</b></span>
             <span><b>{compact(plans.reduce((a, p) => a + p.tokens, 0) + (data.unplanned?.tokens || 0))}</b> tokens</span>
           </div>
           <PlanBreakdown bd={data} CLI={CLI} />
@@ -941,27 +942,27 @@ function PlanCompare({ stats }) {
   return (
     <section className="card">
       <div className="card-head">
-        <h3>Plan comparison — tokens & money, all billed history</h3>
+        <h3>{t('rep.planComparison')}</h3>
         <div className="legend" style={{ margin: 0 }}>
-          <span className="leg"><span className="dot" style={{ background: FEE_COLOR }} />Fees paid</span>
-          <span className="leg"><span className="dot" style={{ background: WORTH_COLOR }} />Usage worth</span>
+          <span className="leg"><span className="dot" style={{ background: FEE_COLOR }} />{t('rep.feesPaid')}</span>
+          <span className="leg"><span className="dot" style={{ background: WORTH_COLOR }} />{t('rep.usageWorthLegend')}</span>
         </div>
       </div>
       <div className="cmp-row cmp-head">
-        <span>Plan</span>
-        <span>Fees paid vs usage worth (USD)</span>
-        <span className="cmp-r">Value</span>
-        <span>Tokens</span>
-        <span className="cmp-r" title="what you actually paid per million tokens on this plan — lower is cheaper">Paid $/1M</span>
+        <span>{t('rep.plan')}</span>
+        <span>{t('rep.feesVsWorthUsd')}</span>
+        <span className="cmp-r">{t('rep.valueLabel')}</span>
+        <span>{t('rep.tokensCol')}</span>
+        <span className="cmp-r" title={t('rep.paidPer1MTip')}>{t('rep.paidPer1M')}</span>
       </div>
       {rows.map((s) => {
         const val = s.totalPaid > 0 ? Math.round((100 * s.totalCost) / s.totalPaid) : null
         const unit = s.totalTokens > 0 && s.totalPaid > 0 ? s.totalPaid / (s.totalTokens / 1e6) : null
         return (
           <div className="cmp-row" key={s.id}>
-            <span className="cmp-name" title={s.name + ' · $' + usd(s.monthlyUsd) + '/mo since ' + s.startDate}>
+            <span className="cmp-name" title={s.name + ' · $' + usd(s.monthlyUsd) + '/mo · ' + s.startDate}>
               {s.name}
-              {!s.active && <span className="muted small"> (ended)</span>}
+              {!s.active && <span className="muted small"> {t('rep.endedTag')}</span>}
             </span>
             <div className="cmp-bars">
               {hbar(s.totalPaid, usdMax, FEE_COLOR, '$' + usd(s.totalPaid))}
@@ -1027,8 +1028,8 @@ function PairedBars({ data, height = 220 }) {
         const ratio = d.paid > 0 ? Math.round((100 * d.cost) / d.paid) + '%' : '—'
         return (
           <g key={d.month}>
-            {bar(cx - bw - 1, d.paid, FEE_COLOR, `${mf} — fees paid $${usd(d.paid)}`)}
-            {bar(cx + 1, d.cost, WORTH_COLOR, `${mf} — usage worth $${usd(d.cost)} (${ratio} of fees)`)}
+            {bar(cx - bw - 1, d.paid, FEE_COLOR, `${mf} — ${t('rep.feesPaidWord')} $${usd(d.paid)}`)}
+            {bar(cx + 1, d.cost, WORTH_COLOR, `${mf} — ${t('rep.usageWorthWord')} $${usd(d.cost)} (${ratio} ${t('rep.ofFees')})`)}
             {isLast && d.paid > 0 && (
               <text x={cx} y={y(Math.max(d.paid, d.cost)) - 6} className="blabel" textAnchor="middle">{ratio}</text>
             )}
@@ -1053,43 +1054,43 @@ function RequestLog({ rows, count, day, today, setDay, reqCli, setReqCli, CLI, O
   return (
     <section className="card">
       <div className="card-head">
-        <h3>Logs — {dayLabel(day)}</h3>
+        <h3>{t('rep.logsTitle', { label: dayLabel(day) })}</h3>
         <div className="rep-actions">
           <select className="sel" value={reqCli} onChange={(e) => setReqCli(e.target.value)}>
-            <option value="all">All providers</option>
+            <option value="all">{t('rep.allProviders')}</option>
             {ORDER.map((c) => <option key={c} value={c}>{metaFor(CLI, c).label}</option>)}
           </select>
           <div className="daynav">
             <button className="btn" onClick={() => setDay(day - DAY)}>‹</button>
-            <button className="btn" onClick={() => setDay(today)} disabled={day === today}>Today</button>
+            <button className="btn" onClick={() => setDay(today)} disabled={day === today}>{t('common.today')}</button>
             <button className="btn" onClick={() => setDay(Math.min(today, day + DAY))} disabled={day >= today}>›</button>
           </div>
         </div>
       </div>
 
       <div className="reqsum">
-        {count.toLocaleString()} request{count === 1 ? '' : 's'} · {compact(totals.total)} tokens · {compact(totals.noCache)} excl. cache read · {usd(totals.cost)}
-        {rows.length < count && <span className="reqclip"> (showing first {rows.length.toLocaleString()})</span>}
+        {t('rep.requests', { count: count.toLocaleString(), unit: count === 1 ? t('rep.request') : t('rep.requestsWord'), tokens: compact(totals.total), noCache: compact(totals.noCache), cost: usd(totals.cost) })}
+        {rows.length < count && <span className="reqclip"> {t('rep.showingFirst', { n: rows.length.toLocaleString() })}</span>}
       </div>
 
       <div className="reqwrap">
         <table className="reqtable">
           <thead>
             <tr>
-              <th>Time</th>
-              <th>Provider</th>
-              <th>Model</th>
-              <th>Session</th>
-              <th className="r">Input</th>
-              <th className="r">Output</th>
-              <th className="r">Total</th>
-              <th className="r" title="Total minus cache-read tokens — closer to how CC Switch counts">Total −R</th>
-              <th className="r">Cost</th>
+              <th>{t('rep.time')}</th>
+              <th>{t('rep.provider')}</th>
+              <th>{t('rep.modelCol')}</th>
+              <th>{t('rep.session')}</th>
+              <th className="r">{t('rep.input')}</th>
+              <th className="r">{t('rep.output')}</th>
+              <th className="r">{t('rep.total')}</th>
+              <th className="r" title={t('rep.totalMinusRTip')}>{t('rep.totalMinusR')}</th>
+              <th className="r">{t('rep.cost')}</th>
             </tr>
           </thead>
           <tbody>
             {rows.length === 0 && (
-              <tr><td colSpan={9} className="empty">No requests on this day.</td></tr>
+              <tr><td colSpan={9} className="empty">{t('rep.noRequestsDay')}</td></tr>
             )}
             {rows.map((r, i) => (
               <tr key={i}>

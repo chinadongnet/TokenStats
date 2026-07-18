@@ -4,7 +4,7 @@ import fs from 'node:fs'
 import { fileURLToPath } from 'node:url'
 import { Store } from './core/store.js'
 import { UsageDb } from './core/db.js'
-import { CLI_META, ensureConfigFile, CONFIG_FILE } from './core/paths.js'
+import { CLI_META, ensureConfigFile, CONFIG_FILE, loadLanguage, saveLanguage } from './core/paths.js'
 import { createLitellmPoller, listModels } from './core/parsers/litellm.js'
 import { codexResetWindows } from './core/parsers/codex.js'
 import { cursorResetWindows } from './core/parsers/cursor.js'
@@ -34,6 +34,39 @@ let ingestTimer = null
 // in sync by refreshLitellmPollers() — used wherever a static CLI_META lookup
 // alone wouldn't know about a dynamic provider (tray recolor, open-data-dir).
 let dynamicCliMeta = {}
+// UI language for the native tray menu/tooltip. The renderer owns its own copy
+// (localStorage); this mirror is updated by the 'set-language' IPC and read when
+// the tray context menu is (re)built on each right-click.
+let lang = loadLanguage()
+// Tray-only strings — the renderer has its own full dictionary (src/renderer/
+// src/i18n.js); this covers just the native menu/tooltip the main process draws.
+const TRAY_STRINGS = {
+  en: {
+    open: 'Open TokenStats',
+    report: 'Token report…',
+    settings: 'Settings…',
+    refresh: 'Refresh now',
+    editSources: 'Edit data sources… (other devices)',
+    startAtLogin: 'Start at login',
+    quit: 'Quit',
+    todayTokens: 'today {n} tokens',
+  },
+  zh: {
+    open: '打开 TokenStats',
+    report: '用量报表…',
+    settings: '设置…',
+    refresh: '立即刷新',
+    editSources: '编辑数据源…（其他设备）',
+    startAtLogin: '开机启动',
+    quit: '退出',
+    todayTokens: '今日 {n} tokens',
+  },
+}
+const tray_t = (key, params) => {
+  let s = (TRAY_STRINGS[lang] || TRAY_STRINGS.en)[key] || TRAY_STRINGS.en[key] || key
+  if (params) for (const k in params) s = s.split('{' + k + '}').join(String(params[k]))
+  return s
+}
 // True while the popup's screenshot save dialog is open — the dialog steals
 // focus, and without this the popup's hide-on-blur would close it mid-export.
 let popupExporting = false
@@ -98,6 +131,16 @@ async function init() {
   ipcMain.on('quit-app', () => { app.isQuitting = true; app.quit() })
   ipcMain.on('open-report', () => openReport())
   ipcMain.on('open-settings', () => openSettings())
+
+  // UI language: renderer owns the instant switch (localStorage); this persists
+  // it for the tray menu and rebroadcasts to every window so all three stay in
+  // sync even if a cross-window storage event is missed.
+  ipcMain.handle('get-language', () => lang)
+  ipcMain.handle('set-language', (_e, l) => {
+    lang = saveLanguage(l)
+    for (const w of BrowserWindow.getAllWindows()) w.webContents.send('language', lang)
+    return lang
+  })
 
   // Report data queries (served from the SQLite hourly table).
   ipcMain.handle('report:hourly', (_e, dayStartMs) => db?.hourly(dayStartMs) ?? [])
@@ -426,16 +469,16 @@ function createTray() {
   tray.on('click', () => toggleWindow())
   tray.on('right-click', () => {
     const menu = Menu.buildFromTemplate([
-      { label: 'Open TokenStats', click: () => showWindow() },
-      { label: 'Token report…', click: () => openReport() },
-      { label: 'Settings…', click: () => openSettings() },
+      { label: tray_t('open'), click: () => showWindow() },
+      { label: tray_t('report'), click: () => openReport() },
+      { label: tray_t('settings'), click: () => openSettings() },
       { type: 'separator' },
-      { label: 'Refresh now', click: async () => { await store.scanAll(); await store.refreshNetworkParsers(); await Promise.all(store.pollers.map((p) => store.forcePoll(p.cli))); broadcastSnapshot() } },
-      { label: 'Edit data sources… (other devices)', click: () => { ensureConfigFile(); shell.openPath(CONFIG_FILE) } },
+      { label: tray_t('refresh'), click: async () => { await store.scanAll(); await store.refreshNetworkParsers(); await Promise.all(store.pollers.map((p) => store.forcePoll(p.cli))); broadcastSnapshot() } },
+      { label: tray_t('editSources'), click: () => { ensureConfigFile(); shell.openPath(CONFIG_FILE) } },
       { type: 'separator' },
-      { label: 'Start at login', type: 'checkbox', checked: isAutoLaunch(), click: (item) => setAutoLaunch(item.checked) },
+      { label: tray_t('startAtLogin'), type: 'checkbox', checked: isAutoLaunch(), click: (item) => setAutoLaunch(item.checked) },
       { type: 'separator' },
-      { label: 'Quit', click: () => { app.isQuitting = true; app.quit() } },
+      { label: tray_t('quit'), click: () => { app.isQuitting = true; app.quit() } },
     ])
     tray.popUpContextMenu(menu)
   })
@@ -446,7 +489,7 @@ function updateTray(snap) {
   const today = snap?.totals?.today?.total || 0
   // Build time, not just version: dev iterates without bumping, so the version
   // alone can't tell a fresh install from a stale one.
-  tray.setToolTip(`TokenStats v${__APP_VERSION__} (${__BUILD_TIME__}) — today ${compact(today)} tokens`)
+  tray.setToolTip(`TokenStats v${__APP_VERSION__} (${__BUILD_TIME__}) — ${tray_t('todayTokens', { n: compact(today) })}`)
   // Recolour by the most recently active CLI (built-in or a dynamic LiteLLM provider).
   const cli = snap?.live?.cli
   const meta = cli && (CLI_META[cli] || dynamicCliMeta[cli])
