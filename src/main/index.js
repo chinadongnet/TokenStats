@@ -19,7 +19,7 @@ const __dirname = path.dirname(fileURLToPath(import.meta.url))
 // Fixed logical (DIP) size of the tray popup's content area. Re-applied on every
 // show and on display changes so a resolution/DPI switch can't shrink it.
 const POPUP_W = 380
-const POPUP_H = 600
+const POPUP_H = 700
 
 let tray = null
 let win = null

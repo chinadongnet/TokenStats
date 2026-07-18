@@ -80,12 +80,6 @@ function tints(hex, n) {
 }
 
 const WEEK_MS = 7 * 86400000
-const BattIcon = () => (
-  <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.7" aria-hidden="true">
-    <rect x="2" y="7" width="18" height="10" rx="2" />
-    <path d="M22 10v4" />
-  </svg>
-)
 const ClockIcon = () => (
   <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" aria-hidden="true">
     <circle cx="12" cy="12" r="9" />
@@ -99,11 +93,11 @@ const BillIcon = () => (
   </svg>
 )
 
-// A plan's quota windows as aligned meters: a battery bar for usage remaining
-// (流量, colored by headroom) and a clock for the reset countdown — two visually
-// distinct shapes so time never reads like usage. Cells render straight into the
-// parent grid so every row's columns line up. Billing renewal is a separate row.
-function QuotaMeters({ plan, now }) {
+// The plan's live quota — the card's centerpiece. Per window: a bold usage-
+// remaining ratio (流量, colored by headroom) on a wide bar, and the NEXT reset
+// cycle (clock). Billing renewal is a slim sub-row. Cells render straight into
+// the grid so the columns line up across windows.
+function QuotaBig({ plan, now }) {
   const cells = []
   for (const w of plan.windows) {
     const live = w.source === 'live'
@@ -116,26 +110,24 @@ function QuotaMeters({ plan, now }) {
         : 0
     const pct = Math.round(frac * 100)
     const fill = !live ? 'var(--faint)' : pct > 50 ? 'var(--ok)' : pct > 20 ? 'var(--warn)' : 'var(--crit)'
-    const resetTxt = w.end ? (w.periodMs >= WEEK_MS ? atTime(w.end, w.periodMs) : dur(left)) : '—'
-    const per = RESET_FULL[w.period] || w.period
+    const next = w.end ? (w.periodMs >= WEEK_MS ? atTime(w.end, w.periodMs) : dur(left)) : '—'
     const title = live
-      ? `${per} quota (live) · ${Math.round(w.usedPercent)}% used — ${pct}% left` +
-        (w.end ? `\nresets ${atTime(w.end, w.periodMs)} (${dur(left)})` : '')
-      : `${per} quota (estimate)` + (w.end ? `\nresets ${atTime(w.end, w.periodMs)} (${dur(left)})` : '')
+      ? `${RESET_FULL[w.period] || w.period} quota (live) · ${Math.round(w.usedPercent)}% used — ${pct}% left` +
+        (w.end ? `\nnext cycle ${atTime(w.end, w.periodMs)} (${dur(left)})` : '')
+      : `${RESET_FULL[w.period] || w.period} quota (estimate)` + (w.end ? `\nnext cycle ${atTime(w.end, w.periodMs)} (${dur(left)})` : '')
     cells.push(
       <React.Fragment key={w.period}>
-        <span className="qi" title={title}>
-          <BattIcon />
+        <span className="qwk">{RESET_LABEL[w.period] || w.period}</span>
+        <span className="qbar" title={title}>
+          <i style={{ width: `${Math.max(3, pct)}%`, background: fill }} />
         </span>
-        <span className="meter" title={title}>
-          <i style={{ width: `${Math.max(4, pct)}%`, background: fill }} />
+        <span className="qnum">
+          {live ? <b>{pct}%</b> : <span className="qk">est</span>}
+          <span className="qlab">left</span>
         </span>
-        <span className="qv">{live ? <><b>{pct}%</b> left</> : <span className="qk">est</span>}</span>
-        <span className="qi">
+        <span className="qnext" title={title}>
           <ClockIcon />
-        </span>
-        <span className="qv">
-          <span className="qk">{RESET_LABEL[w.period] || w.period}</span> <b>{resetTxt}</b>
+          <b>{next}</b>
         </span>
       </React.Fragment>
     )
@@ -144,25 +136,19 @@ function QuotaMeters({ plan, now }) {
     const away = Math.max(0, plan.renewal.end - now)
     cells.push(
       <React.Fragment key="bill">
-        <span className="qi" title={`Subscription renewal\n$${usd(plan.monthlyUsd)} bills ${atTime(plan.renewal.end, plan.renewal.periodMs)} (${dur(away)})`}>
-          <BillIcon />
-        </span>
-        <span className="meter">
+        <span className="qwk bill">bill</span>
+        <span className="qbar" title={`Renewal · $${usd(plan.monthlyUsd)} bills ${atTime(plan.renewal.end, plan.renewal.periodMs)} (${dur(away)})`}>
           <i style={{ width: `${Math.round(100 * (away / plan.renewal.periodMs))}%`, background: FEE_COLOR }} />
         </span>
-        <span className="qv">
-          <span className="qk">bill</span>
-        </span>
-        <span className="qi">
-          <ClockIcon />
-        </span>
-        <span className="qv">
+        <span className="qnum billamt">${usd(plan.monthlyUsd)}</span>
+        <span className="qnext">
+          <BillIcon />
           <b>{dur(away)}</b>
         </span>
       </React.Fragment>
     )
   }
-  return <div className="quota">{cells}</div>
+  return <div className="qb">{cells}</div>
 }
 
 // One plan's models as a segmented bar (widths ∝ tokens, shaded in the plan's
@@ -243,10 +229,11 @@ export default function App() {
 
   if (!snap) return <div className="loading">Scanning CLI logs…</div>
 
-  const per = scope === 'today' ? snap.todayPerCli : snap.perCli
+  const per = scope === 'today' ? snap.todayPerCli : scope === '7d' ? snap.weekPerCli : snap.perCli
+  const perModelSrc = scope === 'today' ? snap.todayPerModel : scope === '7d' ? snap.weekPerModel : snap.perModel
   // Models grouped by CLI (biggest first) for each plan's in-place breakdown.
   const modelsByCli = new Map()
-  for (const m of (scope === 'today' ? snap.todayPerModel : snap.perModel) || []) {
+  for (const m of perModelSrc || []) {
     if (!(m.total > 0)) continue
     if (!modelsByCli.has(m.cli)) modelsByCli.set(m.cli, [])
     modelsByCli.get(m.cli).push(m)
@@ -255,8 +242,11 @@ export default function App() {
   // First plan bound to each CLI, so a card can show its quota + live/manual.
   const planByCli = new Map()
   for (const r of resets) for (const b of r.bindings || []) if (b.cli && !planByCli.has(b.cli)) planByCli.set(b.cli, r)
-  // Cards for CLIs with usage this scope, biggest first.
-  const cliOrder = ORDER.filter((c) => (per[c]?.total || 0) > 0).sort((a, b) => (per[b]?.total || 0) - (per[a]?.total || 0))
+  // Cards for every CLI with usage this scope, PLUS any CLI that has a plan (so
+  // its live quota shows even with no usage in the selected range), biggest first.
+  const cliOrder = [...new Set([...ORDER.filter((c) => (per[c]?.total || 0) > 0), ...planByCli.keys()])]
+    .filter((c) => CLI[c])
+    .sort((a, b) => (per[b]?.total || 0) - (per[a]?.total || 0))
   const totalTok = ORDER.reduce((a, c) => a + (per[c]?.total || 0), 0)
   const totalCost = ORDER.reduce((a, c) => a + (per[c]?.cost || 0), 0)
 
@@ -270,6 +260,7 @@ export default function App() {
         <div className="hwin">
           <div className="seg">
             <button className={scope === 'today' ? 'on' : ''} onClick={() => setScope('today')}>Today</button>
+            <button className={scope === '7d' ? 'on' : ''} onClick={() => setScope('7d')}>7d</button>
             <button className={scope === 'all' ? 'on' : ''} onClick={() => setScope('all')}>All</button>
           </div>
           <button className="ghost" title="Token report" onClick={() => window.api.openReport()}>▤</button>
@@ -334,7 +325,7 @@ export default function App() {
                     <span className="pc">${usd(d.cost)}</span>
                   </span>
                 </div>
-                {plan && <QuotaMeters plan={plan} now={now} />}
+                {plan && plan.windows.length > 0 && <QuotaBig plan={plan} now={now} />}
                 {ms.length > 0 && <ModelBar models={ms} color={meta.color} />}
               </div>
             )

@@ -252,6 +252,11 @@ export class Store extends EventEmitter {
     const records = this.dedupedRecords()
     const now = new Date()
     const todayKey = dayKey(now.getTime())
+    // Rolling 7-day window (start of the local day 6 days ago = 7 calendar days
+    // incl. today), for the popup's "7d" scope.
+    const midnight = new Date(now)
+    midnight.setHours(0, 0, 0, 0)
+    const weekStart = midnight.getTime() - 6 * 86400000
 
     // 5 fixed built-in CLIs + whatever LiteLLM providers are currently active,
     // so a dynamic `litellm:<id>` cli id never hits a missing blank accumulator.
@@ -264,8 +269,10 @@ export class Store extends EventEmitter {
     const blank = () => ({ total: 0, input: 0, output: 0, cacheRead: 0, cacheCreate: 0, reasoning: 0, cost: 0, count: 0 })
     const perCli = Object.fromEntries(allCliIds.map((c) => [c, blank()]))
     const todayPerCli = Object.fromEntries(allCliIds.map((c) => [c, blank()]))
+    const weekPerCli = Object.fromEntries(allCliIds.map((c) => [c, blank()]))
     const perModel = new Map()
     const todayPerModel = new Map()
+    const weekPerModel = new Map()
     const perDay = new Map() // dayKey -> { [cli]: total }
     let latest = null
 
@@ -274,6 +281,7 @@ export class Store extends EventEmitter {
       add(perCli[r.cli], r, cost)
       const dk = dayKey(r.ts)
       if (dk === todayKey) add(todayPerCli[r.cli], r, cost)
+      if (r.ts >= weekStart && weekPerCli[r.cli]) add(weekPerCli[r.cli], r, cost)
 
       if (!perModel.has(r.model)) perModel.set(r.model, { model: r.model, cli: r.cli, ...blank() })
       add(perModel.get(r.model), r, cost)
@@ -281,6 +289,10 @@ export class Store extends EventEmitter {
       if (dk === todayKey) {
         if (!todayPerModel.has(r.model)) todayPerModel.set(r.model, { model: r.model, cli: r.cli, ...blank() })
         add(todayPerModel.get(r.model), r, cost)
+      }
+      if (r.ts >= weekStart) {
+        if (!weekPerModel.has(r.model)) weekPerModel.set(r.model, { model: r.model, cli: r.cli, ...blank() })
+        add(weekPerModel.get(r.model), r, cost)
       }
 
       if (!perDay.has(dk)) perDay.set(dk, { day: dk, total: 0, ...Object.fromEntries(allCliIds.map((c) => [c, 0])) })
@@ -306,11 +318,14 @@ export class Store extends EventEmitter {
       totals: {
         all: sumCli(perCli),
         today: sumCli(todayPerCli),
+        week: sumCli(weekPerCli),
       },
       perCli,
       todayPerCli,
+      weekPerCli,
       perModel: [...perModel.values()].sort((a, b) => b.total - a.total),
       todayPerModel: [...todayPerModel.values()].sort((a, b) => b.total - a.total),
+      weekPerModel: [...weekPerModel.values()].sort((a, b) => b.total - a.total),
       perDay: [...perDay.values()].sort((a, b) => a.day.localeCompare(b.day)).slice(-30),
       recentSessions: sessions.slice(0, 12),
       todayRecentSessions: todaySessions.slice(0, 12),
