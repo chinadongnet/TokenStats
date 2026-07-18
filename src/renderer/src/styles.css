@@ -5,7 +5,13 @@
   --line: #262a35;
   --text: #e6e8ee;
   --muted: #8b90a0;
+  --faint: #5b6172;
   --accent: #d97757;
+  /* semantic quota-headroom colors (separate from the per-plan accents) */
+  --ok: #43d19e;
+  --warn: #e0b24a;
+  --crit: #e56b6b;
+  --cost: #7ee0b8;
 }
 
 * { box-sizing: border-box; }
@@ -35,6 +41,11 @@ header {
 .drag { -webkit-app-region: drag; }
 .hwin, button { -webkit-app-region: no-drag; }
 .brand { display: flex; align-items: center; gap: 8px; font-weight: 600; }
+/* popup header controls: keep the Today/All toggle + icon buttons compact so
+   they fit beside the brand at 380px. */
+.hwin { display: flex; align-items: center; gap: 3px; }
+.hwin .seg { margin-right: 3px; }
+.hwin .seg button { padding: 4px 9px; font-size: 11px; }
 .logo {
   width: 16px; height: 16px; border-radius: 5px;
   background: linear-gradient(135deg, var(--accent), #10a37f 60%, #4285f4);
@@ -73,52 +84,56 @@ header {
 .tabs button.on { background: var(--panel2); color: var(--text); border-color: #39405200; }
 .detail-tabs button { font-size: 11px; padding: 6px 3px; white-space: nowrap; }
 
-.hero { text-align: center; padding: 14px 0 6px; }
-.hero-num { font-size: 38px; font-weight: 700; letter-spacing: -1px; }
-.hero-sub { color: var(--muted); margin-top: 2px; }
-.cost { color: #7ee0b8; }
+/* ---- popup: summary strip + per-plan cards ---- */
+.sum { display: flex; align-items: baseline; gap: 8px; padding: 12px 14px 8px; }
+.sum > b { font-size: 27px; font-weight: 700; letter-spacing: -.6px; font-variant-numeric: tabular-nums; }
+.sum .u { color: var(--muted); font-size: 12px; }
+.sum .c { color: var(--cost); font-weight: 600; font-size: 12px; font-variant-numeric: tabular-nums; }
 
-.bars { padding: 8px 12px; display: flex; flex-direction: column; gap: 10px; }
-.row { cursor: pointer; }
-.row:hover .name { color: #fff; }
-.row-head { display: flex; align-items: center; gap: 8px; margin-bottom: 5px; }
+.cards { display: flex; flex-direction: column; gap: 7px; padding: 2px 10px 10px; }
+.pcard { background: var(--panel); border: 1px solid var(--line); border-left: 3px solid var(--ac);
+  border-radius: 11px; padding: 9px 11px; cursor: pointer; }
+.pcard:hover { background: var(--panel2); }
+.ptop { display: flex; align-items: center; gap: 7px; }
+.pdot { width: 9px; height: 9px; border-radius: 50%; background: var(--ac); flex: none; }
+.pnm { display: flex; align-items: baseline; gap: 6px; min-width: 0; flex: 1; }
+.pnm > b { font-size: 13px; font-weight: 600; white-space: nowrap; }
+.pplan { color: var(--muted); font-size: 11px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.ptot { white-space: nowrap; font-variant-numeric: tabular-nums; text-align: right; }
+.ptot > b { font-size: 13px; font-weight: 600; }
+.ptot .pc { color: var(--cost); font-size: 11px; margin-left: 5px; }
+
+/* live = real numbers from the CLI's own usage report; manual = estimate */
+.src { flex: none; font-size: 8px; text-transform: uppercase; letter-spacing: .05em; font-weight: 600;
+  padding: 1px 4px; border-radius: 4px; }
+.src.live { background: rgba(67, 209, 158, .16); color: var(--ok); }
+.src.man { background: var(--panel2); color: var(--muted); }
+
+/* quota meters — battery bar for usage (流量) + clock for reset time, aligned
+   in a shared grid so every row's columns line up. */
+.quota { display: grid; grid-template-columns: 15px 1fr auto 14px auto; gap: 5px 6px; align-items: center; margin-top: 8px; }
+.qi { color: var(--muted); display: inline-flex; align-items: center; }
+.meter { height: 7px; border-radius: 4px; background: var(--panel2); overflow: hidden; position: relative; }
+.meter > i { position: absolute; inset: 0 auto 0 0; border-radius: 4px; transition: width .4s ease; }
+.qv { font-size: 11px; color: var(--muted); font-variant-numeric: tabular-nums; white-space: nowrap; }
+.qv > b { color: var(--text); font-weight: 600; }
+.qk { font-size: 9px; text-transform: uppercase; letter-spacing: .04em; color: var(--faint); }
+
+/* per-plan model breakdown — segmented bar (shaded in the plan color) + legend */
+.models { margin-top: 9px; }
+.segbar { height: 8px; border-radius: 4px; overflow: hidden; display: flex; background: var(--panel2); }
+.segbar > span { height: 100%; }
+.pleg { display: flex; flex-wrap: wrap; gap: 4px 12px; margin-top: 6px; }
+.pleg > span { display: flex; align-items: center; gap: 5px; font-size: 11px; color: var(--muted); font-variant-numeric: tabular-nums; }
+.pleg > span > i { width: 7px; height: 7px; border-radius: 2px; flex: none; }
+.pleg b { color: var(--text); font-weight: 500; }
+
 .dot { width: 9px; height: 9px; border-radius: 50%; flex: none; }
 .dot.sm { width: 7px; height: 7px; }
-.name { flex: 1; }
-.tok { font-variant-numeric: tabular-nums; font-weight: 600; }
-.track { height: 7px; background: var(--panel2); border-radius: 4px; overflow: hidden; }
-.fill { height: 100%; border-radius: 4px; transition: width .4s ease; min-width: 2px; }
-.row-meta { display: flex; justify-content: space-between; color: var(--muted); font-size: 11px; margin-top: 4px; }
-
-/* Quota-reset windows (popup): ONE line per plan, with that plan's windows
-   inlined on the right. The ring carries the remaining-time ratio, so no
-   full-width bar is needed — the popup is 380px wide and a plan can declare up
-   to 3 windows. Exact usage/cost lives in each window's tooltip. */
-.resets .reset { display: flex; align-items: center; gap: 7px; padding: 2px 0; font-size: 11px; }
-.resets .reset .ellipsis { color: var(--text); }
-.rwins { display: flex; align-items: center; gap: 9px; flex: none; flex-wrap: wrap; justify-content: flex-end; row-gap: 4px; }
-.rwin { display: flex; align-items: center; gap: 5px; color: var(--muted); cursor: default; }
-.rwin .ring { flex: none; }
-.rwin-meta { display: flex; flex-direction: column; line-height: 1.15; }
-.rwin-p { font-size: 9px; text-transform: uppercase; letter-spacing: 0.03em; color: var(--muted); }
-.rwin-t { color: var(--text); font-variant-numeric: tabular-nums; font-size: 11px; }
-/* Quota-source badge: whether a plan's windows are live (from the CLI's own
-   usage report) or estimated from tracked usage against the manual config. */
-.resets .qsrc { flex: none; font-size: 8.5px; text-transform: uppercase; letter-spacing: 0.05em; padding: 1px 4px; border-radius: 4px; line-height: 1.4; cursor: default; }
-.resets .qsrc.live { background: rgba(16, 163, 127, 0.16); color: #12a884; }
-.resets .qsrc.est { background: var(--panel2); color: var(--muted); }
-
-.block { padding: 4px 12px 8px; }
-.block h3 {
-  font-size: 11px; text-transform: uppercase; letter-spacing: .6px;
-  color: var(--muted); margin: 10px 0 6px; font-weight: 600;
-}
-.line { display: flex; align-items: center; gap: 8px; padding: 3px 0; }
 .ellipsis { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.num { font-variant-numeric: tabular-nums; color: var(--text); }
 .muted { color: var(--muted); }
 .small { font-size: 11px; }
-.empty.mini { padding: 4px 0; font-size: 12px; }
+.empty { padding: 22px 4px; text-align: center; color: var(--muted); font-size: 12px; }
 
 footer {
   margin-top: auto; display: flex; align-items: center; justify-content: space-between;

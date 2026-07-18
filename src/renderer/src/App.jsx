@@ -15,12 +15,6 @@ const FIXED_ORDER = ['claude', 'codex', 'gemini', 'agy', 'cursor']
 // Cheap insurance for the rare case a snapshot references a provider that was
 // just deleted (stale-by-one-tick), so a lookup never renders `undefined`.
 const FALLBACK_META = (id) => ({ label: id.startsWith('litellm:') ? '(deleted provider)' : id, color: '#5b6172' })
-const DETAIL_TABS = [
-  { id: 'today-models', label: 'Today Models', scope: 'today', detail: 'models', title: 'Today models' },
-  { id: 'today-sessions', label: 'Today Sessions', scope: 'today', detail: 'sessions', title: 'Today sessions' },
-  { id: 'all-models', label: 'All Models', scope: 'all', detail: 'models', title: 'All-time models' },
-  { id: 'all-sessions', label: 'All Sessions', scope: 'all', detail: 'sessions', title: 'All-time sessions' },
-]
 
 const compact = (n) => {
   if (!n) return '0'
@@ -54,31 +48,6 @@ const atTime = (ts, periodMs) => {
   const t = d.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })
   return periodMs >= 86400000 ? `${d.toLocaleDateString([], { month: 'short', day: 'numeric' })} ${t}` : t
 }
-// Ratio gauge: a ring showing how much of a quota window is LEFT, with the
-// remaining number printed inside it (when `label` is given). The popup is only
-// 380px wide, so this replaces a full-width progress bar. Stroke scales with
-// size so a bigger ring still looks right.
-function Ring({ frac, color, size = 12, label }) {
-  const stroke = Math.max(2.5, Math.round(size * 0.12))
-  const r = (size - stroke) / 2
-  const c = 2 * Math.PI * r
-  const mid = size / 2
-  return (
-    <svg className="ring" width={size} height={size} viewBox={`0 0 ${size} ${size}`} aria-hidden="true">
-      <circle cx={mid} cy={mid} r={r} fill="none" stroke="var(--panel2)" strokeWidth={stroke} />
-      <circle
-        cx={mid} cy={mid} r={r} fill="none" stroke={color} strokeWidth={stroke} strokeLinecap="round"
-        strokeDasharray={`${frac * c} ${c}`}
-        transform={`rotate(-90 ${mid} ${mid})`}
-      />
-      {label != null && (
-        <text x={mid} y={mid} textAnchor="middle" dominantBaseline="central" fontSize={size * 0.36} fontWeight="700" fill={color}>
-          {label}
-        </text>
-      )}
-    </svg>
-  )
-}
 
 const ago = (ts) => {
   if (!ts) return ''
@@ -89,9 +58,140 @@ const ago = (ts) => {
   return Math.round(s / 86400) + 'd ago'
 }
 
+// Trim a model id to something legible in a tight legend.
+function shortModel(m) {
+  let s = String(m || '')
+    .replace(/\s*\([^)]*\)\s*$/, '') // drop trailing "(High)" etc.
+    .replace(/^claude-/, '')
+    .replace(/^cursor-/, '')
+    .replace(/-(thinking|high|low|xhigh|fast)(-|$).*/i, '')
+  return s.trim() || 'model'
+}
+
+// Tints of a hex color from the base (i=0) toward white, to shade the stacked
+// model segments within one plan's own color.
+function tints(hex, n) {
+  const h = String(hex).replace('#', '')
+  const rgb = [0, 2, 4].map((i) => parseInt(h.slice(i, i + 2), 16))
+  return Array.from({ length: n }, (_, i) => {
+    const t = n <= 1 ? 0 : (i / (n - 1)) * 0.58
+    return '#' + rgb.map((v) => Math.round(v + (255 - v) * t).toString(16).padStart(2, '0')).join('')
+  })
+}
+
+const WEEK_MS = 7 * 86400000
+const BattIcon = () => (
+  <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.7" aria-hidden="true">
+    <rect x="2" y="7" width="18" height="10" rx="2" />
+    <path d="M22 10v4" />
+  </svg>
+)
+const ClockIcon = () => (
+  <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" aria-hidden="true">
+    <circle cx="12" cy="12" r="9" />
+    <path d="M12 7v5l3 2" />
+  </svg>
+)
+const BillIcon = () => (
+  <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" aria-hidden="true">
+    <rect x="3" y="5" width="18" height="14" rx="2" />
+    <path d="M3 10h18" />
+  </svg>
+)
+
+// A plan's quota windows as aligned meters: a battery bar for usage remaining
+// (流量, colored by headroom) and a clock for the reset countdown — two visually
+// distinct shapes so time never reads like usage. Cells render straight into the
+// parent grid so every row's columns line up. Billing renewal is a separate row.
+function QuotaMeters({ plan, now }) {
+  const cells = []
+  for (const w of plan.windows) {
+    const live = w.source === 'live'
+    const open = live ? w.end == null || w.end > now : w.open && w.end > now
+    const left = w.end ? Math.max(0, w.end - now) : 0
+    const frac = live
+      ? Math.min(1, Math.max(0, (w.remainingPercent || 0) / 100))
+      : open
+        ? Math.min(1, Math.max(0, left / w.periodMs))
+        : 0
+    const pct = Math.round(frac * 100)
+    const fill = !live ? 'var(--faint)' : pct > 50 ? 'var(--ok)' : pct > 20 ? 'var(--warn)' : 'var(--crit)'
+    const resetTxt = w.end ? (w.periodMs >= WEEK_MS ? atTime(w.end, w.periodMs) : dur(left)) : '—'
+    const per = RESET_FULL[w.period] || w.period
+    const title = live
+      ? `${per} quota (live) · ${Math.round(w.usedPercent)}% used — ${pct}% left` +
+        (w.end ? `\nresets ${atTime(w.end, w.periodMs)} (${dur(left)})` : '')
+      : `${per} quota (estimate)` + (w.end ? `\nresets ${atTime(w.end, w.periodMs)} (${dur(left)})` : '')
+    cells.push(
+      <React.Fragment key={w.period}>
+        <span className="qi" title={title}>
+          <BattIcon />
+        </span>
+        <span className="meter" title={title}>
+          <i style={{ width: `${Math.max(4, pct)}%`, background: fill }} />
+        </span>
+        <span className="qv">{live ? <><b>{pct}%</b> left</> : <span className="qk">est</span>}</span>
+        <span className="qi">
+          <ClockIcon />
+        </span>
+        <span className="qv">
+          <span className="qk">{RESET_LABEL[w.period] || w.period}</span> <b>{resetTxt}</b>
+        </span>
+      </React.Fragment>
+    )
+  }
+  if (plan.renewal && plan.monthlyUsd > 0) {
+    const away = Math.max(0, plan.renewal.end - now)
+    cells.push(
+      <React.Fragment key="bill">
+        <span className="qi" title={`Subscription renewal\n$${usd(plan.monthlyUsd)} bills ${atTime(plan.renewal.end, plan.renewal.periodMs)} (${dur(away)})`}>
+          <BillIcon />
+        </span>
+        <span className="meter">
+          <i style={{ width: `${Math.round(100 * (away / plan.renewal.periodMs))}%`, background: FEE_COLOR }} />
+        </span>
+        <span className="qv">
+          <span className="qk">bill</span>
+        </span>
+        <span className="qi">
+          <ClockIcon />
+        </span>
+        <span className="qv">
+          <b>{dur(away)}</b>
+        </span>
+      </React.Fragment>
+    )
+  }
+  return <div className="quota">{cells}</div>
+}
+
+// One plan's models as a segmented bar (widths ∝ tokens, shaded in the plan's
+// color) plus a compact legend — the current-period breakdown, grouped in place.
+function ModelBar({ models, color }) {
+  const total = models.reduce((a, m) => a + (m.total || 0), 0) || 1
+  const cols = tints(color, models.length)
+  return (
+    <div className="models">
+      <div className="segbar">
+        {models.map((m, i) => (
+          <span key={m.cli + m.model} style={{ width: `${(100 * (m.total || 0)) / total}%`, background: cols[i] }} title={`${m.model} · ${compact(m.total)}`} />
+        ))}
+      </div>
+      <div className="pleg">
+        {models.map((m, i) => (
+          <span key={m.cli + m.model}>
+            <i style={{ background: cols[i] }} />
+            {shortModel(m.model)} <b>{compact(m.total)}</b>
+          </span>
+        ))}
+      </div>
+    </div>
+  )
+}
+
 export default function App() {
   const [snap, setSnap] = useState(null)
-  const [tab, setTab] = useState('today-models')
+  const [scope, setScope] = useState('today')
   const [shotMenu, setShotMenu] = useState(false)
   const [copied, setCopied] = useState(false)
   const [resets, setResets] = useState([])
@@ -143,18 +243,22 @@ export default function App() {
 
   if (!snap) return <div className="loading">Scanning CLI logs…</div>
 
-  const activeTab = DETAIL_TABS.find((t) => t.id === tab) || DETAIL_TABS[0]
-  const scope = activeTab.scope
   const per = scope === 'today' ? snap.todayPerCli : snap.perCli
-  const models = ((scope === 'today' ? snap.todayPerModel : snap.perModel) || [])
-    .filter((m) => scope !== 'today' || (m.total || 0) > 0)
-  const sessions = (scope === 'today' ? snap.todayRecentSessions : snap.recentSessions) || []
-  const visibleCliOrder = scope === 'today'
-    ? ORDER.filter((c) => (per[c]?.total || 0) > 0)
-    : ORDER
+  // Models grouped by CLI (biggest first) for each plan's in-place breakdown.
+  const modelsByCli = new Map()
+  for (const m of (scope === 'today' ? snap.todayPerModel : snap.perModel) || []) {
+    if (!(m.total > 0)) continue
+    if (!modelsByCli.has(m.cli)) modelsByCli.set(m.cli, [])
+    modelsByCli.get(m.cli).push(m)
+  }
+  for (const arr of modelsByCli.values()) arr.sort((a, b) => b.total - a.total)
+  // First plan bound to each CLI, so a card can show its quota + live/manual.
+  const planByCli = new Map()
+  for (const r of resets) for (const b of r.bindings || []) if (b.cli && !planByCli.has(b.cli)) planByCli.set(b.cli, r)
+  // Cards for CLIs with usage this scope, biggest first.
+  const cliOrder = ORDER.filter((c) => (per[c]?.total || 0) > 0).sort((a, b) => (per[b]?.total || 0) - (per[a]?.total || 0))
   const totalTok = ORDER.reduce((a, c) => a + (per[c]?.total || 0), 0)
   const totalCost = ORDER.reduce((a, c) => a + (per[c]?.cost || 0), 0)
-  const maxTok = Math.max(1, ...visibleCliOrder.map((c) => per[c]?.total || 0))
 
   return (
     <div className="app">
@@ -164,6 +268,10 @@ export default function App() {
           <span>TokenStats</span>
         </div>
         <div className="hwin">
+          <div className="seg">
+            <button className={scope === 'today' ? 'on' : ''} onClick={() => setScope('today')}>Today</button>
+            <button className={scope === 'all' ? 'on' : ''} onClick={() => setScope('all')}>All</button>
+          </div>
           <button className="ghost" title="Token report" onClick={() => window.api.openReport()}>▤</button>
           <button className="ghost" title="Settings" onClick={() => window.api.openSettings()}>⚙</button>
           <div className="shot">
@@ -181,158 +289,57 @@ export default function App() {
         </div>
       </header>
 
-      <div className="tabs detail-tabs">
-        {DETAIL_TABS.map((t) => (
-          <button key={t.id} className={tab === t.id ? 'on' : ''} onClick={() => setTab(t.id)}>
-            {t.label}
-          </button>
-        ))}
-      </div>
-
       <div className="scroll">
-      <div className="hero">
-        <div className="hero-num">{compact(totalTok)}</div>
-        <div className="hero-sub">tokens · <span className="cost">{usd(totalCost)}</span> est.</div>
-      </div>
+        <div className="sum">
+          <b>{compact(totalTok)}</b>
+          <span className="u">tokens</span>
+          <span className="c">${usd(totalCost)} est</span>
+        </div>
 
-      {resets.length > 0 && (
-        <section className="block resets">
-          <h3>Quota windows</h3>
-          {resets.map((r) => {
-            const cli = r.bindings?.[0]?.cli
-            const color = cli ? (CLI[cli] || FALLBACK_META(cli)).color : '#5b6172'
-            const isLive = r.source === 'live'
+        <div className="cards">
+          {cliOrder.length === 0 && <div className="empty">No usage in this range yet.</div>}
+          {cliOrder.map((c) => {
+            const d = per[c] || { total: 0, cost: 0, count: 0 }
+            const meta = CLI[c] || FALLBACK_META(c)
+            const plan = planByCli.get(c)
+            const ms = (modelsByCli.get(c) || []).slice(0, 4)
             return (
-              <div className="reset" key={r.id}>
-                <span className="dot sm" style={{ background: color }} />
-                <span className="ellipsis">{r.name}</span>
-                {/* Source badge: live = real numbers from the CLI's own logs;
-                    manual = estimated from tracked usage vs the plan config. */}
-                <span
-                  className={`qsrc ${isLive ? 'live' : 'est'}`}
-                  title={
-                    isLive
-                      ? `Live quota read from ${cli}'s own usage report — refreshed as ${cli} runs`
-                      : 'Estimated from tracked token usage against your manually-configured plan'
-                  }
-                >
-                  {isLive ? 'live' : 'manual'}
-                </span>
-                <span className="rwins">
-                  {r.windows.map((w) => {
-                    const live = w.source === 'live'
-                    // Estimate windows: ring = TIME left / period. Live windows:
-                    // ring = USAGE left (100 − used_percent) from the CLI itself.
-                    // `open` re-checks the live clock so a mid-tick expiry shows.
-                    const open = live ? (w.end == null || w.end > now) : (w.open && w.end > now)
-                    const left = w.end ? Math.max(0, w.end - now) : 0
-                    const frac = live
-                      ? Math.min(1, Math.max(0, (w.remainingPercent || 0) / 100))
-                      : open ? Math.min(1, Math.max(0, left / w.periodMs)) : 0
-                    const title = live
-                      ? `${r.name} · ${RESET_FULL[w.period] || w.period} quota (live)\n` +
-                        `${Math.round(w.usedPercent)}% used — ${Math.round(w.remainingPercent)}% left\n` +
-                        (w.end ? `resets ${atTime(w.end, w.periodMs)} (${dur(left)})` : 'no reset time reported')
-                      : open
-                        ? `${r.name} · ${RESET_FULL[w.period] || w.period} quota\n` +
-                          `${dur(left)} left — resets ${atTime(w.end, w.periodMs)}\n` +
-                          `${compact(w.tokens)} tokens · $${usd(w.cost)} · ${w.turns} turns this window`
-                        : `${r.name} · ${RESET_FULL[w.period] || w.period} quota\nno open window — your next request starts one`
-                    return (
-                      <span className="rwin" key={w.period} title={title}>
-                        <Ring
-                          frac={frac}
-                          color={open ? color : '#5b6172'}
-                          size={26}
-                          label={live ? Math.round(w.remainingPercent) : undefined}
-                        />
-                        <span className="rwin-meta">
-                          <span className="rwin-p">{RESET_LABEL[w.period] || w.period}</span>
-                          <span className="rwin-t">
-                            {live ? (w.end ? dur(left) : `${Math.round(w.remainingPercent)}%`) : open ? dur(left) : 'idle'}
-                          </span>
-                        </span>
-                      </span>
-                    )
-                  })}
-                  {/* Subscription renewal — a separate clock off startDate (when
-                      the fee is charged), not a token quota. */}
-                  {r.renewal && r.monthlyUsd > 0 && (
+              <div
+                className="pcard"
+                key={c}
+                style={{ '--ac': meta.color }}
+                onClick={() => window.api.openDataDir(c)}
+                title="Open data folder"
+              >
+                <div className="ptop">
+                  <span className="pdot" />
+                  <span className="pnm">
+                    <b>{meta.label}</b>
+                    {plan && <span className="pplan">{plan.name}</span>}
+                  </span>
+                  {plan && (
                     <span
-                      className="rwin"
+                      className={`src ${plan.source === 'live' ? 'live' : 'man'}`}
                       title={
-                        `${r.name} · subscription renewal\n` +
-                        `$${usd(r.monthlyUsd)} bills again ${atTime(r.renewal.end, r.renewal.periodMs)}\n` +
-                        `${dur(Math.max(0, r.renewal.end - now))} away — billing date, not a token quota`
+                        plan.source === 'live'
+                          ? `Live quota from ${meta.label}'s own usage report`
+                          : 'Estimated from tracked usage against your manual plan'
                       }
                     >
-                      <Ring
-                        frac={Math.min(1, Math.max(0, (r.renewal.end - now) / r.renewal.periodMs))}
-                        color={FEE_COLOR}
-                        size={26}
-                      />
-                      <span className="rwin-meta">
-                        <span className="rwin-p">bill</span>
-                        <span className="rwin-t">{dur(Math.max(0, r.renewal.end - now))}</span>
-                      </span>
+                      {plan.source === 'live' ? 'live' : 'manual'}
                     </span>
                   )}
-                </span>
+                  <span className="ptot">
+                    <b>{compact(d.total)}</b>
+                    <span className="pc">${usd(d.cost)}</span>
+                  </span>
+                </div>
+                {plan && <QuotaMeters plan={plan} now={now} />}
+                {ms.length > 0 && <ModelBar models={ms} color={meta.color} />}
               </div>
             )
           })}
-        </section>
-      )}
-
-      <section className="bars">
-        {visibleCliOrder.map((c) => {
-          const d = per[c] || { total: 0, cost: 0, count: 0 }
-          return (
-            <div className="row" key={c} onClick={() => window.api.openDataDir(c)} title="Open data folder">
-              <div className="row-head">
-                <span className="dot" style={{ background: CLI[c].color }} />
-                <span className="name">{CLI[c].label}</span>
-                <span className="tok">{compact(d.total)}</span>
-              </div>
-              <div className="track">
-                <div className="fill" style={{ width: (100 * (d.total || 0)) / maxTok + '%', background: CLI[c].color }} />
-              </div>
-              <div className="row-meta">
-                <span>{usd(d.cost)} est.</span>
-                <span>{d.count} turns</span>
-              </div>
-            </div>
-          )
-        })}
-      </section>
-
-      <section className="block">
-        <h3>{activeTab.title}</h3>
-        {activeTab.detail === 'models' ? (
-          <>
-            {models.length === 0 && <div className="empty mini">No model usage in this range.</div>}
-            {models.slice(0, 8).map((m) => (
-              <div className="line" key={m.cli + m.model}>
-                <span className="dot sm" style={{ background: (CLI[m.cli] || FALLBACK_META(m.cli)).color }} />
-                <span className="ellipsis">{m.model}</span>
-                <span className="num">{compact(m.total)}</span>
-              </div>
-            ))}
-          </>
-        ) : (
-          <>
-            {sessions.length === 0 && <div className="empty mini">No sessions in this range.</div>}
-            {sessions.slice(0, 8).map((s) => (
-              <div className="line" key={s.cli + s.sessionId}>
-                <span className="dot sm" style={{ background: (CLI[s.cli] || FALLBACK_META(s.cli)).color }} />
-                <span className="ellipsis">{s.project}</span>
-                <span className="muted small">{ago(s.lastTs)}</span>
-                <span className="num">{compact(s.total)}</span>
-              </div>
-            ))}
-          </>
-        )}
-      </section>
+        </div>
       </div>
 
       <footer>
