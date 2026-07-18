@@ -107,7 +107,6 @@ function QuotaBig({ plan, now }) {
     if (w.source !== 'live') continue
     const left = w.end ? Math.max(0, w.end - now) : 0
     const uFrac = Math.min(1, Math.max(0, (w.remainingPercent || 0) / 100))
-    const tFrac = w.end && w.periodMs ? Math.min(1, Math.max(0, left / w.periodMs)) : 0
     const uPct = Math.round(uFrac * 100)
     const next = w.end ? (w.periodMs >= WEEK_MS ? atTime(w.end, w.periodMs) : dur(left)) : '—'
     cells.push(
@@ -116,11 +115,10 @@ function QuotaBig({ plan, now }) {
         <span className="qbar" title={`${Math.round(w.usedPercent)}% used — ${uPct}% left`}>
           <i style={{ width: `${Math.max(3, uPct)}%`, background: levelColor(uFrac) }} />
         </span>
-        <span className="qnum"><b>{uPct}%</b></span>
-        <span className="qbar" title={w.end ? `resets ${atTime(w.end, w.periodMs)}` : 'no reset time'}>
-          <i style={{ width: `${Math.max(3, Math.round(tFrac * 100))}%`, background: levelColor(tFrac) }} />
-        </span>
-        <span className="qnext">
+        <span className="qnum">{uPct}%</span>
+        {/* time is a rounded countdown chip, NOT a bar, so it never reads as a
+            second usage meter */}
+        <span className="qtime" title={w.end ? `next cycle ${atTime(w.end, w.periodMs)} (${dur(left)})` : 'no reset time'}>
           <ClockIcon />
           <b>{next}</b>
         </span>
