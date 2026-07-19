@@ -34,6 +34,14 @@ System tray:  [▮ AI] ◄ click
 - 📊 **Usage report** — a full window with **hour-by-hour** and daily charts, per-model
   breakdown, and a one-click **Export PNG**. Backed by a local **SQLite** database
   (`~/.TokenStats/usage.sqlite`) that records usage at hourly granularity per model.
+- 💳 **Subscription plans & live quota windows** — enter your monthly plans (Claude,
+  ChatGPT, Google AI, Cursor, a LiteLLM token plan…) to compare what you pay against
+  what your usage is actually worth, and see each plan's **remaining quota + reset
+  countdown** in the popup. Where a tool reports its own quota this shows **live** —
+  Claude, Codex, Cursor, and **Antigravity** (see [Antigravity live quota](#antigravity-live-quota)) —
+  otherwise it's an estimate. The active plans' total **$/mo** shows top-right of the popup.
+- 🌐 **English / 简体中文** — switch the whole UI language in **Settings → App**
+  (amounts stay in USD). The tray menu follows too.
 - ⚙️ **LiteLLM Settings** — track any number of self-hosted LiteLLM proxies, each with
   its own name, color, sync frequency, and per-model show/hide + rename. See
   [LiteLLM providers](#litellm-providers) below.
@@ -105,6 +113,26 @@ source here, LiteLLM's admin API reports **actual spend**, not a `pricing.js` es
 
 Provider configuration (including the API key) is stored locally in
 `~/.TokenStats/usage.sqlite`, never sent anywhere except to the proxy you configured.
+
+## Antigravity live quota
+
+Antigravity (`agy`) keeps its remaining quota only in memory — its interactive
+`/usage` view is the only place it's shown, and there's no local file or public API to
+read it from. To surface it anyway, TokenStats uses agy's **statusLine hook** (the same
+mechanism as [Ranteck/agy-statusline](https://github.com/Ranteck/agy-statusline)): agy
+pipes its live session state — including per-model-pool quota — as JSON to a configured
+command on every render.
+
+Turn it on in **Settings → App → "Track agy quota"**. TokenStats then installs a tiny
+hook into agy's own `settings.json` that mirrors that JSON to
+`~/.TokenStats/agy_status.json`, and shows the **Gemini** weekly quota (remaining % +
+reset countdown) as a live **Antigravity** card in the popup. Notes:
+
+- It refreshes **for free whenever you run the `agy` CLI** — no OAuth, no extra network
+  calls, and no quota spent. It won't touch a statusLine you configured yourself, and
+  un-checking the toggle removes it cleanly.
+- The mirror updates on **`agy` CLI** use, not the Antigravity IDE. The current agy
+  version reports weekly (~7-day) pools only, no separate 5-hour window.
 
 ## Multiple devices
 
