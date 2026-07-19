@@ -12,6 +12,7 @@ import { claudeResetWindows, primeClaudeLimits } from './core/claudeLimits.js'
 import { computeAllSubscriptionStats, computePlanBreakdown, computePlanTimeline, computeResetWindows, mergeLiveLimits } from './core/subscriptions.js'
 import { migrateLegacyLitellmConfig } from './core/migrateLitellm.js'
 import { isAutoLaunch, setAutoLaunch, migrateLegacyRunKeys } from './autoLaunch.js'
+import { agyResetWindows, getAgyQuotaState, enableAgyQuota, disableAgyQuota, ensureAgyHook } from './agyQuota.js'
 import { makeTrayIcon } from './trayIcon.js'
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url))
@@ -142,6 +143,16 @@ async function init() {
     return lang
   })
 
+  // Antigravity (agy) live-quota integration — installs/removes a statusLine
+  // hook in agy's own settings (see agyQuota.js). Broadcasting after a change
+  // lets the popup pick up (or drop) the live Antigravity card right away.
+  ipcMain.handle('agy:get-state', () => getAgyQuotaState())
+  ipcMain.handle('agy:set-enabled', (_e, on) => {
+    const res = on ? enableAgyQuota() : disableAgyQuota()
+    broadcastSnapshot()
+    return res
+  })
+
   // Report data queries (served from the SQLite hourly table).
   ipcMain.handle('report:hourly', (_e, dayStartMs) => db?.hourly(dayStartMs) ?? [])
   ipcMain.handle('report:daily', (_e, fromMs, toMs) => db?.daily(fromMs, toMs) ?? [])
@@ -216,7 +227,7 @@ async function init() {
     if (!db || !store) return []
     const now = Date.now()
     const entries = computeResetWindows(db.listSubscriptions(), store.dedupedRecords(), now)
-    const liveByCli = { codex: codexResetWindows(), claude: claudeResetWindows(), cursor: cursorResetWindows() }
+    const liveByCli = { codex: codexResetWindows(), claude: claudeResetWindows(), cursor: cursorResetWindows(), agy: agyResetWindows() }
     const labels = Object.fromEntries(Object.entries(CLI_META).map(([k, v]) => [k, v.label]))
     return mergeLiveLimits(entries, liveByCli, now, labels)
   })
@@ -238,6 +249,7 @@ async function init() {
     if (store?.reapplyPoller('litellm:' + payload.providerId)) broadcastSnapshot()
   })
 
+  ensureAgyHook() // re-assert the agy statusLine hook file if the user enabled it
   refreshLitellmPollers() // populate store.pollers before the initial scan/poll
   await store.start()
   ingestNow() // first full ingest after the initial scan

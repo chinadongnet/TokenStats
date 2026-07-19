@@ -88,6 +88,10 @@ export default function Settings() {
   const [expanded, setExpanded] = useState(null) // providerId whose model list is shown
   const [modelsByProvider, setModelsByProvider] = useState({}) // id -> {loading, error, rows}
 
+  // Antigravity (agy) live-quota integration state
+  const [agy, setAgy] = useState(null) // null = loading; else getAgyQuotaState()
+  const [agyBusy, setAgyBusy] = useState(false)
+
   // subscription plans
   const [subs, setSubs] = useState(null) // null = loading
   const [subStats, setSubStats] = useState({}) // id -> stats
@@ -107,6 +111,18 @@ export default function Settings() {
     setSubStats(Object.fromEntries((stats || []).map((s) => [s.id, s])))
   }
   useEffect(() => { loadSubs() }, [])
+
+  useEffect(() => { window.api.agyGetState().then(setAgy) }, [])
+  async function toggleAgy(on) {
+    setAgyBusy(true)
+    try {
+      const res = await window.api.agySetEnabled(on)
+      // enable/disable returns the fresh state (minus the leading ok flag)
+      setAgy(res && res.agyFound !== undefined ? res : await window.api.agyGetState())
+    } finally {
+      setAgyBusy(false)
+    }
+  }
 
   function startAdd() {
     setDraft(emptyDraft())
@@ -315,6 +331,18 @@ export default function Settings() {
     return cli
   }
 
+  // Human-readable status line under the agy toggle.
+  const agyStatus = (() => {
+    if (!agy) return ''
+    if (!agy.agyFound) return t('set.agyNotFound')
+    if (agy.foreign && !agy.enabled) return t('set.agyForeign')
+    if (!agy.enabled) return t('set.agyQuotaHint')
+    if (agy.mirrorAgeMs == null) return t('set.agyEnabledWaiting')
+    const mins = Math.max(0, Math.round(agy.mirrorAgeMs / 60000))
+    return t(mins > 60 ? 'set.agyEnabledStale' : 'set.agyEnabledFresh', { mins })
+  })()
+  const agyDisabled = agyBusy || !agy || !agy.agyFound || (agy.foreign && !agy.enabled)
+
   return (
     <div className="report">
       <header className="rep-head">
@@ -336,6 +364,24 @@ export default function Settings() {
           <div className="field grow">
             <label>&nbsp;</label>
             <div className="muted small" style={{ marginTop: 7 }}>{t('set.languageHint')}</div>
+          </div>
+        </div>
+        <div className="field-row" style={{ alignItems: 'flex-start', marginTop: 4 }}>
+          <div className="field shrink" style={{ width: 200 }}>
+            <label>{t('set.agyQuota')}</label>
+            <label className="check" style={{ marginTop: 7 }}>
+              <input
+                type="checkbox"
+                checked={!!(agy && agy.enabled)}
+                disabled={agyDisabled}
+                onChange={(e) => toggleAgy(e.target.checked)}
+              />
+              {t('set.agyQuotaOn')}
+            </label>
+          </div>
+          <div className="field grow">
+            <label>&nbsp;</label>
+            <div className="muted small" style={{ marginTop: 7 }}>{agyStatus}</div>
           </div>
         </div>
       </section>

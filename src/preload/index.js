@@ -25,6 +25,10 @@ contextBridge.exposeInMainWorld('api', {
     return () => ipcRenderer.removeListener('language', handler)
   },
 
+  // Antigravity (agy) live-quota integration toggle
+  agyGetState: () => ipcRenderer.invoke('agy:get-state'),
+  agySetEnabled: (on) => ipcRenderer.invoke('agy:set-enabled', on),
+
   // report window
   reportHourly: (dayStartMs) => ipcRenderer.invoke('report:hourly', dayStartMs),
   reportDaily: (fromMs, toMs) => ipcRenderer.invoke('report:daily', fromMs, toMs),
