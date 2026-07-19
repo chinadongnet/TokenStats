@@ -30,11 +30,17 @@ const TOKENSTATS_DIR = path.join(home, '.tokenstats')
 const HOOK_PATH = path.join(TOKENSTATS_DIR, 'agyStatusHook.cjs')
 export const AGY_MIRROR_PATH = path.join(TOKENSTATS_DIR, 'agy_status.json')
 
-// Forward-slash form so the path is safe inside both the JS hook source and the
-// quoted shell command agy runs (agy passes `command` to a shell).
+// Forward-slash form for the path inside both the JS hook source and the
+// command string.
 const fwd = (p) => p.replace(/\\/g, '/')
 // The exact statusLine command we install; used verbatim to detect "is ours".
-const OUR_COMMAND = `node "${fwd(HOOK_PATH)}"`
+// NOTE: agy executes `command` by splitting on spaces WITHOUT shell/quote
+// handling (verified on Windows), so the path must NOT be quoted — quotes get
+// passed to node literally and break it. This means a hook path containing a
+// space wouldn't work; ~/.tokenstats sits under the home dir, so that only
+// happens if the Windows username has a space (rare). Kept unquoted for the
+// common case.
+const OUR_COMMAND = `node ${fwd(HOOK_PATH)}`
 
 // The hook script agy executes. Reads the piped session JSON from stdin,
 // mirrors it to AGY_MIRROR_PATH, and prints a compact status line back so the
