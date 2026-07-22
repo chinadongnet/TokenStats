@@ -130,23 +130,13 @@ header {
 .qwk { font-size: 9px; text-transform: uppercase; letter-spacing: .04em; color: var(--faint); font-weight: 600; min-width: 16px; }
 .qbar { height: 9px; border-radius: 5px; background: var(--panel2); overflow: hidden; position: relative; }
 .qbar > i { position: absolute; inset: 0 auto 0 0; border-radius: 5px; transition: width .4s ease, background .4s ease; }
-/* stands in for the bar + % of a window that doesn't report a percentage (5h),
-   so its countdown chip still lines up with the others' */
-.qgap { grid-column: span 2; }
 .qnum { font-size: 13px; font-weight: 700; color: var(--text); font-variant-numeric: tabular-nums; white-space: nowrap; }
 .qtime { display: inline-flex; align-items: center; gap: 4px; padding: 2px 8px; border-radius: 20px;
   background: var(--panel2); border: 1px solid var(--line); color: var(--muted);
   font-size: 11px; font-variant-numeric: tabular-nums; white-space: nowrap; }
 .qtime > svg { opacity: .75; }
 .qtime > b { color: var(--text); font-weight: 600; }
-/* value line under each live quota window: tokens · usage $ vs the fee slice
-   covering the same span. Spans the whole .qb grid so it reads as a caption of
-   the bar above it, not a fifth column. */
-.qrate { grid-column: 1 / -1; margin: -3px 0 1px 0; display: flex; align-items: baseline; gap: 4px;
-  font-size: 10.5px; color: var(--faint); font-variant-numeric: tabular-nums; }
-.qrate b { color: var(--muted); font-weight: 600; }
-.qrate .qsep { opacity: .55; }
-.qrate em, .cyval em { font-style: normal; font-weight: 700; margin-left: 2px; }
+.cyval em { font-style: normal; font-weight: 700; margin-left: 2px; }
 em.good { color: #1fa87c; }
 em.ok { color: #c9a227; }
 em.bad { color: #b3564f; }

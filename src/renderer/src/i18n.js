@@ -75,10 +75,7 @@ const en = {
   'app.scopeFee': 'plan {scope} share',
   'app.scopeRateTip':
     '{scope}: ${cost} of usage at pay-as-you-go rates vs ${fee} of the subscription fee for the same span (${usd}/mo ÷ {div}) — {pct}% of what it costs you',
-  'app.rateTip':
-    '{tokens} tokens in this {period} window · ${cost} of usage at pay-as-you-go rates vs ${fee} of the plan fee covering the same span — {pct}% of what it costs you',
-  'app.noFee': '{tokens} tokens · ${cost} of usage in this window (no fee to compare)',
-  'app.vsFee': 'vs',
+  'app.spentIn': '{tokens} tokens · ${cost} spent in this window',
   'app.cycleValue': 'used ${cost}',
   'app.cycleValueTip':
     'This billing cycle: ${cost} of usage at pay-as-you-go rates against the ${usd} fee — {pct}% of what you pay',
@@ -347,10 +344,7 @@ const zh = {
   'app.scopeFee': '订阅费（按{scope}摊）',
   'app.scopeRateTip':
     '{scope}：按量计费约 ${cost}，对应同期订阅费摊销 ${fee}（${usd}/月 ÷ {div}）——相当于所付费用的 {pct}%',
-  'app.rateTip':
-    '本{period}周期内 {tokens} tokens · 按量计费约 ${cost}，对应订阅费摊销 ${fee}——相当于所付费用的 {pct}%',
-  'app.noFee': '本周期 {tokens} tokens · 按量计费约 ${cost}（无订阅费可对比）',
-  'app.vsFee': '对比',
+  'app.spentIn': '本窗口内已用 {tokens} 词元 · 约 ${cost}',
   'app.cycleValue': '已用 ${cost}',
   'app.cycleValueTip': '本计费周期：按量计费约 ${cost}，订阅费 ${usd}——相当于所付费用的 {pct}%',
 

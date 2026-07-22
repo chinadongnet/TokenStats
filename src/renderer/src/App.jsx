@@ -127,38 +127,20 @@ const SCOPE_DIV = { day: 28, week: 4, month: 1 }
 const scopeFee = (monthlyUsd, scope) => (Number(monthlyUsd) || 0) / SCOPE_DIV[scope]
 const scopeLabel = (scope) => t('scope.' + scope)
 
-const MONTH_MS = 30 * 86400000
-// What the plan's monthly fee works out to over one quota window — the fee is
-// billed monthly, the window is 5h/weekly/monthly, so it has to be prorated
-// before "usage worth vs what you pay" means anything. The real length of the
-// current billing month (from `renewal`) is used where known, so a 31-day month
-// isn't priced as 30.
-const proratedFee = (plan, periodMs) => {
-  const monthMs = plan.renewal?.periodMs || MONTH_MS
-  if (!(plan.monthlyUsd > 0) || !(periodMs > 0)) return 0
-  return (plan.monthlyUsd * periodMs) / monthMs
-}
 // Above 100% the window's usage is worth more than its slice of the fee — the
 // plan is paying off. Below, it isn't (yet).
 const valueClass = (pct) => (pct >= 100 ? 'good' : pct >= 50 ? 'ok' : 'bad')
 
 // The plan's LIVE quota — the card's centerpiece. Estimated windows are not
-// shown at all. Each live window gets two headroom bars: usage remaining (流量)
-// and time-to-reset, both on the green→red scale, plus a value line: the tokens
-// and pay-as-you-go cost actually spent INSIDE that same window against the
-// share of the subscription fee covering it. Billing renewal is a slim line
-// below. Returns null if the plan has no live window.
+// shown at all. Each live window is one row: period label, a headroom bar on the
+// green→red scale, its %, and a countdown chip. What the window actually spent
+// (tokens / cost) lives in the bar's tooltip — a line per window was the widest
+// thing in a 380px card and pushed the layout around. Billing renewal is a slim
+// line below. Returns null if the plan has no live window.
 function QuotaBig({ plan, now, color }) {
   const cells = []
   for (const w of plan.windows) {
     if (w.source !== 'live') continue
-    // The 5h window is a burst limiter, not an allowance you budget against:
-    // its share of a monthly fee is fractions of a cent and its headroom % swings
-    // wildly within one session, so both percentages are dropped and it shows
-    // only what was actually spent plus the countdown.
-    const showPct = w.period !== '5h'
-    const fee = proratedFee(plan, w.periodMs)
-    const pct = showPct && fee > 0 ? (w.cost / fee) * 100 : null
     const left = w.end ? Math.max(0, w.end - now) : 0
     // Fraction of the window's length still remaining — drives the clock dial.
     const tFrac = w.end && w.periodMs ? Math.min(1, Math.max(0, left / w.periodMs)) : 0
@@ -168,49 +150,22 @@ function QuotaBig({ plan, now, color }) {
     cells.push(
       <React.Fragment key={w.period}>
         <span className="qwk">{resetLabel(w.period)}</span>
-        {showPct ? (
-          <>
-            <span className="qbar" title={t('app.usedLeft', { used: Math.round(w.usedPercent), left: uPct })}>
-              <i style={{ width: `${Math.max(3, uPct)}%`, background: levelColor(uFrac) }} />
-            </span>
-            <span className="qnum">{uPct}%</span>
-          </>
-        ) : (
-          <span className="qgap" />
-        )}
+        <span
+          className="qbar"
+          title={
+            t('app.usedLeft', { used: Math.round(w.usedPercent), left: uPct }) +
+            (w.tokens > 0 ? ' · ' + t('app.spentIn', { tokens: compact(w.tokens), cost: usd(w.cost) }) : '')
+          }
+        >
+          <i style={{ width: `${Math.max(3, uPct)}%`, background: levelColor(uFrac) }} />
+        </span>
+        <span className="qnum">{uPct}%</span>
         {/* time is a rounded countdown chip, NOT a bar, so it never reads as a
             second usage meter */}
         <span className="qtime" title={w.end ? t('app.nextCycle', { time: atTime(w.end, w.periodMs), dur: dur(left) }) : t('app.noResetTime')}>
           <ClockIcon frac={tFrac} color={color} />
           <b>{next}</b>
         </span>
-        {/* Value line — spans the grid: what this window's usage would have
-            cost pay-as-you-go, against the fee slice covering the same span. */}
-        {w.tokens > 0 && (
-          <span
-            className="qrate"
-            title={
-              pct == null
-                ? t('app.noFee', { tokens: compact(w.tokens), cost: usd(w.cost) })
-                : t('app.rateTip', {
-                    period: resetLabel(w.period),
-                    tokens: compact(w.tokens),
-                    cost: usd(w.cost),
-                    fee: usd(fee),
-                    pct: Math.round(pct),
-                  })
-            }
-          >
-            <b>{compact(w.tokens)}</b>
-            <span className="qsep">·</span>${usd(w.cost)}
-            {pct != null && (
-              <>
-                <span className="qsep">{t('app.vsFee')}</span>${usd(fee)}
-                <em className={valueClass(pct)}>{Math.round(pct)}%</em>
-              </>
-            )}
-          </span>
-        )}
       </React.Fragment>
     )
   }
