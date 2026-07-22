@@ -1,4 +1,5 @@
 import React, { useEffect, useMemo, useState } from 'react'
+import { t, useLang } from './i18n.js'
 
 // The 5 fixed built-in CLIs. LiteLLM providers are NOT listed here — they're
 // dynamic, DB-backed entries (`litellm:<providerId>`) merged in at render time
@@ -24,8 +25,9 @@ const compact = (n) => {
   return String(Math.round(n))
 }
 const usd = (n) => (n || 0).toFixed(2)
-// Mirrors core/subscriptions.js's RESET_PERIODS (renderer can't import from main).
-const RESET_LABEL = { '5h': '5h', weekly: 'wk', monthly: 'mo' }
+// Short reset-window label (5h / wk / mo), localized. Mirrors the period keys in
+// core/subscriptions.js's RESET_PERIODS (renderer can't import from main).
+const resetLabel = (period) => t('reset.' + period)
 // Coarse duration for the reset countdown — minute granularity is plenty, and
 // it keeps the label from jittering on every tick.
 const dur = (ms) => {
@@ -33,9 +35,9 @@ const dur = (ms) => {
   const d = Math.floor(s / 86400)
   const h = Math.floor((s % 86400) / 3600)
   const m = Math.floor((s % 3600) / 60)
-  if (d) return `${d}d ${h}h`
-  if (h) return `${h}h ${m}m`
-  return m ? `${m}m` : '<1m'
+  if (d) return `${d}${t('unit.d')} ${h}${t('unit.h')}`
+  if (h) return `${h}${t('unit.h')} ${m}${t('unit.m')}`
+  return m ? `${m}${t('unit.m')}` : t('unit.lt1m')
 }
 // Wall-clock time the window resets at; weekly windows need the date too.
 const atTime = (ts, periodMs) => {
@@ -47,10 +49,10 @@ const atTime = (ts, periodMs) => {
 const ago = (ts) => {
   if (!ts) return ''
   const s = Math.max(0, Math.round((Date.now() - ts) / 1000))
-  if (s < 60) return s + 's ago'
-  if (s < 3600) return Math.round(s / 60) + 'm ago'
-  if (s < 86400) return Math.round(s / 3600) + 'h ago'
-  return Math.round(s / 86400) + 'd ago'
+  if (s < 60) return t('unit.sAgo', { n: s })
+  if (s < 3600) return t('unit.mAgo', { n: Math.round(s / 60) })
+  if (s < 86400) return t('unit.hAgo', { n: Math.round(s / 3600) })
+  return t('unit.dAgo', { n: Math.round(s / 86400) })
 }
 
 // Trim a model id to something legible in a tight legend.
@@ -75,12 +77,35 @@ function tints(hex, n) {
 }
 
 const WEEK_MS = 7 * 86400000
-const ClockIcon = () => (
-  <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" aria-hidden="true">
-    <circle cx="12" cy="12" r="9" />
-    <path d="M12 7v5l3 2" />
-  </svg>
-)
+// SVG path for a pie wedge from 12 o'clock, sweeping clockwise by `frac` of a
+// full turn. Used to "drain" the clock face as a window counts down.
+function pieSlice(cx, cy, r, frac) {
+  const f = Math.max(0, Math.min(1, frac))
+  if (f <= 0) return ''
+  if (f >= 1) return `M ${cx} ${cy - r} A ${r} ${r} 0 1 1 ${cx - 0.001} ${cy - r} Z`
+  const a = f * 2 * Math.PI
+  const ex = cx + r * Math.sin(a)
+  const ey = cy - r * Math.cos(a)
+  return `M ${cx} ${cy} L ${cx} ${cy - r} A ${r} ${r} 0 ${f > 0.5 ? 1 : 0} 1 ${ex.toFixed(3)} ${ey.toFixed(3)} Z`
+}
+// Clock glyph. With `frac` (0..1) it becomes a dial filled proportionally to the
+// time REMAINING in the window, tinted with the subscription's own color; the
+// wedge shrinks as the countdown runs down. Without `frac` it's the plain clock.
+const ClockIcon = ({ frac = null, color = 'currentColor' }) => {
+  if (frac == null)
+    return (
+      <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" aria-hidden="true">
+        <circle cx="12" cy="12" r="9" />
+        <path d="M12 7v5l3 2" />
+      </svg>
+    )
+  return (
+    <svg width="13" height="13" viewBox="0 0 24 24" aria-hidden="true">
+      <circle cx="12" cy="12" r="9" fill="none" stroke="currentColor" strokeWidth="1.5" opacity="0.35" />
+      <path d={pieSlice(12, 12, 8, frac)} fill={color} />
+    </svg>
+  )
+}
 const BillIcon = () => (
   <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" aria-hidden="true">
     <rect x="3" y="5" width="18" height="14" rx="2" />
@@ -101,25 +126,27 @@ function levelColor(frac) {
 // shown at all. Each live window gets two headroom bars: usage remaining (流量)
 // and time-to-reset, both on the green→red scale. Billing renewal is a slim
 // line below. Returns null if the plan has no live window.
-function QuotaBig({ plan, now }) {
+function QuotaBig({ plan, now, color }) {
   const cells = []
   for (const w of plan.windows) {
     if (w.source !== 'live') continue
     const left = w.end ? Math.max(0, w.end - now) : 0
+    // Fraction of the window's length still remaining — drives the clock dial.
+    const tFrac = w.end && w.periodMs ? Math.min(1, Math.max(0, left / w.periodMs)) : 0
     const uFrac = Math.min(1, Math.max(0, (w.remainingPercent || 0) / 100))
     const uPct = Math.round(uFrac * 100)
     const next = w.end ? (w.periodMs >= WEEK_MS ? atTime(w.end, w.periodMs) : dur(left)) : '—'
     cells.push(
       <React.Fragment key={w.period}>
-        <span className="qwk">{RESET_LABEL[w.period] || w.period}</span>
-        <span className="qbar" title={`${Math.round(w.usedPercent)}% used — ${uPct}% left`}>
+        <span className="qwk">{resetLabel(w.period)}</span>
+        <span className="qbar" title={t('app.usedLeft', { used: Math.round(w.usedPercent), left: uPct })}>
           <i style={{ width: `${Math.max(3, uPct)}%`, background: levelColor(uFrac) }} />
         </span>
         <span className="qnum">{uPct}%</span>
         {/* time is a rounded countdown chip, NOT a bar, so it never reads as a
             second usage meter */}
-        <span className="qtime" title={w.end ? `next cycle ${atTime(w.end, w.periodMs)} (${dur(left)})` : 'no reset time'}>
-          <ClockIcon />
+        <span className="qtime" title={w.end ? t('app.nextCycle', { time: atTime(w.end, w.periodMs), dur: dur(left) }) : t('app.noResetTime')}>
+          <ClockIcon frac={tFrac} color={color} />
           <b>{next}</b>
         </span>
       </React.Fragment>
@@ -131,9 +158,9 @@ function QuotaBig({ plan, now }) {
     <div className="qwrap">
       <div className="qb">{cells}</div>
       {plan.renewal && plan.monthlyUsd > 0 && (
-        <div className="billrow" title={`Renews ${atTime(plan.renewal.end, plan.renewal.periodMs)} · $${usd(plan.monthlyUsd)}/mo`}>
+        <div className="billrow" title={t('app.renewsTip', { time: atTime(plan.renewal.end, plan.renewal.periodMs), usd: usd(plan.monthlyUsd) })}>
           <BillIcon />
-          renews <b>{dur(away)}</b> · ${usd(plan.monthlyUsd)}/mo
+          {t('app.renews')} <b>{dur(away)}</b> · ${usd(plan.monthlyUsd)}{t('app.perMo')}
         </div>
       )}
     </div>
@@ -165,11 +192,13 @@ function ModelBar({ models, color }) {
 }
 
 export default function App() {
+  useLang() // re-render whole popup on language switch
   const [snap, setSnap] = useState(null)
   const [scope, setScope] = useState('today')
   const [shotMenu, setShotMenu] = useState(false)
   const [copied, setCopied] = useState(false)
   const [resets, setResets] = useState([])
+  const [subs, setSubs] = useState([]) // for the monthly subscription total
   const [now, setNow] = useState(() => Date.now())
 
   useEffect(() => {
@@ -178,11 +207,14 @@ export default function App() {
     // refetch on snapshot rather than polling, and the popup stays quiet while
     // hidden.
     const loadResets = () => window.api.subsResets().then(setResets)
+    const loadSubs = () => window.api.subsList().then((r) => setSubs(r || []))
     window.api.getSnapshot().then(setSnap)
     loadResets()
+    loadSubs()
     return window.api.onSnapshot((s) => {
       setSnap(s)
       loadResets()
+      loadSubs()
     })
   }, [])
 
@@ -216,7 +248,10 @@ export default function App() {
     }
   }, [snap?.providers])
 
-  if (!snap) return <div className="loading">Scanning CLI logs…</div>
+  // Total monthly fee of currently-active subscriptions (task: top-right badge).
+  const monthlyTotal = subs.reduce((a, s) => a + (s.active ? Number(s.monthlyUsd) || 0 : 0), 0)
+
+  if (!snap) return <div className="loading">{t('app.scanning')}</div>
 
   const per = scope === 'today' ? snap.todayPerCli : scope === '7d' ? snap.weekPerCli : snap.perCli
   const perModelSrc = scope === 'today' ? snap.todayPerModel : scope === '7d' ? snap.weekPerModel : snap.perModel
@@ -250,36 +285,41 @@ export default function App() {
         </div>
         <div className="hwin">
           <div className="seg">
-            <button className={scope === 'today' ? 'on' : ''} onClick={() => setScope('today')}>Today</button>
-            <button className={scope === '7d' ? 'on' : ''} onClick={() => setScope('7d')}>7d</button>
-            <button className={scope === 'all' ? 'on' : ''} onClick={() => setScope('all')}>All</button>
+            <button className={scope === 'today' ? 'on' : ''} onClick={() => setScope('today')}>{t('common.today')}</button>
+            <button className={scope === '7d' ? 'on' : ''} onClick={() => setScope('7d')}>{t('common.7d')}</button>
+            <button className={scope === 'all' ? 'on' : ''} onClick={() => setScope('all')}>{t('common.all')}</button>
           </div>
-          <button className="ghost" title="Token report" onClick={() => window.api.openReport()}>▤</button>
-          <button className="ghost" title="Settings" onClick={() => window.api.openSettings()}>⚙</button>
+          <button className="ghost" title={t('app.reportTitle')} onClick={() => window.api.openReport()}>▤</button>
+          <button className="ghost" title={t('app.settingsTitle')} onClick={() => window.api.openSettings()}>⚙</button>
           <div className="shot">
-            <button className="ghost" title="Screenshot" onClick={() => setShotMenu((v) => !v)}>⎙</button>
+            <button className="ghost" title={t('app.screenshot')} onClick={() => setShotMenu((v) => !v)}>⎙</button>
             {shotMenu && (
               <div className="shot-menu">
-                <button onClick={() => screenshot('copy')}>Copy to clipboard</button>
-                <button onClick={() => screenshot('save')}>Save as PNG…</button>
+                <button onClick={() => screenshot('copy')}>{t('app.copyClipboard')}</button>
+                <button onClick={() => screenshot('save')}>{t('app.savePng')}</button>
               </div>
             )}
-            {copied && <div className="shot-toast">Copied ✓</div>}
+            {copied && <div className="shot-toast">{t('app.copied')}</div>}
           </div>
-          <button className="ghost" title="Refresh" onClick={() => window.api.getSnapshot().then(setSnap)}>⟳</button>
-          <button className="ghost" title="Hide" onClick={() => window.api.hide()}>—</button>
+          <button className="ghost" title={t('app.refresh')} onClick={() => window.api.getSnapshot().then(setSnap)}>⟳</button>
+          <button className="ghost" title={t('app.hide')} onClick={() => window.api.hide()}>—</button>
         </div>
       </header>
 
       <div className="scroll">
         <div className="sum">
           <b>{compact(totalTok)}</b>
-          <span className="u">tokens</span>
-          <span className="c">${usd(totalCost)} est</span>
+          <span className="u">{t('common.tokens')}</span>
+          <span className="c">${usd(totalCost)} {t('common.est')}</span>
+          {monthlyTotal > 0 && (
+            <span className="mo" title={t('app.subsTip')}>
+              {t('app.subsPerMo')} <b>${usd(monthlyTotal)}</b>{t('app.perMo')}
+            </span>
+          )}
         </div>
 
         <div className="cards">
-          {cliOrder.length === 0 && <div className="empty">No usage in this range yet.</div>}
+          {cliOrder.length === 0 && <div className="empty">{t('app.noUsageRange')}</div>}
           {cliOrder.map((c) => {
             const d = per[c] || { total: 0, cost: 0, count: 0 }
             const meta = CLI[c] || FALLBACK_META(c)
@@ -292,7 +332,7 @@ export default function App() {
                 key={c}
                 style={{ '--ac': meta.color }}
                 onClick={() => window.api.openDataDir(c)}
-                title="Open data folder"
+                title={t('app.openDataFolder')}
               >
                 <div className="ptop">
                   <span className="pdot" />
@@ -301,8 +341,8 @@ export default function App() {
                     {plan && <span className="pplan">{plan.name}</span>}
                   </span>
                   {live && (
-                    <span className="src live" title={`Live quota from ${meta.label}'s own usage report`}>
-                      live
+                    <span className="src live" title={t('app.liveQuotaTip', { label: meta.label })}>
+                      {t('app.live')}
                     </span>
                   )}
                   <span className="ptot">
@@ -310,7 +350,7 @@ export default function App() {
                     <span className="pc">${usd(d.cost)}</span>
                   </span>
                 </div>
-                {live && <QuotaBig plan={plan} now={now} />}
+                {live && <QuotaBig plan={plan} now={now} color={meta.color} />}
                 {ms.length > 0 && <ModelBar models={ms} color={meta.color} />}
               </div>
             )
@@ -325,10 +365,10 @@ export default function App() {
             {(CLI[snap.live.cli] || FALLBACK_META(snap.live.cli)).label} · {snap.live.model} · {ago(snap.live.ts)}
           </span>
         ) : (
-          <span className="muted">No activity yet</span>
+          <span className="muted">{t('app.noActivity')}</span>
         )}
-        <span className="muted small build" title={`built ${__BUILD_TIME__}`}>v{__APP_VERSION__}</span>
-        <button className="ghost" onClick={() => window.api.quit()} title="Quit">⏻</button>
+        <span className="muted small build" title={t('app.built', { time: __BUILD_TIME__ })}>v{__APP_VERSION__}</span>
+        <button className="ghost" onClick={() => window.api.quit()} title={t('app.quit')}>⏻</button>
       </footer>
     </div>
   )

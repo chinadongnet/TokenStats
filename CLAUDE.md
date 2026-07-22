@@ -290,7 +290,10 @@ testable via `npm run test:parsers`.
   `loadLitellmConfig()` (the old single-provider `config.litellm.{baseUrl,apiKey}`
   reader) and `LITELLM_DEFAULT_COLOR` are kept, but **only** for the one-time
   migration and as the Settings UI's new-provider color default — nothing in the live
-  poller path reads `LITELLM_CONFIG` anymore.
+  poller path reads `LITELLM_CONFIG` anymore. `loadLanguage()`/`saveLanguage()` persist
+  the UI language (`'en'`|`'zh'`) in `config.json` so the native tray menu can read it
+  (the renderer keeps its own `localStorage` copy for instant switching — see
+  `renderer/src/i18n.js`).
 - **`migrateLitellm.js`** — `migrateLegacyLitellmConfig(db)`, called once from
   `index.js`'s `init()` right after opening the DB. If a legacy `config.json`
   `litellm` block exists and the DB has zero providers yet, creates one provider row
@@ -350,10 +353,17 @@ identity-based matching (subscription model filters) survives the rename.
   `delete`, `stats`, `resets`) also live here — `subs:stats`/`subs:resets` compute
   live from `store.dedupedRecords()` (see `core/subscriptions.js`), and a
   save/delete pings the report window (`report-updated`) so its Subscriptions tab
-  refreshes. `dynamicCliMeta` (module-level, kept in sync
-  by `refreshLitellmPollers()`) is consulted alongside the static `CLI_META` wherever
-  a lookup needs to resolve a `litellm:<id>` (tray recolor in `updateTray()`,
-  `open-data-dir`'s `shell.openExternal(provider.baseUrl)` fallback for providers).
+  refreshes. `subs:resets` also overlays `agy` live windows (`agyResetWindows()` from
+  `agyQuota.js`) into `liveByCli` alongside Codex/Claude/Cursor. The **language** IPC
+  (`get-language`/`set-language`) persists to `config.json`, rebuilds the (translated)
+  native tray menu — `TRAY_STRINGS`/`tray_t()`, the only main-process strings — and
+  broadcasts `language` to every window; the **`agy:*`** IPC (`get-state`/`set-enabled`)
+  installs/removes the statusLine hook and `broadcastSnapshot()`s so the popup's
+  Antigravity card appears/disappears at once. `ensureAgyHook()` runs on startup to
+  re-assert the hook file if the user left the integration enabled. `dynamicCliMeta`
+  (module-level, kept in sync by `refreshLitellmPollers()`) is consulted alongside the
+  static `CLI_META` wherever a lookup needs to resolve a `litellm:<id>` (tray recolor in
+  `updateTray()`, `open-data-dir`'s `shell.openExternal(provider.baseUrl)` fallback).
 - **`trayIcon.js`** — renders the tray icon at runtime as a raw BGRA bitmap
   (`nativeImage.createFromBitmap`) so no image asset files are needed; recolored by the
   most recently active CLI (built-in or dynamic LiteLLM provider).
@@ -363,11 +373,30 @@ identity-based matching (subscription model filters) survives the rename.
   matches by path+args while `setLoginItemSettings` writes by registry value name, so
   both go through one `loginItemOpts()` — when they disagreed, the checkbox reported a
   state the app had never written and autostart couldn't be turned off.
+- **`agyQuota.js`** — the opt-in **Antigravity (`agy`) live-quota** integration. agy has
+  no local quota file or usable API — the numbers live only in the running CLI's memory
+  (its `/usage` view). But agy, like Claude Code, pipes its live session-state JSON —
+  including a `quota` map of per-model-pool `{remaining_fraction, reset_time,
+  reset_in_seconds}` — to a configured **statusLine command** on every render. So
+  `enableAgyQuota()` writes a tiny hook script (`~/.tokenstats/agyStatusHook.cjs`) and
+  points agy's `settings.json` `statusLine.command` at it; the hook mirrors that JSON to
+  `~/.tokenstats/agy_status.json`. `agyResetWindows()` reads the mirror and returns the
+  **Gemini** pools (driven by the most-consumed one) as a weekly live window in the same
+  shape `codexResetWindows()` uses, fed into `mergeLiveLimits()` under `liveByCli.agy` so
+  the popup shows an **Antigravity** live card. Refreshes for free on `agy` **CLI** use
+  (not the IDE) — no OAuth, no spawning agy, no quota spent. `getAgyQuotaState()` /
+  `disableAgyQuota()` back the **Settings → App** toggle; it never clobbers a statusLine
+  the user set themselves. **Gotcha**: agy runs `statusLine.command` by naive
+  space-splitting with **no shell/quote handling**, so the installed command must be
+  **unquoted** (`node C:/…/agyStatusHook.cjs`) — a quoted path is passed to node
+  literally and never runs (space-containing paths therefore unsupported). Imports only
+  `node:*`, no `electron`.
 - **`src/preload/index.js`** — CommonJS (`require`) contextBridge exposing
   `window.api`: `getSnapshot`, `onSnapshot`, `openDataDir`, `hide`, `quit`,
-  `openSettings`, plus the `litellm*` and `subs*` methods (incl. `subsResets`)
-  mirroring the IPC handlers above. Built to `out/preload/index.cjs`; `index.js` references it by the `.cjs`
-  extension.
+  `openSettings`, the `litellm*` and `subs*` methods (incl. `subsResets`), the
+  **language** methods (`getLanguage`/`setLanguage`/`onLanguage`), and the **agy**
+  quota toggle (`agyGetState`/`agySetEnabled`) — all mirroring the IPC handlers above.
+  Built to `out/preload/index.cjs`; `index.js` references it by the `.cjs` extension.
 
   Main also owns the **SQLite ingest** (throttled to ≤ once / 4s via `scheduleIngest`,
   forced on report open and manual refresh), the **report window** (`openReport` — a
@@ -378,13 +407,25 @@ identity-based matching (subscription model filters) survives the rename.
 ### Renderer — `src/renderer/`
 
 React + Vite, three views selected by URL hash in `main.jsx`:
+- **`i18n.js`** — a dependency-free **English / 简体中文** layer for all three windows
+  (renderer can't import from main). Exports `t(key, params)`, a `useLang()` hook, and
+  `setLang()`. The choice lives in `localStorage` for instant, no-flash switching; the
+  three windows share one origin so a `storage` event syncs them, and `setLang()` also
+  calls `window.api.setLanguage()` so the **native tray menu** follows (main persists it
+  to `config.json` via `paths.js`'s `saveLanguage`, and rebroadcasts `onLanguage`).
+  Currency stays USD in both languages. A top-level `useLang()` in each view re-renders
+  the whole tree on switch, so nested components can call the module-level `t()` directly.
 - **`App.jsx`** — the tray popup. Reads the snapshot via `window.api`, subscribes to live
   updates, renders the hero total, per-CLI bars, top models, recent sessions, live
-  indicator. Header has Report/Settings buttons (`window.api.openReport()`/
-  `openSettings()`). Under the hero sits the **Quota windows** section
+  indicator. The hero row also shows the **active subscriptions' total `$/mo`**
+  (summed from `subsList()`, active only) right-aligned at the top-right. Header has
+  Report/Settings buttons (`window.api.openReport()`/`openSettings()`). Under the hero
+  sits the **Quota windows** section
   (`window.api.subsResets()`): **one line per active plan** — name on the left, that
   plan's clocks inlined on the right, each a `<Ring>` (minimal SVG donut showing the
-  **remaining**-time fraction) + short label + countdown. Quota windows
+  **remaining**-time fraction) + short label + countdown. The reset-time chip's clock
+  (`ClockIcon`/`pieSlice`) is a dial filled proportionally to the time **remaining**,
+  tinted the plan's brand color — it drains as the window counts down. Quota windows
   (`5h`/`wk`/`mo`) use the plan's brand color; the **`bill`** chip (billing renewal,
   from `renewal`, shown only when `monthlyUsd > 0`) uses the report's fee color
   `#6478cf` — it's money, not tokens, and the two clocks are unrelated, so they must

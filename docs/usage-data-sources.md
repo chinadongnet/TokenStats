@@ -17,7 +17,7 @@ Code lives in `src/main/core/parsers/*.js`; the store/watch/poll plumbing is in
 | Claude Code | local files | `~/.claude/projects/**/*.jsonl` per-message `usage`         | ✅ accurate  | ✅ live via `claude -p /usage` |
 | Codex       | local files | `~/.codex/sessions/**/rollout-*.jsonl` `token_count` events | ✅ accurate  | ✅ live from the logs (`rate_limits`) |
 | Gemini      | local files | `~/.gemini/tmp/**/chats/session-*.jsonl`                    | ✅ accurate  | ❌ CLI deprecated for individuals |
-| Antigravity | local files | `~/.gemini/antigravity-cli/conversations/<uuid>.db`         | ✅ accurate  | ⚠️ TUI-only, not wired |
+| Antigravity | local files | `~/.gemini/antigravity-cli/conversations/<uuid>.db`         | ✅ accurate  | ✅ live via statusLine mirror hook (opt-in) |
 | Cursor      | **network** | cursor.com dashboard CSV export (real usage is server-only) | ✅ accurate  | ✅ live via `/api/usage-summary` |
 | LiteLLM     | **network** | your proxy's admin API                                      | ✅ actual $  | n/a |
 
@@ -219,30 +219,50 @@ runs in the background (the IPC handler stays synchronous). Per-model weekly lin
 individuals — migrate to the Antigravity suite`. So the old Gemini CLI is a dead end;
 its successor is Antigravity (below).
 
-### Antigravity (`agy`) — capturable but too fragile to automate ⚠️
+### Antigravity (`agy`) — done, via a statusLine mirror hook ✅
 `agy` **is** a real CLI (`%LOCALAPPDATA%\agy\bin\agy.exe`), the successor to the Gemini
-CLI. Two paths were tried:
+CLI. It has no local quota file and no usable public API — the numbers live only in the
+running CLI's memory, rendered by its interactive `/usage` view. Two dead ends first:
 
 - `agy -p "/usage"` (print mode) does **not** run the built-in — it treats the slash
-  command as an *agent prompt* (given `/status` it went and ran `git status` on a
-  nearby repo). So unlike Claude, print mode can't surface the usage view.
-- Driving the **interactive TUI** over a pty (winpty, not the GUI) *does* work: after a
-  ~30 s sign-in it renders "Models & Quota" — per-model bars like
-  `Gemini 3.5 Flash (High) — 9% remaining · Refreshes in 3m`, 38 models across separate
-  Gemini-Pro / Flash / Claude-GPT pools, in a scrollable alternate-screen buffer.
+  command as an *agent prompt* (given `/status` it went and ran `git status`). So unlike
+  Claude, print mode can't surface the usage view.
+- Driving the **interactive TUI** over a pty needs a fresh ~30 s sign-in plus
+  alternate-screen scraping across dozens of model lines — too fragile to poll.
 
-So the data exists, but automating it for a background tray app is a poor trade: every
-poll would need a fresh ~30 s interactive sign-in, then alternate-screen scraping with
-pagination across 38 model lines, and it breaks on any TUI change. Left unwired; a
-cleaner route would be the local `agy agentapi` server (see `bin/agentapi.bat`) if it
-exposes quota programmatically — a future investigation.
+The clean route is agy's **statusLine hook**. Like Claude Code, agy pipes its live
+session-state JSON to a user-configured command's stdin on every render — including a
+`quota` map of per-model-pool `{remaining_fraction, reset_time, reset_in_seconds}`
+(inspired by [Ranteck/agy-statusline](https://github.com/Ranteck/agy-statusline)).
+`src/main/agyQuota.js` registers (opt-in, from **Settings → App → Track agy quota**) a
+tiny hook as agy's `statusLine.command` that mirrors that JSON to
+`~/.tokenstats/agy_status.json`, then prints a compact status line back so the user still
+gets a useful agy status bar. `agyResetWindows()` reads the mirror and surfaces the
+**Gemini** pools (driven by the most-consumed one) as a weekly live window through
+`mergeLiveLimits()` under `liveByCli.agy`, so the popup shows an **Antigravity**
+live-quota card. It refreshes for free whenever the user runs the `agy` CLI — no OAuth,
+no spawning agy, no quota spent — and never overwrites a statusLine the user set
+themselves (the toggle cleanly removes it).
+
+Gotchas worth recording:
+- agy executes `statusLine.command` by **naive space-splitting with no shell and no quote
+  handling** (verified on Windows), so the installed command must be **unquoted**
+  (`node C:/Users/…/.tokenstats/agyStatusHook.cjs`); a quoted path is passed to node
+  literally and never runs. A hook path containing a space is therefore unsupported.
+- The mirror only refreshes on `agy` **CLI** use — the Antigravity **IDE** doesn't
+  trigger it. And this agy version (1.1.4) exposed only ~7-day (weekly) per-pool windows,
+  no separate 5-hour bucket.
+- There's an alternate, OAuth-based source — `POST daily-cloudcode-pa.googleapis.com/
+  v1internal:retrieveUserQuotaSummary`, which agy's `quota_manager` polls — but it needs
+  the account token and a `v1internal` request shape, so the token-free statusLine mirror
+  is preferred.
 
 ## Verdict
 
-**Codex**, **Claude**, and **Cursor** now drive live overlays on their plans' Quota
-windows — Codex from the `rate_limits` in its local logs (real-time, no network),
-Claude by shelling out to `claude -p /usage`, and Cursor from `/api/usage-summary`
-(both throttled ~15 min). **Gemini** is deprecated, and **Antigravity** exposes its
-quota only through a fragile interactive TUI, so both stay on the manual estimate
-(badged **manual**). Any future clean source (e.g. `agy agentapi`) plugs into
+**Codex**, **Claude**, **Cursor**, and **Antigravity** now drive live overlays on their
+plans' Quota windows — Codex from the `rate_limits` in its local logs (real-time, no
+network), Claude by shelling out to `claude -p /usage`, Cursor from `/api/usage-summary`
+(both throttled ~15 min), and Antigravity via the opt-in statusLine mirror hook
+(`src/main/agyQuota.js`, refreshed on `agy` CLI use). **Gemini** is deprecated and stays
+on the manual estimate (badged **manual**). Any future clean source plugs into
 `mergeLiveLimits()` as another `liveByCli` entry — the UI already handles it.

@@ -4,7 +4,7 @@ import fs from 'node:fs'
 import { fileURLToPath } from 'node:url'
 import { Store } from './core/store.js'
 import { UsageDb } from './core/db.js'
-import { CLI_META, ensureConfigFile, CONFIG_FILE } from './core/paths.js'
+import { CLI_META, ensureConfigFile, CONFIG_FILE, loadLanguage, saveLanguage } from './core/paths.js'
 import { createLitellmPoller, listModels } from './core/parsers/litellm.js'
 import { codexResetWindows } from './core/parsers/codex.js'
 import { cursorResetWindows } from './core/parsers/cursor.js'
@@ -12,6 +12,7 @@ import { claudeResetWindows, primeClaudeLimits } from './core/claudeLimits.js'
 import { computeAllSubscriptionStats, computePlanBreakdown, computePlanTimeline, computeResetWindows, mergeLiveLimits } from './core/subscriptions.js'
 import { migrateLegacyLitellmConfig } from './core/migrateLitellm.js'
 import { isAutoLaunch, setAutoLaunch, migrateLegacyRunKeys } from './autoLaunch.js'
+import { agyResetWindows, getAgyQuotaState, enableAgyQuota, disableAgyQuota, ensureAgyHook, AGY_MIRROR_PATH } from './agyQuota.js'
 import { makeTrayIcon } from './trayIcon.js'
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url))
@@ -34,6 +35,39 @@ let ingestTimer = null
 // in sync by refreshLitellmPollers() — used wherever a static CLI_META lookup
 // alone wouldn't know about a dynamic provider (tray recolor, open-data-dir).
 let dynamicCliMeta = {}
+// UI language for the native tray menu/tooltip. The renderer owns its own copy
+// (localStorage); this mirror is updated by the 'set-language' IPC and read when
+// the tray context menu is (re)built on each right-click.
+let lang = loadLanguage()
+// Tray-only strings — the renderer has its own full dictionary (src/renderer/
+// src/i18n.js); this covers just the native menu/tooltip the main process draws.
+const TRAY_STRINGS = {
+  en: {
+    open: 'Open TokenStats',
+    report: 'Token report…',
+    settings: 'Settings…',
+    refresh: 'Refresh now',
+    editSources: 'Edit data sources… (other devices)',
+    startAtLogin: 'Start at login',
+    quit: 'Quit',
+    todayTokens: 'today {n} tokens',
+  },
+  zh: {
+    open: '打开 TokenStats',
+    report: '用量报表…',
+    settings: '设置…',
+    refresh: '立即刷新',
+    editSources: '编辑数据源…（其他设备）',
+    startAtLogin: '开机启动',
+    quit: '退出',
+    todayTokens: '今日 {n} tokens',
+  },
+}
+const tray_t = (key, params) => {
+  let s = (TRAY_STRINGS[lang] || TRAY_STRINGS.en)[key] || TRAY_STRINGS.en[key] || key
+  if (params) for (const k in params) s = s.split('{' + k + '}').join(String(params[k]))
+  return s
+}
 // True while the popup's screenshot save dialog is open — the dialog steals
 // focus, and without this the popup's hide-on-blur would close it mid-export.
 let popupExporting = false
@@ -54,6 +88,21 @@ async function init() {
   app.setAppUserModelId('com.tokenstats.app')
   migrateLegacyRunKeys() // one-time: drop the pre-rename com.tokenstatus.app Run value
   ensureConfigFile() // create ~/.tokenstats/config.json template on first run
+
+  // UI language: renderer owns the instant switch (localStorage); this persists
+  // it for the tray menu and rebroadcasts to every window so all three stay in
+  // sync even if a cross-window storage event is missed. Registered BEFORE the
+  // window loads: a renderer with no stored choice invokes 'get-language'
+  // immediately, and anything registered after createWindow() can lose that race.
+  ipcMain.handle('get-language', () => lang)
+  ipcMain.handle('set-language', (_e, l) => {
+    lang = saveLanguage(l)
+    for (const w of BrowserWindow.getAllWindows()) w.webContents.send('language', lang)
+    // The right-click menu is rebuilt on demand, but the tooltip string is not —
+    // without this it keeps the old language until the next store snapshot.
+    if (lastSnapshot) updateTray(lastSnapshot)
+    return lang
+  })
 
   createWindow()
   createTray()
@@ -98,6 +147,16 @@ async function init() {
   ipcMain.on('quit-app', () => { app.isQuitting = true; app.quit() })
   ipcMain.on('open-report', () => openReport())
   ipcMain.on('open-settings', () => openSettings())
+
+  // Antigravity (agy) live-quota integration — installs/removes a statusLine
+  // hook in agy's own settings (see agyQuota.js). Broadcasting after a change
+  // lets the popup pick up (or drop) the live Antigravity card right away.
+  ipcMain.handle('agy:get-state', () => getAgyQuotaState())
+  ipcMain.handle('agy:set-enabled', (_e, on) => {
+    const res = on ? enableAgyQuota() : disableAgyQuota()
+    broadcastSnapshot()
+    return res
+  })
 
   // Report data queries (served from the SQLite hourly table).
   ipcMain.handle('report:hourly', (_e, dayStartMs) => db?.hourly(dayStartMs) ?? [])
@@ -173,7 +232,7 @@ async function init() {
     if (!db || !store) return []
     const now = Date.now()
     const entries = computeResetWindows(db.listSubscriptions(), store.dedupedRecords(), now)
-    const liveByCli = { codex: codexResetWindows(), claude: claudeResetWindows(), cursor: cursorResetWindows() }
+    const liveByCli = { codex: codexResetWindows(), claude: claudeResetWindows(), cursor: cursorResetWindows(), agy: agyResetWindows() }
     const labels = Object.fromEntries(Object.entries(CLI_META).map(([k, v]) => [k, v.label]))
     return mergeLiveLimits(entries, liveByCli, now, labels)
   })
@@ -195,6 +254,8 @@ async function init() {
     if (store?.reapplyPoller('litellm:' + payload.providerId)) broadcastSnapshot()
   })
 
+  ensureAgyHook() // re-assert the agy statusLine hook file if the user enabled it
+  watchAgyMirror() // pick up quota-only refreshes (agy rewrites the mirror without any new usage)
   refreshLitellmPollers() // populate store.pollers before the initial scan/poll
   await store.start()
   ingestNow() // first full ingest after the initial scan
@@ -245,6 +306,20 @@ function refreshLitellmPollers() {
       })
     )
   )
+}
+
+// agy rewrites its quota mirror on every statusLine render — which happens on
+// startup and while the user browses `/usage`, i.e. without producing any new
+// token usage for the store to watch. Nothing else would ever fire, so the
+// popup's Antigravity card would sit stale until unrelated usage landed. Poll
+// the mirror's mtime and re-send the current snapshot, which is what makes the
+// popup refetch subs:resets (see App.jsx). Cheap: one stat every 20s, and no
+// snapshot recompute.
+function watchAgyMirror() {
+  fs.watchFile(AGY_MIRROR_PATH, { interval: 20000 }, (cur, prev) => {
+    if (cur.mtimeMs === prev.mtimeMs) return
+    if (win && !win.isDestroyed() && lastSnapshot) win.webContents.send('snapshot', lastSnapshot)
+  })
 }
 
 // Pushes a fresh snapshot to the popup + tray + ingest, outside the normal
@@ -426,16 +501,16 @@ function createTray() {
   tray.on('click', () => toggleWindow())
   tray.on('right-click', () => {
     const menu = Menu.buildFromTemplate([
-      { label: 'Open TokenStats', click: () => showWindow() },
-      { label: 'Token report…', click: () => openReport() },
-      { label: 'Settings…', click: () => openSettings() },
+      { label: tray_t('open'), click: () => showWindow() },
+      { label: tray_t('report'), click: () => openReport() },
+      { label: tray_t('settings'), click: () => openSettings() },
       { type: 'separator' },
-      { label: 'Refresh now', click: async () => { await store.scanAll(); await store.refreshNetworkParsers(); await Promise.all(store.pollers.map((p) => store.forcePoll(p.cli))); broadcastSnapshot() } },
-      { label: 'Edit data sources… (other devices)', click: () => { ensureConfigFile(); shell.openPath(CONFIG_FILE) } },
+      { label: tray_t('refresh'), click: async () => { await store.scanAll(); await store.refreshNetworkParsers(); await Promise.all(store.pollers.map((p) => store.forcePoll(p.cli))); broadcastSnapshot() } },
+      { label: tray_t('editSources'), click: () => { ensureConfigFile(); shell.openPath(CONFIG_FILE) } },
       { type: 'separator' },
-      { label: 'Start at login', type: 'checkbox', checked: isAutoLaunch(), click: (item) => setAutoLaunch(item.checked) },
+      { label: tray_t('startAtLogin'), type: 'checkbox', checked: isAutoLaunch(), click: (item) => setAutoLaunch(item.checked) },
       { type: 'separator' },
-      { label: 'Quit', click: () => { app.isQuitting = true; app.quit() } },
+      { label: tray_t('quit'), click: () => { app.isQuitting = true; app.quit() } },
     ])
     tray.popUpContextMenu(menu)
   })
@@ -446,7 +521,7 @@ function updateTray(snap) {
   const today = snap?.totals?.today?.total || 0
   // Build time, not just version: dev iterates without bumping, so the version
   // alone can't tell a fresh install from a stale one.
-  tray.setToolTip(`TokenStats v${__APP_VERSION__} (${__BUILD_TIME__}) — today ${compact(today)} tokens`)
+  tray.setToolTip(`TokenStats v${__APP_VERSION__} (${__BUILD_TIME__}) — ${tray_t('todayTokens', { n: compact(today) })}`)
   // Recolour by the most recently active CLI (built-in or a dynamic LiteLLM provider).
   const cli = snap?.live?.cli
   const meta = cli && (CLI_META[cli] || dynamicCliMeta[cli])

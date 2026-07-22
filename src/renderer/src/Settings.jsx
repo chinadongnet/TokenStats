@@ -1,4 +1,5 @@
 import React, { useEffect, useState } from 'react'
+import { t, useLang, LANGS } from './i18n.js'
 
 // Mirrors paths.js's LITELLM_DEFAULT_COLOR / parsers/litellm.js's DEFAULT_SYNC_MINUTES —
 // the renderer can't import from the main process, so these literals stay in sync by hand.
@@ -46,11 +47,11 @@ const todayIso = () => {
 // start is decided by usage, nothing to configure), weekly/monthly are pinned to
 // a user-set date — weekly with a time of day, monthly by day-of-month.
 const RESET_OPTIONS = [
-  { value: '5h', label: '5 hours', hint: 'rolling' },
-  { value: 'weekly', label: 'Weekly', hint: 'fixed time', anchor: 'datetime-local', anchorLabel: 'Weekly resets at' },
-  { value: 'monthly', label: 'Monthly', hint: 'fixed day', anchor: 'date', anchorLabel: 'Monthly resets on' },
+  { value: '5h', labelKey: 'set.reset5h', hintKey: 'set.hintRolling' },
+  { value: 'weekly', labelKey: 'set.resetWeekly', hintKey: 'set.hintFixedTime', anchor: 'datetime-local', anchorLabelKey: 'set.weeklyResetsAt' },
+  { value: 'monthly', labelKey: 'set.resetMonthly', hintKey: 'set.hintFixedDay', anchor: 'date', anchorLabelKey: 'set.monthlyResetsOn' },
 ]
-const resetLabel = (v) => RESET_OPTIONS.find((o) => o.value === v)?.label || v
+const resetLabel = (v) => { const o = RESET_OPTIONS.find((o) => o.value === v); return o ? t(o.labelKey) : v }
 // A `datetime-local` input needs 'YYYY-MM-DDTHH:mm'; a bare start date has no time.
 const defaultAnchor = (period, startDate) =>
   period === 'weekly' ? `${startDate}T00:00` : startDate
@@ -77,6 +78,7 @@ const compact = (n) => {
 const usd = (n) => (Number(n) || 0).toFixed(2)
 
 export default function Settings() {
+  const { lang, setLang } = useLang() // re-render on language switch
   const [providers, setProviders] = useState(null) // null = loading
   const [editingId, setEditingId] = useState(null) // null | 'new' | providerId
   const [draft, setDraft] = useState(emptyDraft())
@@ -85,6 +87,10 @@ export default function Settings() {
   const [testResult, setTestResult] = useState(null) // {ok, count} | {ok:false, error}
   const [expanded, setExpanded] = useState(null) // providerId whose model list is shown
   const [modelsByProvider, setModelsByProvider] = useState({}) // id -> {loading, error, rows}
+
+  // Antigravity (agy) live-quota integration state
+  const [agy, setAgy] = useState(null) // null = loading; else getAgyQuotaState()
+  const [agyBusy, setAgyBusy] = useState(false)
 
   // subscription plans
   const [subs, setSubs] = useState(null) // null = loading
@@ -105,6 +111,18 @@ export default function Settings() {
     setSubStats(Object.fromEntries((stats || []).map((s) => [s.id, s])))
   }
   useEffect(() => { loadSubs() }, [])
+
+  useEffect(() => { window.api.agyGetState().then(setAgy) }, [])
+  async function toggleAgy(on) {
+    setAgyBusy(true)
+    try {
+      const res = await window.api.agySetEnabled(on)
+      // enable/disable returns the fresh state (minus the leading ok flag)
+      setAgy(res && res.agyFound !== undefined ? res : await window.api.agyGetState())
+    } finally {
+      setAgyBusy(false)
+    }
+  }
 
   function startAdd() {
     setDraft(emptyDraft())
@@ -146,7 +164,7 @@ export default function Settings() {
   }
 
   async function deleteProvider(p) {
-    if (!window.confirm(`Delete provider "${p.name}"? TokenStats will stop tracking its usage.`)) return
+    if (!window.confirm(t('set.deleteProviderConfirm', { name: p.name }))) return
     await window.api.litellmDeleteProvider(p.id)
     if (editingId === p.id) setEditingId(null)
     if (expanded === p.id) setExpanded(null)
@@ -291,7 +309,7 @@ export default function Settings() {
   }
 
   async function deleteSub(s) {
-    if (!window.confirm(`Delete token plan "${s.name}"? Its billing history stats will disappear.`)) return
+    if (!window.confirm(t('set.deletePlanConfirm', { name: s.name }))) return
     await window.api.subsDelete(s.id)
     if (subEditing === s.id) setSubEditing(null)
     await loadSubs()
@@ -308,21 +326,70 @@ export default function Settings() {
     if (fixed) return fixed.label
     if (cli.startsWith('litellm:')) {
       const p = (providers || []).find((p) => 'litellm:' + p.id === cli)
-      return p ? p.name : '(deleted provider)'
+      return p ? p.name : t('common.deletedProvider')
     }
     return cli
   }
 
+  // Human-readable status line under the agy toggle.
+  const agyStatus = (() => {
+    if (!agy) return ''
+    if (!agy.agyFound) return t('set.agyNotFound')
+    if (agy.foreign && !agy.enabled) return t('set.agyForeign')
+    if (!agy.enabled) return t('set.agyQuotaHint')
+    if (agy.mirrorAgeMs == null) return t('set.agyEnabledWaiting')
+    const mins = Math.max(0, Math.round(agy.mirrorAgeMs / 60000))
+    return t(mins > 60 ? 'set.agyEnabledStale' : 'set.agyEnabledFresh', { mins })
+  })()
+  const agyDisabled = agyBusy || !agy || !agy.agyFound || (agy.foreign && !agy.enabled)
+
   return (
     <div className="report">
       <header className="rep-head">
-        <div className="rep-title"><span className="logo" /> Settings</div>
+        <div className="rep-title"><span className="logo" /> {t('set.title')}</div>
       </header>
+
+      {/* ---------------- App / language ---------------- */}
+      <div className="group-head">
+        <h2>{t('set.appSection')}</h2>
+      </div>
+      <section className="card">
+        <div className="field-row" style={{ alignItems: 'center' }}>
+          <div className="field shrink" style={{ width: 200 }}>
+            <label>{t('set.language')}</label>
+            <select className="sel" value={lang} onChange={(e) => setLang(e.target.value)}>
+              {LANGS.map((l) => <option key={l.value} value={l.value}>{l.label}</option>)}
+            </select>
+          </div>
+          <div className="field grow">
+            <label>&nbsp;</label>
+            <div className="muted small" style={{ marginTop: 7 }}>{t('set.languageHint')}</div>
+          </div>
+        </div>
+        <div className="field-row" style={{ alignItems: 'flex-start', marginTop: 4 }}>
+          <div className="field shrink" style={{ width: 200 }}>
+            <label>{t('set.agyQuota')}</label>
+            <label className="check" style={{ marginTop: 7 }}>
+              <input
+                type="checkbox"
+                checked={!!(agy && agy.enabled)}
+                disabled={agyDisabled}
+                onChange={(e) => toggleAgy(e.target.checked)}
+              />
+              {t('set.agyQuotaOn')}
+            </label>
+          </div>
+          <div className="field grow">
+            <label>&nbsp;</label>
+            <div className="muted small" style={{ marginTop: 7 }}>{agyStatus}</div>
+          </div>
+        </div>
+      </section>
 
       {/* ---------------- Subscription plans ---------------- */}
       <div className="group-head">
-        <h2>Token plans</h2>
-        <button className="btn primary" onClick={startAddSub} disabled={subEditing === 'new'}>+ Add plan</button>
+        <h2>{t('set.tokenPlans')}</h2>
+        <button className="btn primary" onClick={startAddSub} disabled={subEditing === 'new'}>{t('set.addPlan')}</button>
       </div>
 
       {subEditing === 'new' && (
@@ -334,12 +401,9 @@ export default function Settings() {
         </section>
       )}
 
-      {subs === null && <div className="empty">Loading…</div>}
+      {subs === null && <div className="empty">{t('common.loading')}</div>}
       {subs !== null && subs.length === 0 && subEditing !== 'new' && (
-        <div className="empty">
-          No token plans yet. Add your monthly plans (Claude, ChatGPT, Google AI, Cursor, a LiteLLM token
-          plan…) to compare what you pay with what your usage is actually worth.
-        </div>
+        <div className="empty">{t('set.noPlans')}</div>
       )}
 
       {(subs || []).map((s) => (
@@ -354,30 +418,30 @@ export default function Settings() {
               <div className="card-head">
                 <div className="provider-title">
                   {s.name}
-                  <span className="muted small">${usd(s.monthlyUsd)}/mo</span>
-                  {!s.active && <span className="muted small">(ended {s.endDate || '—'})</span>}
+                  <span className="muted small">${usd(s.monthlyUsd)}{t('set.perMo')}</span>
+                  {!s.active && <span className="muted small">{t('set.ended', { date: s.endDate || '—' })}</span>}
                 </div>
                 <div className="rep-actions">
-                  <button className="btn" onClick={() => toggleSubActive(s)}>{s.active ? 'Deactivate' : 'Reactivate'}</button>
-                  <button className="btn" onClick={() => startEditSub(s)}>Edit</button>
-                  <button className="btn danger" onClick={() => deleteSub(s)}>Delete</button>
+                  <button className="btn" onClick={() => toggleSubActive(s)}>{s.active ? t('set.deactivate') : t('set.reactivate')}</button>
+                  <button className="btn" onClick={() => startEditSub(s)}>{t('common.edit')}</button>
+                  <button className="btn danger" onClick={() => deleteSub(s)}>{t('common.delete')}</button>
                 </div>
               </div>
               <div className="provider-meta">
-                since {s.startDate}
+                {t('set.since', { date: s.startDate })}
                 {' · '}
                 {(s.bindings || []).length === 0
-                  ? 'no sources bound'
+                  ? t('set.noSources')
                   : (s.bindings || []).map((b) => sourceLabel(b.cli) + (b.keyAlias ? ` (${b.keyAlias})` : '')).join(', ')}
                 {s.active && (s.resetPeriods || []).length > 0 && (
-                  <>{' · '}quota resets {s.resetPeriods.map(resetLabel).join(' + ').toLowerCase()}</>
+                  <>{' · '}{t('set.quotaResets', { list: s.resetPeriods.map(resetLabel).join(' + ') })}</>
                 )}
               </div>
               {subStats[s.id] && (
                 <div className="provider-meta">
-                  billed {subStats[s.id].monthsBilled} month{subStats[s.id].monthsBilled === 1 ? '' : 's'}
-                  {' · '}paid ${usd(subStats[s.id].totalPaid)}
-                  {' · '}usage worth ${usd(subStats[s.id].totalCost)}
+                  {t('set.billed', { n: subStats[s.id].monthsBilled, unit: subStats[s.id].monthsBilled === 1 ? t('common.month') : t('common.months') })}
+                  {' · '}{t('set.paid', { usd: usd(subStats[s.id].totalPaid) })}
+                  {' · '}{t('set.usageWorth', { usd: usd(subStats[s.id].totalCost) })}
                   {subStats[s.id].totalPaid > 0 && (
                     <> ({Math.round((100 * subStats[s.id].totalCost) / subStats[s.id].totalPaid)}%)</>
                   )}
@@ -390,8 +454,8 @@ export default function Settings() {
 
       {/* ---------------- LiteLLM providers ---------------- */}
       <div className="group-head">
-        <h2>LiteLLM providers</h2>
-        <button className="btn primary" onClick={startAdd} disabled={editingId === 'new'}>+ Add provider</button>
+        <h2>{t('set.litellmProviders')}</h2>
+        <button className="btn primary" onClick={startAdd} disabled={editingId === 'new'}>{t('set.addProvider')}</button>
       </div>
 
       {editingId === 'new' && (
@@ -403,9 +467,9 @@ export default function Settings() {
         </section>
       )}
 
-      {providers === null && <div className="empty">Loading…</div>}
+      {providers === null && <div className="empty">{t('common.loading')}</div>}
       {providers !== null && providers.length === 0 && editingId !== 'new' && (
-        <div className="empty">No LiteLLM providers configured yet. Click "+ Add provider" to track a proxy's usage.</div>
+        <div className="empty">{t('set.noProviders')}</div>
       )}
 
       {(providers || []).map((p) => (
@@ -421,16 +485,16 @@ export default function Settings() {
                 <div className="provider-title">
                   <span className="dot" style={{ background: p.color }} />
                   {p.name}
-                  {!p.enabled && <span className="muted small"> (disabled)</span>}
+                  {!p.enabled && <span className="muted small"> {t('set.disabled')}</span>}
                 </div>
                 <div className="rep-actions">
-                  <button className="btn" onClick={() => toggleExpanded(p)}>{expanded === p.id ? 'Hide models' : 'Models'}</button>
-                  <button className="btn" onClick={() => toggleEnabled(p)}>{p.enabled ? 'Disable' : 'Enable'}</button>
-                  <button className="btn" onClick={() => startEdit(p)}>Edit</button>
-                  <button className="btn danger" onClick={() => deleteProvider(p)}>Delete</button>
+                  <button className="btn" onClick={() => toggleExpanded(p)}>{expanded === p.id ? t('set.hideModels') : t('set.modelsBtn')}</button>
+                  <button className="btn" onClick={() => toggleEnabled(p)}>{p.enabled ? t('set.disable') : t('set.enable')}</button>
+                  <button className="btn" onClick={() => startEdit(p)}>{t('common.edit')}</button>
+                  <button className="btn danger" onClick={() => deleteProvider(p)}>{t('common.delete')}</button>
                 </div>
               </div>
-              <div className="provider-meta">{p.baseUrl} · syncs every {p.syncMinutes} min</div>
+              <div className="provider-meta">{t('set.syncsEvery', { url: p.baseUrl, min: p.syncMinutes })}</div>
 
               {expanded === p.id && (
                 <ModelList
@@ -447,7 +511,7 @@ export default function Settings() {
       ))}
 
       <footer className="rep-foot">
-        TokenStats v{__APP_VERSION__} · provider keys stored locally in ~/.tokenstats/usage.sqlite
+        {t('set.footer', { ver: __APP_VERSION__ })}
       </footer>
     </div>
   )
@@ -527,40 +591,40 @@ function SubForm({ draft, setDraft, providers, onSave, onCancel, saving }) {
     <div>
       <div className="field-row">
         <div className="field grow">
-          <label>Name</label>
-          <input type="text" value={draft.name} onChange={set('name')} placeholder="e.g. Claude Max" />
+          <label>{t('set.name')}</label>
+          <input type="text" value={draft.name} onChange={set('name')} placeholder={t('set.namePlaceholderPlan')} />
         </div>
         <div className="field shrink" style={{ width: 150 }}>
-          <label>Preset</label>
+          <label>{t('set.preset')}</label>
           <select className="sel" defaultValue="" onChange={applyPreset}>
-            <option value="" disabled>Pick…</option>
+            <option value="" disabled>{t('set.pick')}</option>
             {SUB_PRESETS.map((p) => <option key={p.key} value={p.key}>{p.name}</option>)}
           </select>
         </div>
         <div className="field shrink">
-          <label>USD / month</label>
+          <label>{t('set.usdMonth')}</label>
           <input type="number" min="0" step="0.01" value={draft.monthlyUsd} onChange={set('monthlyUsd')} placeholder="20" />
         </div>
       </div>
       <div className="field-row">
         <div className="field shrink" style={{ width: 150 }}>
-          <label>Start date</label>
+          <label>{t('set.startDate')}</label>
           <input type="date" value={draft.startDate} onChange={set('startDate')} />
         </div>
         <div className="field shrink" style={{ width: 150 }}>
-          <label>Status</label>
+          <label>{t('set.status')}</label>
           <label className="check" style={{ marginTop: 7 }}>
             <input
               type="checkbox"
               checked={draft.active}
               onChange={(e) => setDraft((d) => ({ ...d, active: e.target.checked }))}
             />
-            active (bills monthly)
+            {t('set.activeBills')}
           </label>
         </div>
         {!draft.active && (
           <div className="field shrink" style={{ width: 150 }}>
-            <label>End date</label>
+            <label>{t('set.endDate')}</label>
             <input type="date" value={draft.endDate || todayIso()} onChange={set('endDate')} />
           </div>
         )}
@@ -568,7 +632,7 @@ function SubForm({ draft, setDraft, providers, onSave, onCancel, saving }) {
       {draft.active && (
         <>
           <div className="field" style={{ marginTop: 4 }}>
-            <label>Token quota resets (pick any that apply)</label>
+            <label>{t('set.quotaPick')}</label>
           </div>
           <div className="field-row" style={{ alignItems: 'center', gap: 14 }}>
             {RESET_OPTIONS.map((o) => (
@@ -578,15 +642,15 @@ function SubForm({ draft, setDraft, providers, onSave, onCancel, saving }) {
                   checked={draft.resetPeriods.includes(o.value)}
                   onChange={() => toggleReset(o.value)}
                 />
-                {o.label}
-                <span className="muted small">{o.hint}</span>
+                {t(o.labelKey)}
+                <span className="muted small">{t(o.hintKey)}</span>
               </label>
             ))}
           </div>
           {RESET_OPTIONS.filter((o) => o.anchor && draft.resetPeriods.includes(o.value)).map((o) => (
             <div className="field-row" key={o.value}>
               <div className="field shrink" style={{ width: o.value === 'weekly' ? 210 : 160 }}>
-                <label>{o.anchorLabel}</label>
+                <label>{t(o.anchorLabelKey)}</label>
                 <input
                   type={o.anchor}
                   value={draft.resetAnchors[o.value] || defaultAnchor(o.value, draft.startDate)}
@@ -596,25 +660,21 @@ function SubForm({ draft, setDraft, providers, onSave, onCancel, saving }) {
               <div className="field grow">
                 <label>&nbsp;</label>
                 <div className="muted small" style={{ marginTop: 7 }}>
-                  {o.value === 'weekly'
-                    ? 'Repeats every 7 days from this moment — set it to when your provider actually resets.'
-                    : 'Only the day-of-month matters; clamped in short months (a 31st anchor resets Feb 28).'}
+                  {o.value === 'weekly' ? t('set.weeklyHint') : t('set.monthlyHint')}
                 </div>
               </div>
             </div>
           ))}
           {draft.resetPeriods.length > 0 && (
             <div className="muted small" style={{ marginBottom: 8 }}>
-              These are <b>token quota</b> resets — separate from the billing date above, and each is
-              counted on its own clock. 5h is <b>rolling</b>: it opens on your first request after the
-              previous one expires (Claude's rate limit), so there's nothing to set.
+              {t('set.quotaNote')}
             </div>
           )}
         </>
       )}
 
       <div className="field">
-        <label>Counts usage from</label>
+        <label>{t('set.countsFrom')}</label>
       </div>
       {sources.map((src) => {
         const b = bindingFor(src.id)
@@ -625,30 +685,30 @@ function SubForm({ draft, setDraft, providers, onSave, onCancel, saving }) {
             <label className="check">
               <input type="checkbox" checked={!!b} onChange={() => toggleSource(src.id)} />
               {src.label}
-              {src.provider && <span className="muted small">LiteLLM</span>}
+              {src.provider && <span className="muted small">{t('set.litellmTag')}</span>}
             </label>
             {b && src.provider && (
               <div className="src-litellm">
                 <div className="field-row" style={{ marginBottom: 6 }}>
                   <div className="field grow">
-                    <label>Key alias filter (single token key; empty = all keys)</label>
+                    <label>{t('set.keyAliasLabel')}</label>
                     <input
                       type="text"
                       value={b.keyAlias || ''}
                       onChange={(e) => setBindingField(src.id, 'keyAlias', e.target.value)}
-                      placeholder="e.g. mimo-plan"
+                      placeholder={t('set.keyAliasPlaceholder')}
                     />
                   </div>
                 </div>
                 <div className="field-row" style={{ alignItems: 'center', marginBottom: 6 }}>
                   <button className="btn" onClick={() => loadModelsFor(src)} disabled={ms?.loading}>
-                    {ms?.loading ? 'Loading models…' : ms?.rows?.length ? 'Reload models' : 'Load models to filter'}
+                    {ms?.loading ? t('set.loadingModels') : ms?.rows?.length ? t('set.reloadModels') : t('set.loadModelsFilter')}
                   </button>
                   <span className="muted small">
-                    {selected.length ? `${selected.length} model${selected.length === 1 ? '' : 's'} selected` : 'all models counted'}
+                    {selected.length ? t('set.modelsSelected', { n: selected.length, unit: selected.length === 1 ? t('common.model') : t('common.models') }) : t('set.allModelsCounted')}
                   </span>
                 </div>
-                {ms?.error && <div className="reqclip small">Failed: {ms.error}</div>}
+                {ms?.error && <div className="reqclip small">{t('set.failed', { error: ms.error })}</div>}
                 {ms?.rows?.length > 0 && (
                   <div className="model-picker">
                     {ms.rows.map((model) => (
@@ -661,7 +721,7 @@ function SubForm({ draft, setDraft, providers, onSave, onCancel, saving }) {
                 )}
                 {/* models picked earlier but list not loaded this session */}
                 {!ms?.rows?.length && selected.length > 0 && (
-                  <div className="muted small">filtered to: {selected.join(', ')}</div>
+                  <div className="muted small">{t('set.filteredTo', { list: selected.join(', ') })}</div>
                 )}
               </div>
             )}
@@ -670,8 +730,8 @@ function SubForm({ draft, setDraft, providers, onSave, onCancel, saving }) {
       })}
 
       <div className="field-row" style={{ marginTop: 12 }}>
-        <button className="btn primary" onClick={onSave} disabled={saving || !canSave}>{saving ? 'Saving…' : 'Save'}</button>
-        <button className="btn" onClick={onCancel} disabled={saving}>Cancel</button>
+        <button className="btn primary" onClick={onSave} disabled={saving || !canSave}>{saving ? t('common.saving') : t('common.save')}</button>
+        <button className="btn" onClick={onCancel} disabled={saving}>{t('common.cancel')}</button>
       </div>
     </div>
   )
@@ -685,78 +745,78 @@ function ProviderForm({ draft, setDraft, onSave, onCancel, saving, onTest, testi
     <div>
       <div className="field-row">
         <div className="field grow">
-          <label>Name</label>
-          <input type="text" value={draft.name} onChange={set('name')} placeholder="e.g. Work LiteLLM" />
+          <label>{t('set.name')}</label>
+          <input type="text" value={draft.name} onChange={set('name')} placeholder={t('set.namePlaceholderProvider')} />
         </div>
         <div className="field shrink">
-          <label>Color</label>
+          <label>{t('set.color')}</label>
           <input type="color" value={draft.color} onChange={set('color')} />
         </div>
         <div className="field shrink">
-          <label>Sync (min)</label>
+          <label>{t('set.syncMin')}</label>
           <input type="number" min="1" value={draft.syncMinutes} onChange={set('syncMinutes')} />
         </div>
       </div>
       <div className="field-row">
         <div className="field grow">
-          <label>Base URL</label>
+          <label>{t('set.baseUrl')}</label>
           <input type="text" value={draft.baseUrl} onChange={set('baseUrl')} placeholder="https://litellm.example.com" />
         </div>
       </div>
       <div className="field-row">
         <div className="field grow">
-          <label>Admin API key</label>
+          <label>{t('set.adminKey')}</label>
           <input type="password" value={draft.apiKey} onChange={set('apiKey')} placeholder="sk-..." />
         </div>
       </div>
       <div className="field-row" style={{ alignItems: 'center' }}>
         <button className="btn" onClick={onTest} disabled={testing || !canTest}>
-          {testing ? 'Testing…' : 'Test connection'}
+          {testing ? t('set.testing') : t('set.testConn')}
         </button>
         {testResult && (
           <span className={testResult.ok ? 'muted small' : 'reqclip'}>
-            {testResult.ok ? `OK — ${testResult.count} model${testResult.count === 1 ? '' : 's'} found` : `Failed: ${testResult.error}`}
+            {testResult.ok ? t('set.testOk', { count: testResult.count, unit: testResult.count === 1 ? t('common.model') : t('common.models') }) : t('set.failed', { error: testResult.error })}
           </span>
         )}
       </div>
       <div className="field-row">
-        <button className="btn primary" onClick={onSave} disabled={saving || !canSave}>{saving ? 'Saving…' : 'Save'}</button>
-        <button className="btn" onClick={onCancel} disabled={saving}>Cancel</button>
+        <button className="btn primary" onClick={onSave} disabled={saving || !canSave}>{saving ? t('common.saving') : t('common.save')}</button>
+        <button className="btn" onClick={onCancel} disabled={saving}>{t('common.cancel')}</button>
       </div>
     </div>
   )
 }
 
 function ModelList({ state, onReload, onToggle, onRename, onCommitRename }) {
-  if (!state || state.loading) return <div className="empty mini">Loading models…</div>
+  if (!state || state.loading) return <div className="empty mini">{t('set.loadingModels')}</div>
   if (state.error) {
     return (
       <div className="empty mini">
-        Failed to load models: {state.error} <button className="btn" onClick={onReload}>Retry</button>
+        {t('set.failedLoadModels', { error: state.error })} <button className="btn" onClick={onReload}>{t('set.retry')}</button>
       </div>
     )
   }
   return (
     <div className="models" style={{ marginTop: 10 }}>
       <div className="card-head">
-        <span className="card-sub">{state.rows.length} model{state.rows.length === 1 ? '' : 's'} seen in the last 35 days</span>
-        <button className="btn" onClick={onReload}>Refresh</button>
+        <span className="card-sub">{t('set.modelsSeen', { n: state.rows.length, unit: state.rows.length === 1 ? t('common.model') : t('common.models') })}</span>
+        <button className="btn" onClick={onReload}>{t('set.refresh')}</button>
       </div>
-      {state.rows.length === 0 && <div className="empty">No usage found for this provider yet.</div>}
+      {state.rows.length === 0 && <div className="empty">{t('set.noProviderUsage')}</div>}
       {state.rows.map((r) => (
         <div className={'model-row' + (r.visible ? '' : ' hidden')} key={r.model}>
           <input
             type="checkbox"
             checked={r.visible}
             onChange={(e) => onToggle(r.model, e.target.checked)}
-            title="Show in TokenStats"
+            title={t('set.showInApp')}
           />
           <span className="mname" title={r.model}>{r.model}</span>
           <span className="mtok">{compact(r.total)}</span>
           <span className="mcost">{usd(r.cost)}</span>
           <input
             type="text"
-            placeholder="display name (optional)"
+            placeholder={t('set.displayNamePlaceholder')}
             value={r.displayName}
             onChange={(e) => onRename(r.model, e.target.value)}
             onBlur={() => onCommitRename(r.model)}
