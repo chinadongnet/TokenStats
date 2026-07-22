@@ -447,6 +447,16 @@ React + Vite, three views selected by URL hash in `main.jsx`:
     value % on the same `valueClass` scale. A plan bound to several CLIs shows
     its whole share on each of their cards; the fee is not split, since there's
     no meaningful way to attribute it.
+  - Token counts go through `fmtCount()` (i18n.js), which switches counting
+    systems with the language: 万 / 千万 / 亿 in Chinese, K / M / B in English.
+    "250.67M" is not a number a Chinese reader parses at a glance. The hero line
+    shows tokens plus the scope-prorated subscription fee only — no estimated
+    cost, no value % (the per-card rows carry the comparison).
+  - The **5h** window deliberately shows NO percentage — neither headroom nor
+    value. It's a burst limiter, not an allowance: its share of a monthly fee is
+    fractions of a cent and its headroom swings wildly inside one session. It
+    renders as label + spent tokens/cost + countdown (`.qgap` holds the bar's
+    grid slot so the countdown chips stay aligned).
   - The scope tab labels use `scope.day/week/month`, NOT `common.month` — that
     key already means "个月" (a count of months, used by the report), and since
     `i18n.js` is one flat object literal a duplicate key silently wins.

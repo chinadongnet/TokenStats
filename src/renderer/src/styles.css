@@ -130,6 +130,9 @@ header {
 .qwk { font-size: 9px; text-transform: uppercase; letter-spacing: .04em; color: var(--faint); font-weight: 600; min-width: 16px; }
 .qbar { height: 9px; border-radius: 5px; background: var(--panel2); overflow: hidden; position: relative; }
 .qbar > i { position: absolute; inset: 0 auto 0 0; border-radius: 5px; transition: width .4s ease, background .4s ease; }
+/* stands in for the bar + % of a window that doesn't report a percentage (5h),
+   so its countdown chip still lines up with the others' */
+.qgap { grid-column: span 2; }
 .qnum { font-size: 13px; font-weight: 700; color: var(--text); font-variant-numeric: tabular-nums; white-space: nowrap; }
 .qtime { display: inline-flex; align-items: center; gap: 4px; padding: 2px 8px; border-radius: 20px;
   background: var(--panel2); border: 1px solid var(--line); color: var(--muted);

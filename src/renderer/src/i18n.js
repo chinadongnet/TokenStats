@@ -293,7 +293,7 @@ const zh = {
   'scope.day': '日',
   'scope.week': '周',
   'scope.month': '月',
-  'common.tokens': 'tokens',
+  'common.tokens': '词元',
   'common.est': '预估',
   'common.loading': '加载中…',
   'common.save': '保存',
@@ -607,6 +607,28 @@ export function t(key, params) {
     for (const k in params) s = s.split('{' + k + '}').join(String(params[k]))
   }
   return s
+}
+
+// Token counts in the reader's own counting system. Chinese groups by 万 (1e4),
+// 千万 (1e7) and 亿 (1e8) — "250.67M" is not a number a Chinese reader parses at
+// a glance, "2.5亿" is. English keeps K/M/B. One decimal at every scale (trimmed
+// when it's .0); below the smallest unit it's a plain rounded integer.
+export function fmtCount(n) {
+  const v = Number(n) || 0
+  if (!v) return '0'
+  const trim = (x) => String(Number(x.toFixed(1)))
+  if (current === 'zh') {
+    if (v >= 1e8) return trim(v / 1e8) + '亿'
+    if (v >= 1e7) return trim(v / 1e7) + '千万'
+    if (v >= 1e4) return trim(v / 1e4) + '万'
+    return String(Math.round(v))
+  }
+  // English keeps its original precision (2 decimals at B/M) — the 1-decimal
+  // rounding is what the 万/亿 scale asks for, not a change to K/M/B.
+  if (v >= 1e9) return (v / 1e9).toFixed(2) + 'B'
+  if (v >= 1e6) return (v / 1e6).toFixed(2) + 'M'
+  if (v >= 1e3) return (v / 1e3).toFixed(1) + 'K'
+  return String(Math.round(v))
 }
 
 // Cross-window sync: the three BrowserWindows share one localStorage origin, so

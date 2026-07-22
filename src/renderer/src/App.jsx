@@ -1,5 +1,5 @@
 import React, { useEffect, useMemo, useState } from 'react'
-import { t, useLang } from './i18n.js'
+import { fmtCount, t, useLang } from './i18n.js'
 
 // The 5 fixed built-in CLIs. LiteLLM providers are NOT listed here — they're
 // dynamic, DB-backed entries (`litellm:<providerId>`) merged in at render time
@@ -17,13 +17,10 @@ const FIXED_ORDER = ['claude', 'codex', 'gemini', 'agy', 'cursor']
 // just deleted (stale-by-one-tick), so a lookup never renders `undefined`.
 const FALLBACK_META = (id) => ({ label: id.startsWith('litellm:') ? '(deleted provider)' : id, color: '#5b6172' })
 
-const compact = (n) => {
-  if (!n) return '0'
-  if (n >= 1e9) return (n / 1e9).toFixed(2) + 'B'
-  if (n >= 1e6) return (n / 1e6).toFixed(2) + 'M'
-  if (n >= 1e3) return (n / 1e3).toFixed(1) + 'K'
-  return String(Math.round(n))
-}
+// Token counts follow the reader's counting system — 万/千万/亿 in Chinese,
+// K/M/B in English (see fmtCount in i18n.js). "250.67M" means nothing at a
+// glance to a Chinese reader; "2.5亿" does.
+const compact = (n) => fmtCount(n)
 const usd = (n) => (n || 0).toFixed(2)
 // Short reset-window label (5h / wk / mo), localized. Mirrors the period keys in
 // core/subscriptions.js's RESET_PERIODS (renderer can't import from main).
@@ -155,8 +152,13 @@ function QuotaBig({ plan, now, color }) {
   const cells = []
   for (const w of plan.windows) {
     if (w.source !== 'live') continue
+    // The 5h window is a burst limiter, not an allowance you budget against:
+    // its share of a monthly fee is fractions of a cent and its headroom % swings
+    // wildly within one session, so both percentages are dropped and it shows
+    // only what was actually spent plus the countdown.
+    const showPct = w.period !== '5h'
     const fee = proratedFee(plan, w.periodMs)
-    const pct = fee > 0 ? (w.cost / fee) * 100 : null
+    const pct = showPct && fee > 0 ? (w.cost / fee) * 100 : null
     const left = w.end ? Math.max(0, w.end - now) : 0
     // Fraction of the window's length still remaining — drives the clock dial.
     const tFrac = w.end && w.periodMs ? Math.min(1, Math.max(0, left / w.periodMs)) : 0
@@ -166,10 +168,16 @@ function QuotaBig({ plan, now, color }) {
     cells.push(
       <React.Fragment key={w.period}>
         <span className="qwk">{resetLabel(w.period)}</span>
-        <span className="qbar" title={t('app.usedLeft', { used: Math.round(w.usedPercent), left: uPct })}>
-          <i style={{ width: `${Math.max(3, uPct)}%`, background: levelColor(uFrac) }} />
-        </span>
-        <span className="qnum">{uPct}%</span>
+        {showPct ? (
+          <>
+            <span className="qbar" title={t('app.usedLeft', { used: Math.round(w.usedPercent), left: uPct })}>
+              <i style={{ width: `${Math.max(3, uPct)}%`, background: levelColor(uFrac) }} />
+            </span>
+            <span className="qnum">{uPct}%</span>
+          </>
+        ) : (
+          <span className="qgap" />
+        )}
         {/* time is a rounded countdown chip, NOT a bar, so it never reads as a
             second usage meter */}
         <span className="qtime" title={w.end ? t('app.nextCycle', { time: atTime(w.end, w.periodMs), dur: dur(left) }) : t('app.noResetTime')}>
@@ -383,7 +391,6 @@ export default function App() {
         <div className="sum">
           <b>{compact(totalTok)}</b>
           <span className="u">{t('common.tokens')}</span>
-          <span className="c">${usd(totalCost)} {t('common.est')}</span>
           {/* The subscription side of the same scope: what all active plans cost
               over the selected span (monthly fee ÷ 4 for a week, ÷ 28 for a day),
               and what this scope's usage is worth against it. */}
@@ -400,9 +407,6 @@ export default function App() {
               })}
             >
               {t('app.scopeFee', { scope: scopeLabel(scope) })} <b>${usd(scopeFee(monthlyTotal, scope))}</b>
-              <em className={valueClass((totalCost / scopeFee(monthlyTotal, scope)) * 100)}>
-                {Math.round((totalCost / scopeFee(monthlyTotal, scope)) * 100)}%
-              </em>
             </span>
           )}
         </div>
