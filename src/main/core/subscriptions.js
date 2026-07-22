@@ -213,6 +213,26 @@ function planAssigner(subs, nowMs) {
   return { entries, pick }
 }
 
+// ONE pass over the records that both computeResetWindows() and
+// mergeLiveLimits() can share: the exclusively-assigned records per plan
+// (sorted by ts, ready for usageIn) plus the same per CLI, which is what a
+// live window belonging to no plan needs. Callers that build it once and hand
+// it to both avoid a second full planAssigner sweep per popup refresh.
+export function planRecordIndex(subs, records, nowMs = Date.now()) {
+  const { pick } = planAssigner(subs, nowMs)
+  const byPlan = new Map((subs || []).map((s) => [s.id, []]))
+  const byCli = new Map()
+  for (const r of records || []) {
+    const e = pick(r)
+    if (e) byPlan.get(e.sub.id).push(r)
+    if (!byCli.has(r.cli)) byCli.set(r.cli, [])
+    byCli.get(r.cli).push(r)
+  }
+  for (const rs of byPlan.values()) rs.sort((a, b) => a.ts - b.ts)
+  for (const rs of byCli.values()) rs.sort((a, b) => a.ts - b.ts)
+  return { byPlan, byCli }
+}
+
 export function computeAllSubscriptionStats(subs, records, nowMs = Date.now()) {
   // Pre-assign records so overlapping plans never double-count the same usage
   // (each plan's stats only see the records it owns).
@@ -423,19 +443,14 @@ function usageIn(rs, start, end) {
 //
 // Records are assigned through the same exclusive planAssigner the billing
 // stats use, so two plans over the same sources never double-count a request.
-export function computeResetWindows(subs, records, nowMs = Date.now()) {
+export function computeResetWindows(subs, records, nowMs = Date.now(), index = null) {
   const tracked = (subs || []).filter((s) => s.active && (s.resetPeriods || []).length)
   if (!tracked.length) return []
 
-  const { pick } = planAssigner(subs, nowMs)
-  const owned = new Map(tracked.map((s) => [s.id, []]))
-  for (const r of records) {
-    const e = pick(r)
-    if (e && owned.has(e.sub.id)) owned.get(e.sub.id).push(r)
-  }
+  const idx = index || planRecordIndex(subs, records, nowMs)
 
   return tracked.map((sub) => {
-    const rs = owned.get(sub.id).sort((a, b) => a.ts - b.ts)
+    const rs = idx.byPlan.get(sub.id) || []
     // A rolling window can't be OPENED by a record in the future. LiteLLM has no
     // per-request timestamps and stamps a whole day at noon UTC, so its "today"
     // bucket legitimately sits ahead of now. Anchored windows don't care — such a
@@ -481,7 +496,9 @@ export function computeResetWindows(subs, records, nowMs = Date.now()) {
     let renewal = null
     if (Number.isFinite(startMs)) {
       const { start, end } = monthlyWindow(startMs, nowMs)
-      renewal = { start, end, periodMs: end - start, msToRenew: Math.max(0, end - nowMs) }
+      // Usage inside the CURRENT billing cycle, so the popup can put what the
+      // month's usage is worth next to what the month actually costs.
+      renewal = { start, end, periodMs: end - start, msToRenew: Math.max(0, end - nowMs), ...usageIn(rs, start, end) }
     }
 
     return {
@@ -502,20 +519,32 @@ export function computeResetWindows(subs, records, nowMs = Date.now()) {
 // Convert one such window into the same display shape computeResetWindows()
 // emits, tagged `source:'live'` so the UI can badge it and swap the ring from
 // time-based to usage-based.
-function toLiveWindow(w, nowMs) {
+// `rs` (the owning plan's records, ts-sorted) fills the window's real token/cost
+// usage. The CLI reports only a reset time and a used%, never a window start, so
+// the range is reconstructed as [end - periodMs, end) — the exact span the quota
+// number covers — and clamped to `now` so a not-yet-elapsed remainder can't
+// swallow future-stamped records. Without records the counters stay 0, which is
+// what the pre-usage callers still get.
+function toLiveWindow(w, nowMs, rs = null) {
+  const periodMs = (w.windowMinutes || 0) * 60000
+  const end = w.resetsAt ?? null
+  let usage = { tokens: 0, cost: 0, turns: 0 }
+  if (rs && rs.length && periodMs > 0) {
+    const wEnd = end != null ? end : nowMs
+    usage = usageIn(rs, wEnd - periodMs, Math.min(wEnd, nowMs))
+  }
   return {
     period: w.label,
     source: 'live',
-    open: w.resetsAt == null || w.resetsAt > nowMs,
-    start: null,
-    end: w.resetsAt ?? null,
-    periodMs: (w.windowMinutes || 0) * 60000,
-    msToReset: w.resetsAt != null ? Math.max(0, w.resetsAt - nowMs) : null,
+    open: end == null || end > nowMs,
+    // Derived, not reported — kept so the UI can say what range the usage covers.
+    start: end != null && periodMs > 0 ? end - periodMs : null,
+    end,
+    periodMs,
+    msToReset: end != null ? Math.max(0, end - nowMs) : null,
     usedPercent: w.usedPercent,
     remainingPercent: w.remainingPercent,
-    tokens: 0,
-    cost: 0,
-    turns: 0,
+    ...usage,
   }
 }
 
@@ -529,9 +558,13 @@ function toLiveWindow(w, nowMs) {
 //
 //   liveByCli — { <cli>: [ window, … ] } as returned by e.g. codexResetWindows()
 //   labels    — { <cli>: 'Display Name' } for the synthetic entries' names
-export function mergeLiveLimits(entries, liveByCli = {}, nowMs = Date.now(), labels = {}) {
+//   index     — optional planRecordIndex(), which fills each live window's real
+//               tokens/cost over its own span (see toLiveWindow); omit and the
+//               live windows come back with zeroed counters as before.
+export function mergeLiveLimits(entries, liveByCli = {}, nowMs = Date.now(), labels = {}, index = null) {
   const covered = new Set()
   const out = (entries || []).map((e) => {
+    const rs = index?.byPlan?.get(e.id) || null
     const live = []
     for (const b of e.bindings || []) {
       const ws = b.cli && liveByCli[b.cli]
@@ -545,10 +578,10 @@ export function mergeLiveLimits(entries, liveByCli = {}, nowMs = Date.now(), lab
     }
     const byPeriod = new Map(live.map((w) => [w.label, w]))
     const windows = (e.windows || []).map((w) =>
-      byPeriod.has(w.period) ? toLiveWindow(byPeriod.get(w.period), nowMs) : { ...w, source: 'estimate' }
+      byPeriod.has(w.period) ? toLiveWindow(byPeriod.get(w.period), nowMs, rs) : { ...w, source: 'estimate' }
     )
     const estPeriods = new Set((e.windows || []).map((w) => w.period))
-    for (const w of live) if (!estPeriods.has(w.label)) windows.push(toLiveWindow(w, nowMs))
+    for (const w of live) if (!estPeriods.has(w.label)) windows.push(toLiveWindow(w, nowMs, rs))
     windows.sort((a, b) => (a.periodMs || 0) - (b.periodMs || 0))
     return { ...e, windows, source: 'live' }
   })
@@ -559,7 +592,7 @@ export function mergeLiveLimits(entries, liveByCli = {}, nowMs = Date.now(), lab
       name: labels[cli] || cli,
       monthlyUsd: 0,
       bindings: [{ cli }],
-      windows: ws.map((w) => toLiveWindow(w, nowMs)),
+      windows: ws.map((w) => toLiveWindow(w, nowMs, index?.byCli?.get(cli) || null)),
       renewal: null,
       source: 'live',
       live: true,

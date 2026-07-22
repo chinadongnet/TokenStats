@@ -135,11 +135,17 @@ testable via `npm run test:parsers`.
     in the header comment of `parsers/cursor.js`.
   - **LiteLLM** providers are polled, not file-watched — see "Pollers" below.
   - `snapshot()` aggregates all records into per-CLI / per-model / per-day buckets,
-    today-vs-all-time, recent sessions, and the current "live" model, over
+    recent sessions, and the current "live" model, over
     `[...CLIS, ...dynamicIds]` (the 5 fixed CLIs plus every currently-active LiteLLM
     provider's `litellm:<id>`) so a dynamic id never hits a missing accumulator. It
     also returns a `providers: [{id, label, color}]` field — the only way the
     renderer learns provider names/colors, since it has no other route to the DB.
+    The scope buckets are **calendar-aligned, not rolling**: `todayPerCli/Model`
+    (since local midnight), `weekPerCli/Model` (since **Monday**), `monthPerCli/Model`
+    (since the 1st), plus all-time `perCli/perModel`, with the boundaries echoed in
+    `ranges: {dayStart, weekStart, monthStart}`. Calendar alignment is deliberate —
+    the popup's 日/周/月 tabs have to line up with the cycles a subscription quota
+    actually resets on; a rolling "last 7 days" never would.
     This is the only object the UI consumes.
   - `start()` does the initial scan, then sets up `chokidar` watchers and emits
     debounced `'update'` events (400ms) carrying a fresh snapshot.
@@ -246,13 +252,22 @@ testable via `npm run test:parsers`.
   unbind it; null = all models). Stats are served live via the `subs:stats` IPC
   from `store.dedupedRecords()` — not the hourly DB, which lacks the project/key
   dimension the keyAlias filter needs.
-  `computeResetWindows(subs, records, now)` (IPC `subs:resets`) covers the **quota**
+  `computeResetWindows(subs, records, now, index?)` (IPC `subs:resets`) covers the **quota**
   windows — orthogonal to all the billing math above. A plan declares a **set** of
   them (`resetPeriods`, any subset of `RESET_PERIODS` = `['5h','weekly','monthly']`),
   because real plans differ: Claude caps 5h *and* weekly, Cursor and a Mimo token
   plan only have a monthly allowance. Returns
   `{id, name, monthlyUsd, bindings, windows[], renewal}` per active plan, windows in
-  canonical order. The two window kinds are **not** the same shape:
+  canonical order. `renewal` carries the current billing cycle's own
+  `{tokens, cost, turns}` so the popup can put what the month's usage is worth
+  next to what the month costs. `mergeLiveLimits(entries, liveByCli, now, labels,
+  index?)` fills the same counters for a **live** window: the CLI reports only a
+  used% and a reset time, so the span is reconstructed as `[end - periodMs, end)`
+  (clamped to now) and summed from the plan's own records — that's what makes the
+  popup's "usage worth vs prorated fee" line cover exactly the window it sits
+  under. `planRecordIndex(subs, records, now)` is the one shared pass over the
+  records (owned-per-plan + per-CLI, ts-sorted) that both functions take, so
+  `subs:resets` doesn't sweep the record set twice. The two window kinds are **not** the same shape:
   - **`5h` is ROLLING** (`ROLLING_PERIOD_MS`), modelling Claude's rate limit: the
     window opens on the first request made *after the previous one expired* and
     resets 5h later — **not** a clock-aligned schedule, so it can't be derived from
@@ -415,32 +430,41 @@ React + Vite, three views selected by URL hash in `main.jsx`:
   to `config.json` via `paths.js`'s `saveLanguage`, and rebroadcasts `onLanguage`).
   Currency stays USD in both languages. A top-level `useLang()` in each view re-renders
   the whole tree on switch, so nested components can call the module-level `t()` directly.
-- **`App.jsx`** — the tray popup. Reads the snapshot via `window.api`, subscribes to live
-  updates, renders the hero total, per-CLI bars, top models, recent sessions, live
-  indicator. The hero row also shows the **active subscriptions' total `$/mo`**
-  (summed from `subsList()`, active only) right-aligned at the top-right. Header has
-  Report/Settings buttons (`window.api.openReport()`/`openSettings()`). Under the hero
-  sits the **Quota windows** section
-  (`window.api.subsResets()`): **one line per active plan** — name on the left, that
-  plan's clocks inlined on the right, each a `<Ring>` (minimal SVG donut showing the
-  **remaining**-time fraction) + short label + countdown. The reset-time chip's clock
-  (`ClockIcon`/`pieSlice`) is a dial filled proportionally to the time **remaining**,
-  tinted the plan's brand color — it drains as the window counts down. Quota windows
-  (`5h`/`wk`/`mo`) use the plan's brand color; the **`bill`** chip (billing renewal,
-  from `renewal`, shown only when `monthlyUsd > 0`) uses the report's fee color
-  `#6478cf` — it's money, not tokens, and the two clocks are unrelated, so they must
-  not read as the same thing. Space is the whole constraint: the popup is 380px wide
-  and a plan can show up to 4 chips, so a full-width bar (and even a line per window)
-  was too much — exact tokens/cost/turns and wall-clock reset/bill times live in each
-  chip's `title` tooltip instead. Idle rolling windows render greyed as "idle".
-  Hidden entirely when no plan configures a window. Refetched on each **snapshot**
-  (usage changes are the only thing besides time that can alter a window) rather
-  than polled, so a hidden popup stays quiet; a 30s `setInterval` re-renders the
-  countdown, and remaining time is derived locally from each window's `end` so an
-  expiry mid-tick needs no IPC round-trip. Header, tabs and footer are pinned; the middle sits in a
-  `.scroll` region (`flex:1; min-height:0; overflow-y:auto`) so the content is never
-  clipped when the window is shorter than the content — which is what makes the
-  height-capping in `index.js` safe.
+- **`App.jsx`** — the tray popup. Reads the snapshot via `window.api`, subscribes to
+  live updates, and renders a hero total, one **card per CLI** with usage in the
+  selected scope, and a live-activity footer. The hero row also shows the **active
+  subscriptions' total `$/mo`** (summed from `subsList()`, active only) right-aligned.
+  Header has the scope tabs plus Report/Settings buttons.
+  - **Scope tabs are 日 / 周 / 月** (`scope` = `'day'|'week'|'month'`), reading the
+    snapshot's calendar-aligned buckets (`todayPerCli` / `weekPerCli` / `monthPerCli`
+    and their `*PerModel` twins). Calendar, not rolling, so a scope matches the
+    cycle a plan's quota resets on — see `store.snapshot()` above. There is no
+    "all-time" tab; that view is the report window's job.
+  - Each card carries its plan's **live quota** (`QuotaBig`, fed by
+    `window.api.subsResets()`); windows still on an *estimate* are not drawn at all.
+    Per live window: a headroom bar on a green→red scale (`levelColor`, deliberately
+    unrelated to the CLI brand colors — it means "how much is left", never "which
+    tool"), a countdown chip whose clock (`ClockIcon`/`pieSlice`) is a dial draining
+    with the time remaining, and a **value line** — tokens spent inside that window,
+    what they'd cost pay-as-you-go, and the slice of the monthly fee covering the
+    same span (`proratedFee`, prorated off the real billing-month length from
+    `renewal.periodMs`), ending in a value % (`valueClass`: ≥100% green, ≥50% amber,
+    else red). The window's tokens/cost come from `mergeLiveLimits` filling the
+    live window's own `[end - periodMs, end)` span, so the numbers and the bar
+    above them always describe the same period.
+  - The billing row below (shown only when `monthlyUsd > 0`) is the **other**,
+    unrelated clock: renewal countdown + fee, with the current cycle's usage worth
+    and value % from `renewal.{cost,tokens}`. Quota and billing must never read as
+    the same thing.
+  - Refetched on each **snapshot** (usage is the only thing besides time that moves
+    a window) rather than polled, so a hidden popup stays quiet; a 30s `setInterval`
+    re-renders countdowns, and remaining time is derived locally from each window's
+    `end` so an expiry mid-tick needs no IPC round-trip. Space is the constraint at
+    380px wide — exact turns and wall-clock reset/bill times live in `title`
+    tooltips. Header, tabs and footer are pinned; the middle sits in a `.scroll`
+    region (`flex:1; min-height:0; overflow-y:auto`) so content is never clipped
+    when the window is shorter than the content — which is what makes the
+    height-capping in `index.js` safe.
 - **`Report.jsx`** (`#report`) — the "Token Report" window. Pulls hourly/daily/model
   data from the SQLite DB via IPC and draws hand-rolled **SVG stacked-bar charts** (no
   chart lib): by-hour for a chosen day, daily trend over a range (7d/30d/all),

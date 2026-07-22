@@ -122,14 +122,33 @@ function levelColor(frac) {
   return `hsl(${Math.round(h)} 72% 47%)`
 }
 
+const MONTH_MS = 30 * 86400000
+// What the plan's monthly fee works out to over one quota window — the fee is
+// billed monthly, the window is 5h/weekly/monthly, so it has to be prorated
+// before "usage worth vs what you pay" means anything. The real length of the
+// current billing month (from `renewal`) is used where known, so a 31-day month
+// isn't priced as 30.
+const proratedFee = (plan, periodMs) => {
+  const monthMs = plan.renewal?.periodMs || MONTH_MS
+  if (!(plan.monthlyUsd > 0) || !(periodMs > 0)) return 0
+  return (plan.monthlyUsd * periodMs) / monthMs
+}
+// Above 100% the window's usage is worth more than its slice of the fee — the
+// plan is paying off. Below, it isn't (yet).
+const valueClass = (pct) => (pct >= 100 ? 'good' : pct >= 50 ? 'ok' : 'bad')
+
 // The plan's LIVE quota — the card's centerpiece. Estimated windows are not
 // shown at all. Each live window gets two headroom bars: usage remaining (流量)
-// and time-to-reset, both on the green→red scale. Billing renewal is a slim
-// line below. Returns null if the plan has no live window.
+// and time-to-reset, both on the green→red scale, plus a value line: the tokens
+// and pay-as-you-go cost actually spent INSIDE that same window against the
+// share of the subscription fee covering it. Billing renewal is a slim line
+// below. Returns null if the plan has no live window.
 function QuotaBig({ plan, now, color }) {
   const cells = []
   for (const w of plan.windows) {
     if (w.source !== 'live') continue
+    const fee = proratedFee(plan, w.periodMs)
+    const pct = fee > 0 ? (w.cost / fee) * 100 : null
     const left = w.end ? Math.max(0, w.end - now) : 0
     // Fraction of the window's length still remaining — drives the clock dial.
     const tFrac = w.end && w.periodMs ? Math.min(1, Math.max(0, left / w.periodMs)) : 0
@@ -149,6 +168,33 @@ function QuotaBig({ plan, now, color }) {
           <ClockIcon frac={tFrac} color={color} />
           <b>{next}</b>
         </span>
+        {/* Value line — spans the grid: what this window's usage would have
+            cost pay-as-you-go, against the fee slice covering the same span. */}
+        {w.tokens > 0 && (
+          <span
+            className="qrate"
+            title={
+              pct == null
+                ? t('app.noFee', { tokens: compact(w.tokens), cost: usd(w.cost) })
+                : t('app.rateTip', {
+                    period: resetLabel(w.period),
+                    tokens: compact(w.tokens),
+                    cost: usd(w.cost),
+                    fee: usd(fee),
+                    pct: Math.round(pct),
+                  })
+            }
+          >
+            <b>{compact(w.tokens)}</b>
+            <span className="qsep">·</span>${usd(w.cost)}
+            {pct != null && (
+              <>
+                <span className="qsep">{t('app.vsFee')}</span>${usd(fee)}
+                <em className={valueClass(pct)}>{Math.round(pct)}%</em>
+              </>
+            )}
+          </span>
+        )}
       </React.Fragment>
     )
   }
@@ -161,6 +207,23 @@ function QuotaBig({ plan, now, color }) {
         <div className="billrow" title={t('app.renewsTip', { time: atTime(plan.renewal.end, plan.renewal.periodMs), usd: usd(plan.monthlyUsd) })}>
           <BillIcon />
           {t('app.renews')} <b>{dur(away)}</b> · ${usd(plan.monthlyUsd)}{t('app.perMo')}
+          {/* The billing cycle's own value ratio: this month's usage worth
+              against this month's fee. Independent of the quota windows above. */}
+          {plan.renewal.cost > 0 && (
+            <span
+              className="cyval"
+              title={t('app.cycleValueTip', {
+                cost: usd(plan.renewal.cost),
+                usd: usd(plan.monthlyUsd),
+                pct: Math.round((plan.renewal.cost / plan.monthlyUsd) * 100),
+              })}
+            >
+              {t('app.cycleValue', { cost: usd(plan.renewal.cost) })}
+              <em className={valueClass((plan.renewal.cost / plan.monthlyUsd) * 100)}>
+                {Math.round((plan.renewal.cost / plan.monthlyUsd) * 100)}%
+              </em>
+            </span>
+          )}
         </div>
       )}
     </div>
@@ -194,7 +257,7 @@ function ModelBar({ models, color }) {
 export default function App() {
   useLang() // re-render whole popup on language switch
   const [snap, setSnap] = useState(null)
-  const [scope, setScope] = useState('today')
+  const [scope, setScope] = useState('day')
   const [shotMenu, setShotMenu] = useState(false)
   const [copied, setCopied] = useState(false)
   const [resets, setResets] = useState([])
@@ -253,8 +316,8 @@ export default function App() {
 
   if (!snap) return <div className="loading">{t('app.scanning')}</div>
 
-  const per = scope === 'today' ? snap.todayPerCli : scope === '7d' ? snap.weekPerCli : snap.perCli
-  const perModelSrc = scope === 'today' ? snap.todayPerModel : scope === '7d' ? snap.weekPerModel : snap.perModel
+  const per = scope === 'day' ? snap.todayPerCli : scope === 'week' ? snap.weekPerCli : snap.monthPerCli || snap.perCli
+  const perModelSrc = scope === 'day' ? snap.todayPerModel : scope === 'week' ? snap.weekPerModel : snap.monthPerModel || snap.perModel
   // Models grouped by CLI (biggest first) for each plan's in-place breakdown.
   const modelsByCli = new Map()
   for (const m of perModelSrc || []) {
@@ -284,10 +347,12 @@ export default function App() {
           <span>TokenStats</span>
         </div>
         <div className="hwin">
+          {/* Calendar-aligned scopes (day / week / month), so what a card shows
+              lines up with the cycles a subscription is actually counted in. */}
           <div className="seg">
-            <button className={scope === 'today' ? 'on' : ''} onClick={() => setScope('today')}>{t('common.today')}</button>
-            <button className={scope === '7d' ? 'on' : ''} onClick={() => setScope('7d')}>{t('common.7d')}</button>
-            <button className={scope === 'all' ? 'on' : ''} onClick={() => setScope('all')}>{t('common.all')}</button>
+            <button className={scope === 'day' ? 'on' : ''} title={t('app.scopeDay')} onClick={() => setScope('day')}>{t('common.day')}</button>
+            <button className={scope === 'week' ? 'on' : ''} title={t('app.scopeWeek')} onClick={() => setScope('week')}>{t('common.week')}</button>
+            <button className={scope === 'month' ? 'on' : ''} title={t('app.scopeMonth')} onClick={() => setScope('month')}>{t('common.month')}</button>
           </div>
           <button className="ghost" title={t('app.reportTitle')} onClick={() => window.api.openReport()}>▤</button>
           <button className="ghost" title={t('app.settingsTitle')} onClick={() => window.api.openSettings()}>⚙</button>

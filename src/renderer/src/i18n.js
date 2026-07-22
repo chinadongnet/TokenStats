@@ -18,6 +18,9 @@ const en = {
   'common.today': 'Today',
   'common.7d': '7d',
   'common.all': 'All',
+  'common.day': 'Day',
+  'common.week': 'Week',
+  'common.month': 'Month',
   'common.tokens': 'tokens',
   'common.est': 'est',
   'common.loading': 'Loading…',
@@ -68,6 +71,16 @@ const en = {
   'app.nextCycle': 'next cycle {time} ({dur})',
   'app.renews': 'renews',
   'app.renewsTip': 'Renews {time} · ${usd}/mo',
+  'app.scopeDay': 'Today (since midnight)',
+  'app.scopeWeek': 'This week (since Monday)',
+  'app.scopeMonth': 'This calendar month',
+  'app.rateTip':
+    '{tokens} tokens in this {period} window · ${cost} of usage at pay-as-you-go rates vs ${fee} of the plan fee covering the same span — {pct}% of what it costs you',
+  'app.noFee': '{tokens} tokens · ${cost} of usage in this window (no fee to compare)',
+  'app.vsFee': 'vs',
+  'app.cycleValue': 'used ${cost}',
+  'app.cycleValueTip':
+    'This billing cycle: ${cost} of usage at pay-as-you-go rates against the ${usd} fee — {pct}% of what you pay',
 
   // settings (Settings.jsx)
   'set.title': 'Settings',
@@ -276,6 +289,9 @@ const zh = {
   'common.today': '今天',
   'common.7d': '7天',
   'common.all': '全部',
+  'common.day': '日',
+  'common.week': '周',
+  'common.month': '月',
   'common.tokens': 'tokens',
   'common.est': '预估',
   'common.loading': '加载中…',
@@ -326,6 +342,15 @@ const zh = {
   'app.nextCycle': '下次重置 {time}（{dur}）',
   'app.renews': '续订',
   'app.renewsTip': '续订时间 {time} · ${usd}/月',
+  'app.scopeDay': '今天（从零点起）',
+  'app.scopeWeek': '本周（从周一起）',
+  'app.scopeMonth': '本自然月',
+  'app.rateTip':
+    '本{period}周期内 {tokens} tokens · 按量计费约 ${cost}，对应订阅费摊销 ${fee}——相当于所付费用的 {pct}%',
+  'app.noFee': '本周期 {tokens} tokens · 按量计费约 ${cost}（无订阅费可对比）',
+  'app.vsFee': '对比',
+  'app.cycleValue': '已用 ${cost}',
+  'app.cycleValueTip': '本计费周期：按量计费约 ${cost}，订阅费 ${usd}——相当于所付费用的 {pct}%',
 
   // settings
   'set.title': '设置',

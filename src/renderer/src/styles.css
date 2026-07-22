@@ -129,8 +129,21 @@ header {
   font-size: 11px; font-variant-numeric: tabular-nums; white-space: nowrap; }
 .qtime > svg { opacity: .75; }
 .qtime > b { color: var(--text); font-weight: 600; }
+/* value line under each live quota window: tokens · usage $ vs the fee slice
+   covering the same span. Spans the whole .qb grid so it reads as a caption of
+   the bar above it, not a fifth column. */
+.qrate { grid-column: 1 / -1; margin: -3px 0 1px 0; display: flex; align-items: baseline; gap: 4px;
+  font-size: 10.5px; color: var(--faint); font-variant-numeric: tabular-nums; }
+.qrate b { color: var(--muted); font-weight: 600; }
+.qrate .qsep { opacity: .55; }
+.qrate em, .cyval em { font-style: normal; font-weight: 700; margin-left: 2px; }
+em.good { color: #1fa87c; }
+em.ok { color: #c9a227; }
+em.bad { color: #b3564f; }
+
 .billrow { display: flex; align-items: center; gap: 5px; margin-top: 7px; font-size: 10.5px; color: var(--faint); }
 .billrow b { color: var(--muted); font-weight: 600; }
+.cyval { margin-left: auto; display: inline-flex; align-items: baseline; gap: 2px; font-variant-numeric: tabular-nums; }
 .qk { font-size: 9px; text-transform: uppercase; letter-spacing: .04em; color: var(--faint); }
 
 /* per-plan model breakdown — segmented bar (shaded in the plan color) + legend */
