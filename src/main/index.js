@@ -12,7 +12,7 @@ import { claudeResetWindows, primeClaudeLimits } from './core/claudeLimits.js'
 import { computeAllSubscriptionStats, computePlanBreakdown, computePlanTimeline, computeResetWindows, mergeLiveLimits } from './core/subscriptions.js'
 import { migrateLegacyLitellmConfig } from './core/migrateLitellm.js'
 import { isAutoLaunch, setAutoLaunch, migrateLegacyRunKeys } from './autoLaunch.js'
-import { agyResetWindows, getAgyQuotaState, enableAgyQuota, disableAgyQuota, ensureAgyHook } from './agyQuota.js'
+import { agyResetWindows, getAgyQuotaState, enableAgyQuota, disableAgyQuota, ensureAgyHook, AGY_MIRROR_PATH } from './agyQuota.js'
 import { makeTrayIcon } from './trayIcon.js'
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url))
@@ -89,6 +89,21 @@ async function init() {
   migrateLegacyRunKeys() // one-time: drop the pre-rename com.tokenstatus.app Run value
   ensureConfigFile() // create ~/.tokenstats/config.json template on first run
 
+  // UI language: renderer owns the instant switch (localStorage); this persists
+  // it for the tray menu and rebroadcasts to every window so all three stay in
+  // sync even if a cross-window storage event is missed. Registered BEFORE the
+  // window loads: a renderer with no stored choice invokes 'get-language'
+  // immediately, and anything registered after createWindow() can lose that race.
+  ipcMain.handle('get-language', () => lang)
+  ipcMain.handle('set-language', (_e, l) => {
+    lang = saveLanguage(l)
+    for (const w of BrowserWindow.getAllWindows()) w.webContents.send('language', lang)
+    // The right-click menu is rebuilt on demand, but the tooltip string is not —
+    // without this it keeps the old language until the next store snapshot.
+    if (lastSnapshot) updateTray(lastSnapshot)
+    return lang
+  })
+
   createWindow()
   createTray()
 
@@ -132,16 +147,6 @@ async function init() {
   ipcMain.on('quit-app', () => { app.isQuitting = true; app.quit() })
   ipcMain.on('open-report', () => openReport())
   ipcMain.on('open-settings', () => openSettings())
-
-  // UI language: renderer owns the instant switch (localStorage); this persists
-  // it for the tray menu and rebroadcasts to every window so all three stay in
-  // sync even if a cross-window storage event is missed.
-  ipcMain.handle('get-language', () => lang)
-  ipcMain.handle('set-language', (_e, l) => {
-    lang = saveLanguage(l)
-    for (const w of BrowserWindow.getAllWindows()) w.webContents.send('language', lang)
-    return lang
-  })
 
   // Antigravity (agy) live-quota integration — installs/removes a statusLine
   // hook in agy's own settings (see agyQuota.js). Broadcasting after a change
@@ -250,6 +255,7 @@ async function init() {
   })
 
   ensureAgyHook() // re-assert the agy statusLine hook file if the user enabled it
+  watchAgyMirror() // pick up quota-only refreshes (agy rewrites the mirror without any new usage)
   refreshLitellmPollers() // populate store.pollers before the initial scan/poll
   await store.start()
   ingestNow() // first full ingest after the initial scan
@@ -300,6 +306,20 @@ function refreshLitellmPollers() {
       })
     )
   )
+}
+
+// agy rewrites its quota mirror on every statusLine render — which happens on
+// startup and while the user browses `/usage`, i.e. without producing any new
+// token usage for the store to watch. Nothing else would ever fire, so the
+// popup's Antigravity card would sit stale until unrelated usage landed. Poll
+// the mirror's mtime and re-send the current snapshot, which is what makes the
+// popup refetch subs:resets (see App.jsx). Cheap: one stat every 20s, and no
+// snapshot recompute.
+function watchAgyMirror() {
+  fs.watchFile(AGY_MIRROR_PATH, { interval: 20000 }, (cur, prev) => {
+    if (cur.mtimeMs === prev.mtimeMs) return
+    if (win && !win.isDestroyed() && lastSnapshot) win.webContents.send('snapshot', lastSnapshot)
+  })
 }
 
 // Pushes a fresh snapshot to the popup + tray + ingest, outside the normal

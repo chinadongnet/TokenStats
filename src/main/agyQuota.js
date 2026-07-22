@@ -29,6 +29,10 @@ const AGY_SETTINGS = path.join(home, '.gemini', 'antigravity-cli', 'settings.jso
 const TOKENSTATS_DIR = path.join(home, '.tokenstats')
 const HOOK_PATH = path.join(TOKENSTATS_DIR, 'agyStatusHook.cjs')
 export const AGY_MIRROR_PATH = path.join(TOKENSTATS_DIR, 'agy_status.json')
+// Whatever `statusLine` agy had before we installed ours (including "absent",
+// stored as null), so disabling restores it exactly instead of leaving behind
+// our own empty-command stub.
+const BACKUP_PATH = path.join(TOKENSTATS_DIR, 'agyStatusLineBackup.json')
 
 // Forward-slash form for the path inside both the JS hook source and the
 // command string.
@@ -89,6 +93,28 @@ function writeHookFile() {
   fs.writeFileSync(HOOK_PATH, HOOK_SRC)
 }
 
+// Backup of agy's original statusLine: `{ had: bool, value: <original> }`.
+// `had:false` means agy had no statusLine key at all, so restoring deletes it.
+function saveStatusLineBackup(cfg) {
+  try {
+    fs.mkdirSync(TOKENSTATS_DIR, { recursive: true })
+    const had = Object.prototype.hasOwnProperty.call(cfg, 'statusLine')
+    fs.writeFileSync(BACKUP_PATH, JSON.stringify({ had, value: had ? cfg.statusLine : null }, null, 2))
+  } catch {
+    // best-effort — a missing backup just means disable falls back to deleting
+  }
+}
+
+function readStatusLineBackup() {
+  try {
+    const b = JSON.parse(fs.readFileSync(BACKUP_PATH, 'utf8'))
+    if (b && typeof b === 'object' && 'had' in b) return b
+  } catch {
+    // no backup recorded
+  }
+  return null
+}
+
 // Current state of the integration, for the Settings toggle:
 //   agyFound  — agy's settings.json exists (agy CLI is installed & initialized)
 //   enabled   — our hook is the active statusLine command
@@ -117,7 +143,12 @@ export function enableAgyQuota() {
   const cur = (cfg.statusLine && cfg.statusLine.command) || ''
   if (cur && cur !== OUR_COMMAND) return { ok: false, reason: 'foreign' }
   writeHookFile()
-  cfg.statusLine = { type: 'command', command: OUR_COMMAND, enabled: true }
+  // Record the pre-existing statusLine (an object with no command can still
+  // carry the user's own options, e.g. enabled:false) so disable can put it
+  // back verbatim. Don't re-record once ours is already installed.
+  if (cur !== OUR_COMMAND) saveStatusLineBackup(cfg)
+  // Merge rather than replace, so any unrelated keys agy/the user set survive.
+  cfg.statusLine = { ...(cfg.statusLine || {}), type: 'command', command: OUR_COMMAND, enabled: true }
   try {
     writeAgySettings(cfg)
   } catch {
@@ -132,12 +163,26 @@ export function disableAgyQuota() {
   if (!cfg) return { ok: true }
   const cur = (cfg.statusLine && cfg.statusLine.command) || ''
   if (cur === OUR_COMMAND) {
-    cfg.statusLine = { type: 'command', command: '', enabled: true }
+    const backup = readStatusLineBackup()
+    if (backup && backup.had) cfg.statusLine = backup.value
+    else delete cfg.statusLine // nothing there before us (or no backup) — leave agy clean
     try {
       writeAgySettings(cfg)
     } catch {
       return { ok: false, reason: 'write' }
     }
+    try {
+      fs.rmSync(BACKUP_PATH, { force: true })
+    } catch {
+      // best-effort
+    }
+  }
+  // Drop the mirror too: it holds a stale quota snapshot, and a leftover file
+  // would keep feeding agyResetWindows() after the toggle is off.
+  try {
+    fs.rmSync(AGY_MIRROR_PATH, { force: true })
+  } catch {
+    // best-effort
   }
   return { ok: true, ...getAgyQuotaState() }
 }
@@ -159,6 +204,13 @@ export function ensureAgyHook() {
 // pool — the binding number that actually matters. Returns [] if the mirror is
 // missing or carries no gemini quota.
 export function agyResetWindows() {
+  // The integration being off is the user saying "don't show this" — a mirror
+  // left behind by an earlier session must not keep the card alive.
+  try {
+    if (!getAgyQuotaState().enabled) return []
+  } catch {
+    return []
+  }
   let d
   try {
     d = JSON.parse(fs.readFileSync(AGY_MIRROR_PATH, 'utf8'))

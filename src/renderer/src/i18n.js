@@ -612,7 +612,10 @@ if (typeof window !== 'undefined') {
   // config.json (what the tray menu uses) so all surfaces start in step.
   if (!hadStored) {
     try {
-      window.api?.getLanguage?.().then((l) => {
+      // The invoke can reject if main hasn't registered the handler yet (it
+      // registers before loading the window, but a rejection here must never
+      // become an unhandled one — and one retry costs nothing).
+      const adopt = (l) => {
         if ((l === 'en' || l === 'zh') && l !== current) {
           current = l
           try {
@@ -622,7 +625,19 @@ if (typeof window !== 'undefined') {
           }
           notify()
         }
-      })
+      }
+      const ask = () => window.api.getLanguage()
+      ask()
+        .then(adopt)
+        .catch(() => {
+          setTimeout(() => {
+            try {
+              ask().then(adopt).catch(() => {})
+            } catch {
+              // ignore
+            }
+          }, 500)
+        })
     } catch {
       // ignore
     }
