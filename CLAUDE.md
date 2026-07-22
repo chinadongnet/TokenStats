@@ -32,7 +32,8 @@ color, sync-minutes, per-model show/hide + rename), stored in `usage.sqlite` (no
 The Settings window also manages **subscription plans** — user-entered monthly flat
 fees (Claude, ChatGPT, Google AI, Cursor, a LiteLLM token plan, …) compared against
 what the covered usage would actually have cost. See `core/subscriptions.js` below
-and the report window's "Subscriptions" tab. An active plan can also declare **token
+and the report window's "Token Plans" tab (plus, in the popup, the per-card value
+ratios described under `App.jsx` below). An active plan can also declare **token
 quota resets** — any subset of 5h / weekly / monthly, since Claude caps a 5h and a
 weekly window while Cursor and Mimo only have a monthly allowance — which the tray
 popup surfaces as live countdowns. A plan therefore carries **several independent
@@ -171,7 +172,7 @@ testable via `npm run test:parsers`.
   (LiteLLM's admin API reports actual spend, so its records aren't estimated at all).
   Edit the table freely.
 - **`db.js`** — SQLite (via `sql.js` WASM, no native build) persistence at
-  `~/.TokenStats/usage.sqlite`, split across three concerns:
+  `~/.tokenstats/usage.sqlite`, split across three concerns:
   - **hourly usage** — `UsageDb.ingest(records)` re-aggregates the full record set
     into one row per `(local-hour, cli, model)` in `usage_hourly` and **replaces** the
     table (so it never drifts from the parsers), then exports the DB to disk. Query
@@ -296,7 +297,7 @@ testable via `npm run test:parsers`.
 - **`paths.js`** — resolves the data roots and reads user config. Each of the 5 fixed
   CLIs has an array of roots (`CLI_ROOTS[cli]`): the local dir first (overridable via
   `AIMON_*_ROOT` env vars), then any **extra dirs** listed under `extraRoots` in
-  `~/.TokenStats/config.json` (override path via `AIMON_CONFIG`). Extra roots are how
+  `~/.tokenstats/config.json` (override path via `AIMON_CONFIG`). Extra roots are how
   **other devices' usage is merged** — copy another machine's `.codex/.gemini/.claude`
   data folder locally and add its path. `ensureConfigFile()` writes a template on first
   run. Also exposes per-CLI display metadata (label, color, primary root) as
@@ -372,7 +373,11 @@ identity-based matching (subscription model filters) survives the rename.
   `agyQuota.js`) into `liveByCli` alongside Codex/Claude/Cursor. The **language** IPC
   (`get-language`/`set-language`) persists to `config.json`, rebuilds the (translated)
   native tray menu — `TRAY_STRINGS`/`tray_t()`, the only main-process strings — and
-  broadcasts `language` to every window; the **`agy:*`** IPC (`get-state`/`set-enabled`)
+  broadcasts `language` to every window, refreshing the tray **tooltip** from
+  `lastSnapshot` too (the menu is rebuilt on demand, the tooltip is not). It is
+  registered **before** `createWindow()`: a renderer with no stored language invokes
+  `get-language` immediately, and a handler registered after the window loads can lose
+  that race (`i18n.js` also catches and retries the invoke); the **`agy:*`** IPC (`get-state`/`set-enabled`)
   installs/removes the statusLine hook and `broadcastSnapshot()`s so the popup's
   Antigravity card appears/disappears at once. `ensureAgyHook()` runs on startup to
   re-assert the hook file if the user left the integration enabled. `dynamicCliMeta`
@@ -401,7 +406,14 @@ identity-based matching (subscription model filters) survives the rename.
   the popup shows an **Antigravity** live card. Refreshes for free on `agy` **CLI** use
   (not the IDE) — no OAuth, no spawning agy, no quota spent. `getAgyQuotaState()` /
   `disableAgyQuota()` back the **Settings → App** toggle; it never clobbers a statusLine
-  the user set themselves. **Gotcha**: agy runs `statusLine.command` by naive
+  the user set themselves — enable snapshots whatever `statusLine` object was there
+  (including "absent") to `~/.tokenstats/agyStatusLineBackup.json` and merges into it,
+  and disable restores that verbatim (or deletes the key), then removes the mirror so a
+  stale file can't keep feeding the card. `agyResetWindows()` also returns `[]` unless
+  the toggle is on, for the same reason. `index.js` polls the mirror's mtime
+  (`watchAgyMirror()`, 20s) and re-sends the current snapshot when it changes, because
+  agy rewrites it on renders that produce no token usage at all (startup, browsing
+  `/usage`) — nothing else would ever wake the popup. **Gotcha**: agy runs `statusLine.command` by naive
   space-splitting with **no shell/quote handling**, so the installed command must be
   **unquoted** (`node C:/…/agyStatusHook.cjs`) — a quoted path is passed to node
   literally and never runs (space-containing paths therefore unsupported). Imports only
@@ -431,59 +443,48 @@ React + Vite, three views selected by URL hash in `main.jsx`:
   Currency stays USD in both languages. A top-level `useLang()` in each view re-renders
   the whole tree on switch, so nested components can call the module-level `t()` directly.
 - **`App.jsx`** — the tray popup. Reads the snapshot via `window.api`, subscribes to
-  live updates, and renders a hero total, one **card per CLI** with usage in the
-  selected scope, and a live-activity footer. The hero row also shows the **active
-  subscriptions' total `$/mo`** (summed from `subsList()`, active only) right-aligned.
-  Header has the scope tabs plus Report/Settings buttons.
+  live updates, and renders a hero line, one **card per CLI** with usage in the
+  selected scope, and a live-activity footer. Header holds the scope tabs plus the
+  Report / Settings / screenshot / refresh buttons.
   - **Scope tabs are 日 / 周 / 月** (`scope` = `'day'|'week'|'month'`), reading the
     snapshot's calendar-aligned buckets (`todayPerCli` / `weekPerCli` / `monthPerCli`
-    and their `*PerModel` twins). Calendar, not rolling, so a scope matches the
-    cycle a plan's quota resets on — see `store.snapshot()` above. There is no
-    "all-time" tab; that view is the report window's job.
-  - Both the hero badge and every plan-bound card compare the scope's usage cost
-    against the subscription fee **prorated to that same span** (`SCOPE_DIV`:
-    month = the fee, week = fee/4, day = fee/28 — a month is treated as 4×7 days
-    so the week and day divisors stay consistent with each other), ending in a
-    value % on the same `valueClass` scale (the hero shows only the fee, no %). A plan bound to several CLIs shows
-    its whole share on each of their cards; the fee is not split, since there's
-    no meaningful way to attribute it.
-  - Token counts go through `fmtCount()` (i18n.js), which switches counting
-    systems with the language: 万 / 千万 / 亿 in Chinese, K / M / B in English.
-    "250.67M" is not a number a Chinese reader parses at a glance. The hero line
-    shows tokens plus the scope-prorated subscription fee only — no estimated
-    cost, no value % (the per-card rows carry the comparison).
-  - Every live window is ONE row — label · headroom bar · % · countdown chip.
-    What the window actually spent (tokens/cost, filled by `mergeLiveLimits`)
-    lives in the bar's `title`, not on screen: a line per window was the widest
-    element in a 380px card and shoved the layout around.
-  - The scope tab labels use `scope.day/week/month`, NOT `common.month` — that
-    key already means "个月" (a count of months, used by the report), and since
-    `i18n.js` is one flat object literal a duplicate key silently wins.
-  - Each card carries its plan's **live quota** (`QuotaBig`, fed by
-    `window.api.subsResets()`); windows still on an *estimate* are not drawn at all.
-    Per live window: a headroom bar on a green→red scale (`levelColor`, deliberately
-    unrelated to the CLI brand colors — it means "how much is left", never "which
-    tool"), a countdown chip whose clock (`ClockIcon`/`pieSlice`) is a dial draining
-    with the time remaining, and a **value line** — tokens spent inside that window,
-    what they'd cost pay-as-you-go, and the slice of the monthly fee covering the
-    same span (`proratedFee`, prorated off the real billing-month length from
-    `renewal.periodMs`), ending in a value % (`valueClass`: ≥100% green, ≥50% amber,
-    else red). The window's tokens/cost come from `mergeLiveLimits` filling the
-    live window's own `[end - periodMs, end)` span, so the numbers and the bar
-    above them always describe the same period.
-  - The billing row below (shown only when `monthlyUsd > 0`) is the **other**,
-    unrelated clock: renewal countdown + fee, with the current cycle's usage worth
-    and value % from `renewal.{cost,tokens}`. Quota and billing must never read as
-    the same thing.
-  - Refetched on each **snapshot** (usage is the only thing besides time that moves
-    a window) rather than polled, so a hidden popup stays quiet; a 30s `setInterval`
+    and their `*PerModel` twins). Calendar, not rolling, so a scope matches the cycle
+    a plan's quota resets on — see `store.snapshot()` above. There is no "all-time"
+    tab; that view is the report window's job. The labels use `scope.day/week/month`,
+    NOT `common.month` — that key already means "个月" (a count of months, used by the
+    report), and since `i18n.js` is one flat object literal a duplicate key silently
+    wins.
+  - **Hero line**: token total + the active plans' fee **prorated to the selected
+    scope** — nothing else. No estimated cost, no ratio; the cards carry the
+    comparison.
+  - **Value ratio** (`SCOPE_DIV`: month = the fee, week = fee/4, day = fee/28 — a
+    month treated as 4×7 days, so the two divisors agree): each plan-bound card shows
+    that CLI's usage cost in the scope against its plan's share of the fee for the
+    same span, ending in a value % (`valueClass`: ≥100% green, ≥50% amber, else red).
+    A plan bound to several CLIs shows its whole share on each of their cards; the fee
+    is not split, since there's no meaningful way to attribute it.
+  - Token counts go through `fmtCount()` (i18n.js), which switches counting systems
+    with the language: 万 / 千万 / 亿 in Chinese, K / M / B in English. "250.67M" is
+    not a number a Chinese reader parses at a glance.
+  - **Live quota** (`QuotaBig`, fed by `window.api.subsResets()`): windows still on an
+    *estimate* are not drawn at all. Every live window is ONE row — period label, a
+    headroom bar on a green→red scale (`levelColor`, deliberately unrelated to the CLI
+    brand colors: a bar's color means "how much is left", never "which tool"), its %,
+    and a countdown chip whose clock (`ClockIcon`/`pieSlice`) is a dial draining with
+    the time remaining. What the window actually spent (tokens/cost, filled by
+    `mergeLiveLimits` over the window's own `[end - periodMs, end)` span) lives in the
+    bar's `title`, not on screen — a line per window was the widest element in a 380px
+    card and shoved the layout around.
+  - The **billing row** below (only when `monthlyUsd > 0`) is the *other*, unrelated
+    clock: renewal countdown + fee, plus the current cycle's usage worth and value %
+    from `renewal.{cost,tokens}`. Quota and billing must never read as the same thing.
+  - Refetched on each **snapshot** (usage is the only thing besides time that moves a
+    window) rather than polled, so a hidden popup stays quiet; a 30s `setInterval`
     re-renders countdowns, and remaining time is derived locally from each window's
-    `end` so an expiry mid-tick needs no IPC round-trip. Space is the constraint at
-    380px wide — exact turns and wall-clock reset/bill times live in `title`
-    tooltips. Header, tabs and footer are pinned; the middle sits in a `.scroll`
-    region (`flex:1; min-height:0; overflow-y:auto`) so content is never clipped
-    when the window is shorter than the content — which is what makes the
-    height-capping in `index.js` safe.
+    `end` so an expiry mid-tick needs no IPC round-trip. Header, tabs and footer are
+    pinned; the middle sits in a `.scroll` region (`flex:1; min-height:0;
+    overflow-y:auto`) so content is never clipped when the window is shorter than the
+    content — which is what makes the height-capping in `index.js` safe.
 - **`Report.jsx`** (`#report`) — the "Token Report" window. Pulls hourly/daily/model
   data from the SQLite DB via IPC and draws hand-rolled **SVG stacked-bar charts** (no
   chart lib): by-hour for a chosen day, daily trend over a range (7d/30d/all),

@@ -13,35 +13,49 @@ local file; see [Cursor usage](#cursor-usage-the-one-network-exception) and
 
 ```
 System tray:  [▮ AI] ◄ click
-        ┌─────────────────────────┐
-        │ Today   1.2M tokens     │
-        │ Claude    820K ▆▆▆▆▆     │
-        │ Codex     310K ▆▆        │
-        │ Gemini     70K ▁         │
-        │ ─────────────────────── │
-        │ ● live: opus-4.8 · 12s  │
-        └─────────────────────────┘
+        ┌────────────────────────────────────────┐
+        │ TokenStats            [Day|Week|Month] │
+        │ 250.67M tokens        plan day share $9│
+        │ ┌────────────────────────────────────┐ │
+        │ │ ● Claude Code  Claude Max   82.1M  │ │
+        │ │   plan day share $4.46      9712%  │ │
+        │ │   5h  ▆▆▆▆▆▆▁▁▁▁ 61%     ◷ 3h 12m  │ │
+        │ │   wk  ▆▆▆▆▁▁▁▁▁▁ 38%     ◷ Jul 29  │ │
+        │ │   ▤ renews 13d · $125.00/mo  3077% │ │
+        │ └────────────────────────────────────┘ │
+        │ ● live: opus-4.8 · 12s ago             │
+        └────────────────────────────────────────┘
 ```
 
 ## Features
 
-- 🟢 **Tray icon + popup** — click the icon to see today / all-time tokens, broken down
-  by CLI with bars, top models, and recent sessions.
+- 🟢 **Tray icon + popup** — click the icon for a **Day / Week / Month** breakdown, one
+  card per CLI with its top models. The scopes are **calendar-aligned** (since midnight
+  / since Monday / since the 1st) so they line up with the cycles a subscription's
+  quota actually resets on.
 - ⚡ **Live** — watches `~/.claude`, `~/.codex`, `~/.gemini`, `~/.gemini/antigravity-cli`
   and updates within a second of each turn (via file watching, debounced).
 - 💲 **Cost estimates** — rough USD figures from an editable price table (`pricing.js`).
 - 🎨 Tray icon recolors to the most recently active CLI.
 - 📊 **Usage report** — a full window with **hour-by-hour** and daily charts, per-model
   breakdown, and a one-click **Export PNG**. Backed by a local **SQLite** database
-  (`~/.TokenStats/usage.sqlite`) that records usage at hourly granularity per model.
+  (`~/.tokenstats/usage.sqlite`) that records usage at hourly granularity per model.
 - 💳 **Subscription plans & live quota windows** — enter your monthly plans (Claude,
-  ChatGPT, Google AI, Cursor, a LiteLLM token plan…) to compare what you pay against
-  what your usage is actually worth, and see each plan's **remaining quota + reset
-  countdown** in the popup. Where a tool reports its own quota this shows **live** —
-  Claude, Codex, Cursor, and **Antigravity** (see [Antigravity live quota](#antigravity-live-quota)) —
-  otherwise it's an estimate. The active plans' total **$/mo** shows top-right of the popup.
+  ChatGPT, Google AI, Cursor, a LiteLLM token plan…) and each plan's card shows its
+  **remaining quota + reset countdown** per window (5h / weekly / monthly). Where a
+  tool reports its own quota this is **live** — Claude, Codex, Cursor, and
+  **Antigravity** (see [Antigravity live quota](#antigravity-live-quota)) — otherwise
+  it's an estimate. Hover a quota bar for the tokens and cost actually spent inside
+  that window.
+- 📈 **Is the plan worth it?** — a monthly fee is compared against what the same usage
+  would have cost pay-as-you-go, **prorated to whatever scope you're looking at**
+  (month = the fee, week = fee ÷ 4, day = fee ÷ 28). Each card shows that ratio for
+  its plan, the billing row shows it for the current billing cycle, and the top line
+  shows all active plans' share for the selected scope. Above 100% the plan is paying
+  for itself.
 - 🌐 **English / 简体中文** — switch the whole UI language in **Settings → App**
-  (amounts stay in USD). The tray menu follows too.
+  (amounts stay in USD). The tray menu follows too, and token counts switch counting
+  systems with it: **万 / 千万 / 亿** in Chinese, K / M / B in English.
 - ⚙️ **LiteLLM Settings** — track any number of self-hosted LiteLLM proxies, each with
   its own name, color, sync frequency, and per-model show/hide + rename. See
   [LiteLLM providers](#litellm-providers) below.
@@ -112,7 +126,7 @@ up as its own independent row everywhere the built-in CLIs do. Unlike every othe
 source here, LiteLLM's admin API reports **actual spend**, not a `pricing.js` estimate.
 
 Provider configuration (including the API key) is stored locally in
-`~/.TokenStats/usage.sqlite`, never sent anywhere except to the proxy you configured.
+`~/.tokenstats/usage.sqlite`, never sent anywhere except to the proxy you configured.
 
 ## Antigravity live quota
 
@@ -125,7 +139,7 @@ command on every render.
 
 Turn it on in **Settings → App → "Track agy quota"**. TokenStats then installs a tiny
 hook into agy's own `settings.json` that mirrors that JSON to
-`~/.TokenStats/agy_status.json`, and shows the **Gemini** weekly quota (remaining % +
+`~/.tokenstats/agy_status.json`, and shows the **Gemini** weekly quota (remaining % +
 reset countdown) as a live **Antigravity** card in the popup. Notes:
 
 - It refreshes **for free whenever you run the `agy` CLI** — no OAuth, no extra network
@@ -140,7 +154,7 @@ Token usage for Claude Code, Codex, Gemini, and Antigravity lives only in each
 device's local files — those CLIs don't expose a per-account usage API to pull from
 the cloud. To include usage from **other machines**, copy that machine's CLI data
 folder over (sync drive, network share, or manual copy) and point TokenStats at it.
-Right-click the tray → **Edit data sources…**, or edit `~/.TokenStats/config.json`:
+Right-click the tray → **Edit data sources…**, or edit `~/.tokenstats/config.json`:
 
 ```json
 {
@@ -170,13 +184,25 @@ the same account just re-fetches identical data (harmless, but redundant).
 npm install
 npm run dev            # launch with hot reload
 npm run test:parsers   # parse your real local data and print totals (no GUI)
+npm run test:db        # ingest into a temp SQLite db and run the report queries
 ```
+
+Quit the installed TokenStats from the tray before `npm run dev` — both share one
+`userData` directory, so they share the single-instance lock and dev would exit while
+the *installed* window pops up instead.
 
 ## Build a Windows installer
 
 ```bash
-npm run package        # -> dist/  (NSIS .exe installer)
+npm run release                 # bump patch, build, NSIS installer, silent reinstall, relaunch
+npm run release -- -NoInstall   # same, but stop after writing dist/TokenStats-Setup-*.exe
+npm run package                 # unpacked build in dist/win-unpacked (debug aid, NOT an installer)
 ```
+
+`npm run release` refuses to run on a dirty tree and tags the commit it builds, so every
+installer maps to exactly one commit. `dev`/`build` only refresh `out/` — they never
+touch the installed copy Windows autostarts. The running version and its **build time**
+are shown in the tray tooltip and the popup/report footers.
 
 ## Notes
 
