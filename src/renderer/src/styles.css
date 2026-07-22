@@ -92,6 +92,13 @@ header {
 /* Active-subscription monthly total, pinned to the top-right of the hero row. */
 .sum .mo { margin-left: auto; color: var(--muted); font-size: 11px; font-variant-numeric: tabular-nums; }
 .sum .mo b { color: var(--text); font-weight: 700; }
+.sum .mo em { font-style: normal; font-weight: 700; margin-left: 5px; }
+
+/* per-card: this scope's usage against the plan's fee for the same span */
+.scoperate { display: flex; align-items: baseline; gap: 4px; margin-top: 7px;
+  font-size: 10.5px; color: var(--faint); font-variant-numeric: tabular-nums; }
+.scoperate b { color: var(--muted); font-weight: 600; }
+.scoperate em { margin-left: auto; }
 
 .cards { display: flex; flex-direction: column; gap: 7px; padding: 2px 10px 10px; }
 /* Each card is washed with its own accent so warm (Claude) vs cool (Codex) read

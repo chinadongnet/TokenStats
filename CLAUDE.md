@@ -440,6 +440,16 @@ React + Vite, three views selected by URL hash in `main.jsx`:
     and their `*PerModel` twins). Calendar, not rolling, so a scope matches the
     cycle a plan's quota resets on — see `store.snapshot()` above. There is no
     "all-time" tab; that view is the report window's job.
+  - Both the hero badge and every plan-bound card compare the scope's usage cost
+    against the subscription fee **prorated to that same span** (`SCOPE_DIV`:
+    month = the fee, week = fee/4, day = fee/28 — a month is treated as 4×7 days
+    so the week and day divisors stay consistent with each other), ending in a
+    value % on the same `valueClass` scale. A plan bound to several CLIs shows
+    its whole share on each of their cards; the fee is not split, since there's
+    no meaningful way to attribute it.
+  - The scope tab labels use `scope.day/week/month`, NOT `common.month` — that
+    key already means "个月" (a count of months, used by the report), and since
+    `i18n.js` is one flat object literal a duplicate key silently wins.
   - Each card carries its plan's **live quota** (`QuotaBig`, fed by
     `window.api.subsResets()`); windows still on an *estimate* are not drawn at all.
     Per live window: a headroom bar on a green→red scale (`levelColor`, deliberately

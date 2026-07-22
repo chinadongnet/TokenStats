@@ -122,6 +122,14 @@ function levelColor(frac) {
   return `hsl(${Math.round(h)} 72% 47%)`
 }
 
+// A subscription is billed monthly, so comparing it against a day's or a week's
+// usage means splitting the fee over the same span. A month is treated as 4
+// weeks of 7 days — so week = fee/4 and day = fee/28 stay consistent with each
+// other (a "/30 day" against a "/4 week" would not add up).
+const SCOPE_DIV = { day: 28, week: 4, month: 1 }
+const scopeFee = (monthlyUsd, scope) => (Number(monthlyUsd) || 0) / SCOPE_DIV[scope]
+const scopeLabel = (scope) => t('scope.' + scope)
+
 const MONTH_MS = 30 * 86400000
 // What the plan's monthly fee works out to over one quota window — the fee is
 // billed monthly, the window is 5h/weekly/monthly, so it has to be prorated
@@ -350,9 +358,9 @@ export default function App() {
           {/* Calendar-aligned scopes (day / week / month), so what a card shows
               lines up with the cycles a subscription is actually counted in. */}
           <div className="seg">
-            <button className={scope === 'day' ? 'on' : ''} title={t('app.scopeDay')} onClick={() => setScope('day')}>{t('common.day')}</button>
-            <button className={scope === 'week' ? 'on' : ''} title={t('app.scopeWeek')} onClick={() => setScope('week')}>{t('common.week')}</button>
-            <button className={scope === 'month' ? 'on' : ''} title={t('app.scopeMonth')} onClick={() => setScope('month')}>{t('common.month')}</button>
+            <button className={scope === 'day' ? 'on' : ''} title={t('app.scopeDay')} onClick={() => setScope('day')}>{t('scope.day')}</button>
+            <button className={scope === 'week' ? 'on' : ''} title={t('app.scopeWeek')} onClick={() => setScope('week')}>{t('scope.week')}</button>
+            <button className={scope === 'month' ? 'on' : ''} title={t('app.scopeMonth')} onClick={() => setScope('month')}>{t('scope.month')}</button>
           </div>
           <button className="ghost" title={t('app.reportTitle')} onClick={() => window.api.openReport()}>▤</button>
           <button className="ghost" title={t('app.settingsTitle')} onClick={() => window.api.openSettings()}>⚙</button>
@@ -376,9 +384,25 @@ export default function App() {
           <b>{compact(totalTok)}</b>
           <span className="u">{t('common.tokens')}</span>
           <span className="c">${usd(totalCost)} {t('common.est')}</span>
+          {/* The subscription side of the same scope: what all active plans cost
+              over the selected span (monthly fee ÷ 4 for a week, ÷ 28 for a day),
+              and what this scope's usage is worth against it. */}
           {monthlyTotal > 0 && (
-            <span className="mo" title={t('app.subsTip')}>
-              {t('app.subsPerMo')} <b>${usd(monthlyTotal)}</b>{t('app.perMo')}
+            <span
+              className="mo"
+              title={t('app.scopeRateTip', {
+                scope: scopeLabel(scope),
+                cost: usd(totalCost),
+                fee: usd(scopeFee(monthlyTotal, scope)),
+                usd: usd(monthlyTotal),
+                div: SCOPE_DIV[scope],
+                pct: Math.round((totalCost / scopeFee(monthlyTotal, scope)) * 100),
+              })}
+            >
+              {t('app.scopeFee', { scope: scopeLabel(scope) })} <b>${usd(scopeFee(monthlyTotal, scope))}</b>
+              <em className={valueClass((totalCost / scopeFee(monthlyTotal, scope)) * 100)}>
+                {Math.round((totalCost / scopeFee(monthlyTotal, scope)) * 100)}%
+              </em>
             </span>
           )}
         </div>
@@ -415,6 +439,30 @@ export default function App() {
                     <span className="pc">${usd(d.cost)}</span>
                   </span>
                 </div>
+                {/* This CLI's usage in the selected scope against the covering
+                    plan's fee for the SAME span. A plan bound to several CLIs
+                    shows its full share on each of their cards — the fee is not
+                    split, since there's no meaningful way to attribute it. */}
+                {plan && plan.monthlyUsd > 0 && (() => {
+                  const fee = scopeFee(plan.monthlyUsd, scope)
+                  const pct = (d.cost / fee) * 100
+                  return (
+                    <div
+                      className="scoperate"
+                      title={t('app.scopeRateTip', {
+                        scope: scopeLabel(scope),
+                        cost: usd(d.cost),
+                        fee: usd(fee),
+                        usd: usd(plan.monthlyUsd),
+                        div: SCOPE_DIV[scope],
+                        pct: Math.round(pct),
+                      })}
+                    >
+                      {t('app.scopeFee', { scope: scopeLabel(scope) })} <b>${usd(fee)}</b>
+                      <em className={valueClass(pct)}>{Math.round(pct)}%</em>
+                    </div>
+                  )
+                })()}
                 {live && <QuotaBig plan={plan} now={now} color={meta.color} />}
                 {ms.length > 0 && <ModelBar models={ms} color={meta.color} />}
               </div>
