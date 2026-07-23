@@ -68,7 +68,8 @@ the process stays alive and stderr is empty, then kill it.
 - `npm run dev` and `npm run build` only refresh `out/`. The tray icon you see after a
   reboot is the **installed** copy at `%LOCALAPPDATA%\Programs\tokenstats\TokenStats.exe`,
   which is replaced only by running the NSIS installer. **`npm run release` is the only
-  thing that closes that loop.** There is no auto-update.
+  thing that closes that loop.** Nothing updates in the background — the in-app
+  updater below only ever runs when the user clicks it.
 - **Quit the installed TokenStats from the tray before `npm run dev`.** Dev and the
   installed build share `userData` (`%APPDATA%\tokenstats` — package.json `name` is
   `tokenstats` and `productName` lives only under the `build` key, so `app.getName()`
@@ -81,6 +82,23 @@ the process stays alive and stderr is empty, then kill it.
   bumping, so two different builds routinely share one version number.
 - `release.ps1` refuses to run on a dirty tree and auto-bumps the patch version, so every
   installer maps to one tagged commit. Don't build installers any other way.
+- **GitHub releases are the distribution channel.** `release.ps1` pushes the commit +
+  tag and runs `gh release create v<ver> dist\TokenStats-Setup-<ver>-<stamp>.exe`
+  (skip with `-NoPublish`; `-NoBump` skips it too, since there'd be no new tag). It
+  needs an authenticated `gh` CLI. A version that isn't published is **invisible to
+  every other install** — `src/main/updater.js` reads
+  `api.github.com/repos/chinadongnet/TokenStats/releases/latest` and compares
+  `tag_name` to `__APP_VERSION__`, so an unpublished bump makes real installs report
+  "up to date" forever.
+- **In-app updater** — `src/main/updater.js` + the `update:*` IPC in `index.js` +
+  `UpdateRow` in `Settings.jsx` (Settings → App). Three explicit user-driven steps:
+  check (`releases/latest`), download the release's `.exe` asset to
+  `%TEMP%\tokenstats-update` (progress pushed over `update:progress`), then install —
+  which spawns it detached with `/S` and quits the app 300ms later. NSIS can't
+  overwrite a running `TokenStats.exe`, and `runAfterFinish` brings the new version
+  back up. Hand-rolled rather than electron-updater: unsigned per-user NSIS, no
+  `latest.yml` feed to maintain. The install button is hidden unless `app.isPackaged`
+  — a dev build runs from `out/` and the installer would replace a *different* copy.
 
 ## Architecture
 

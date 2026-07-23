@@ -14,6 +14,7 @@ import { migrateLegacyLitellmConfig } from './core/migrateLitellm.js'
 import { isAutoLaunch, setAutoLaunch, migrateLegacyRunKeys } from './autoLaunch.js'
 import { agyResetWindows, getAgyQuotaState, enableAgyQuota, disableAgyQuota, ensureAgyHook, AGY_MIRROR_PATH } from './agyQuota.js'
 import { makeTrayIcon } from './trayIcon.js'
+import { checkForUpdate, downloadUpdate, launchInstaller, UPDATE_REPO, RELEASES_URL } from './updater.js'
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url))
 
@@ -35,6 +36,10 @@ let ingestTimer = null
 // in sync by refreshLitellmPollers() — used wherever a static CLI_META lookup
 // alone wouldn't know about a dynamic provider (tray recolor, open-data-dir).
 let dynamicCliMeta = {}
+// Installer downloaded by the Settings updater, waiting for the user to confirm
+// the (app-quitting) install. Cleared only by restarting — a stale path is
+// re-validated by launchInstaller().
+let pendingInstaller = null
 // UI language for the native tray menu/tooltip. The renderer owns its own copy
 // (localStorage); this mirror is updated by the 'set-language' IPC and read when
 // the tray context menu is (re)built on each right-click.
@@ -157,6 +162,43 @@ async function init() {
     broadcastSnapshot()
     return res
   })
+
+  // Updates — GitHub releases are the one distribution channel (see updater.js
+  // and scripts/release.ps1). Check is manual: no background polling, no auto
+  // install, so the app never restarts itself behind the user's back.
+  ipcMain.handle('update:app-info', () => ({
+    version: __APP_VERSION__,
+    buildTime: __BUILD_TIME__,
+    repo: UPDATE_REPO,
+    releasesUrl: RELEASES_URL,
+    // Dev runs from out/ and can't be replaced by the installer.
+    packaged: app.isPackaged,
+  }))
+  ipcMain.handle('update:check', () => checkForUpdate(__APP_VERSION__))
+  ipcMain.handle('update:download', async (e, asset) => {
+    try {
+      const send = (p) => {
+        if (!e.sender.isDestroyed()) e.sender.send('update:progress', p)
+      }
+      pendingInstaller = await downloadUpdate(asset, send)
+      return { ok: true, file: pendingInstaller }
+    } catch (err) {
+      return { ok: false, error: err.message || String(err) }
+    }
+  })
+  // Hands off to NSIS and quits: the installer can't overwrite a running exe,
+  // and `runAfterFinish` starts the new version once it's done.
+  ipcMain.handle('update:install', () => {
+    try {
+      launchInstaller(pendingInstaller)
+    } catch (err) {
+      return { ok: false, error: err.message || String(err) }
+    }
+    app.isQuitting = true
+    setTimeout(() => app.quit(), 300)
+    return { ok: true }
+  })
+  ipcMain.handle('update:open-releases', (_e, url) => shell.openExternal(url || RELEASES_URL))
 
   // Report data queries (served from the SQLite hourly table).
   ipcMain.handle('report:hourly', (_e, dayStartMs) => db?.hourly(dayStartMs) ?? [])

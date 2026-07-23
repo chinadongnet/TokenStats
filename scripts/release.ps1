@@ -1,16 +1,22 @@
 # TokenStats release pipeline. This is the ONLY way to build an installer.
-#   npm run release               -> bump, build, package, reinstall, relaunch
-#   npm run release -- -NoInstall -> bump + build the dated installer into dist/
-#   npm run release -- -NoBump    -> rebuild the current version (no bump/commit/tag)
+#   npm run release                -> bump, build, package, publish to GitHub, reinstall, relaunch
+#   npm run release -- -NoInstall  -> everything except the local reinstall
+#   npm run release -- -NoBump     -> rebuild the current version (no bump/commit/tag/publish)
+#   npm run release -- -NoPublish  -> keep it local (no push, no GitHub release)
 #
 # `npm run dev`/`npm run build` only refresh out/. The app Windows autostarts is
 # the INSTALLED copy in %LOCALAPPDATA%\Programs\tokenstats, which only the NSIS
-# installer replaces — this script is what closes that loop. There is no auto-update.
+# installer replaces — this script is what closes that loop.
+#
+# The GitHub release is also the app's UPDATE CHANNEL: Settings → App reads
+# /releases/latest and installs its .exe asset (src/main/updater.js). So a version
+# that never gets published here is invisible to every other install — publish is
+# on by default for exactly that reason.
 #
 # Each run stamps the build with a date-time so you can confirm in the app
 # (tray tooltip / popup footer / report footer) that the latest is running.
 
-param([switch]$NoInstall, [switch]$NoBump)
+param([switch]$NoInstall, [switch]$NoBump, [switch]$NoPublish)
 $ErrorActionPreference = 'Stop'
 $root = Split-Path $PSScriptRoot -Parent
 Set-Location $root
@@ -53,6 +59,25 @@ if (-not $NoBump) {
   git commit -am "Release v$ver" | Out-Null
   git tag "v$ver"
   Write-Host "Tagged v$ver" -ForegroundColor Green
+}
+
+# 7) publish to GitHub — the channel the in-app updater checks. Requires the gh
+# CLI (already authenticated); a failure here must not silently pass, or installs
+# in the wild would keep reporting "up to date" against a stale release.
+if (-not $NoBump -and -not $NoPublish) {
+  if (-not (Get-Command gh -ErrorAction SilentlyContinue)) {
+    throw 'gh CLI not found — install it (winget install GitHub.cli) or rerun with -NoPublish.'
+  }
+  Write-Host 'Publishing GitHub release…' -ForegroundColor Cyan
+  git push origin HEAD
+  git push origin "v$ver"
+  # Notes = the commits since the previous tag; the updater shows them verbatim.
+  $prev = git describe --tags --abbrev=0 "v$ver^" 2>$null
+  $log = if ($prev) { git log --pretty=format:'- %s' "$prev..v$ver" } else { git log --pretty=format:'- %s' -20 }
+  $notes = "Built $builtAt`n`n$($log -join "`n")"
+  gh release create "v$ver" (Join-Path 'dist' $dated) --title "TokenStats v$ver" --notes $notes
+  if ($LASTEXITCODE -ne 0) { throw "gh release create failed for v$ver" }
+  Write-Host "Published: https://github.com/chinadongnet/TokenStats/releases/tag/v$ver" -ForegroundColor Green
 }
 
 if ($NoInstall) { Write-Host 'Skipped install (-NoInstall).' -ForegroundColor Yellow; return }

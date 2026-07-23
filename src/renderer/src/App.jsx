@@ -127,6 +127,36 @@ const SCOPE_DIV = { day: 28, week: 4, month: 1 }
 const scopeFee = (monthlyUsd, scope) => (Number(monthlyUsd) || 0) / SCOPE_DIV[scope]
 const scopeLabel = (scope) => t('scope.' + scope)
 
+// "M/D - M/D" over [start, end) — end is exclusive everywhere in subscriptions.js,
+// so the last covered day is end-1ms.
+const md = (ms) => {
+  const d = new Date(ms)
+  return `${d.getMonth() + 1}/${d.getDate()}`
+}
+const spanText = (start, end) => `${md(start)} - ${md(end - 1)}`
+
+// The week/month period THIS plan actually runs on — every plan is anchored
+// differently, so there is no global range to show. Month uses the plan's own
+// billing cycle (that's what the fee on this line is), week its weekly quota
+// window; a plan that declares neither falls back to the calendar scope the
+// numbers on the card are bucketed by.
+const planSpan = (scope, plan, ranges) => {
+  if (scope === 'day') return ''
+  const w = (plan?.windows || []).find(
+    (x) => x.period === (scope === 'week' ? 'weekly' : 'monthly') && x.open && x.start != null,
+  )
+  const own = scope === 'month' ? plan?.renewal || w : w
+  if (own && own.start != null && own.end != null) return spanText(own.start, own.end)
+  if (!ranges) return ''
+  if (scope === 'week') {
+    if (!ranges.weekStart) return ''
+    return spanText(ranges.weekStart, ranges.weekStart + 7 * 864e5)
+  }
+  if (!ranges.monthStart) return ''
+  const s = new Date(ranges.monthStart)
+  return spanText(ranges.monthStart, new Date(s.getFullYear(), s.getMonth() + 1, 1).getTime())
+}
+
 // Above 100% the window's usage is worth more than its slice of the fee — the
 // plan is paying off. Below, it isn't (yet).
 const valueClass = (pct) => (pct >= 100 ? 'good' : pct >= 50 ? 'ok' : 'bad')
@@ -405,6 +435,7 @@ export default function App() {
                 {plan && plan.monthlyUsd > 0 && (() => {
                   const fee = scopeFee(plan.monthlyUsd, scope)
                   const pct = (d.cost / fee) * 100
+                  const span = planSpan(scope, plan, snap.ranges)
                   return (
                     <div
                       className="scoperate"
@@ -418,6 +449,7 @@ export default function App() {
                       })}
                     >
                       {t('app.scopeFee', { scope: scopeLabel(scope) })} <b>${usd(fee)}</b>
+                      {span && <span className="span">({span})</span>}
                       <em className={valueClass(pct)}>{Math.round(pct)}%</em>
                     </div>
                   )

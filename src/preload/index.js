@@ -25,6 +25,18 @@ contextBridge.exposeInMainWorld('api', {
     return () => ipcRenderer.removeListener('language', handler)
   },
 
+  // updates — version info + the GitHub-release check/download/install flow
+  updateAppInfo: () => ipcRenderer.invoke('update:app-info'),
+  updateCheck: () => ipcRenderer.invoke('update:check'),
+  updateDownload: (asset) => ipcRenderer.invoke('update:download', asset),
+  updateInstall: () => ipcRenderer.invoke('update:install'),
+  updateOpenReleases: (url) => ipcRenderer.invoke('update:open-releases', url),
+  onUpdateProgress: (cb) => {
+    const handler = (_e, p) => cb(p)
+    ipcRenderer.on('update:progress', handler)
+    return () => ipcRenderer.removeListener('update:progress', handler)
+  },
+
   // Antigravity (agy) live-quota integration toggle
   agyGetState: () => ipcRenderer.invoke('agy:get-state'),
   agySetEnabled: (on) => ipcRenderer.invoke('agy:set-enabled', on),

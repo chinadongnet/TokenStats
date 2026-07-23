@@ -98,6 +98,8 @@ header {
 .scoperate { display: flex; align-items: baseline; gap: 4px; margin-top: 7px;
   font-size: 10.5px; color: var(--faint); font-variant-numeric: tabular-nums; }
 .scoperate b { color: var(--muted); font-weight: 600; }
+/* The plan's own week/month period — every plan is anchored differently. */
+.scoperate .span { color: var(--faint); }
 .scoperate em { margin-left: auto; }
 
 .cards { display: flex; flex-direction: column; gap: 7px; padding: 2px 10px 10px; }
@@ -266,6 +268,15 @@ footer {
 .field-row .field { flex: 1; min-width: 140px; }
 .field-row .field.grow { flex: 2; min-width: 220px; }
 .field-row .field.shrink { flex: none; width: 100px; }
+
+/* --- settings: GitHub update flow --- */
+.upbar { height: 5px; border-radius: 3px; background: var(--panel2); overflow: hidden; max-width: 320px; }
+.upbar i { display: block; height: 100%; background: var(--accent); transition: width .15s linear; }
+.relnotes {
+  margin: 6px 0 0; padding: 8px 10px; max-height: 160px; overflow: auto;
+  background: var(--panel2); border: 1px solid var(--line); border-radius: 8px;
+  color: var(--muted); font-size: 11px; line-height: 1.5; white-space: pre-wrap; font-family: inherit;
+}
 
 .model-row { display: grid; grid-template-columns: 16px 1fr 90px 70px 1fr; align-items: center; gap: 10px; }
 .model-row input[type="text"] {

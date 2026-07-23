@@ -384,6 +384,7 @@ export default function Settings() {
             <div className="muted small" style={{ marginTop: 7 }}>{agyStatus}</div>
           </div>
         </div>
+        <UpdateRow />
       </section>
 
       {/* ---------------- Subscription plans ---------------- */}
@@ -513,6 +514,107 @@ export default function Settings() {
       <footer className="rep-foot">
         {t('set.footer', { ver: __APP_VERSION__ })}
       </footer>
+    </div>
+  )
+}
+
+// Version + the GitHub-release update flow (main/updater.js). Three explicit
+// steps — check, download, install — because installing quits the app; nothing
+// here runs on its own, and no check happens until the user asks for one.
+function UpdateRow() {
+  const [info, setInfo] = useState(null)      // { version, buildTime, repo, releasesUrl, packaged }
+  const [state, setState] = useState('idle')  // idle | checking | checked | downloading | ready
+  const [res, setRes] = useState(null)        // checkForUpdate() result
+  const [pct, setPct] = useState(0)
+  const [error, setError] = useState(null)
+
+  useEffect(() => { window.api.updateAppInfo().then(setInfo) }, [])
+  // Download progress is pushed from main (one event per whole percent).
+  useEffect(() => window.api.onUpdateProgress((p) => setPct(p.pct || 0)), [])
+
+  async function check() {
+    setState('checking')
+    setError(null)
+    setRes(await window.api.updateCheck())
+    setState('checked')
+  }
+
+  async function download() {
+    setState('downloading')
+    setPct(0)
+    setError(null)
+    const r = await window.api.updateDownload(res.asset)
+    if (!r.ok) {
+      setError(t('set.downloadFailed', { error: r.error }))
+      setState('checked')
+      return
+    }
+    setState('ready')
+  }
+
+  async function install() {
+    // On success the app quits from under us, so only the failure path returns.
+    const r = await window.api.updateInstall()
+    if (r && !r.ok) setError(t('set.installFailed', { error: r.error }))
+  }
+
+  const releases = () => window.api.updateOpenReleases(res?.htmlUrl || info?.releasesUrl)
+
+  let status = null
+  if (state === 'checking') status = t('set.checking')
+  else if (error) status = error
+  else if (state === 'ready') status = t('set.installReady')
+  else if (state === 'downloading') status = t('set.downloading', { pct })
+  else if (res?.error) status = t('set.updateCheckFailed', { error: res.error })
+  else if (res && !res.hasUpdate) status = t('set.upToDate', { ver: res.latest })
+  else if (res?.hasUpdate) status = t('set.updateAvailable', { ver: res.latest, cur: res.current })
+  else status = t('set.updateHint', { repo: info?.repo || '' })
+
+  // A dev build lives in out/, not %LOCALAPPDATA%\Programs — the NSIS installer
+  // would replace the installed copy, not this one, so don't offer it.
+  const canInstall = res?.hasUpdate && res.asset && info?.packaged
+
+  return (
+    <div className="field-row" style={{ alignItems: 'flex-start', marginTop: 4 }}>
+      <div className="field shrink" style={{ width: 200 }}>
+        <label>{t('set.version')}</label>
+        <button className="btn" style={{ marginTop: 7 }} onClick={check} disabled={state === 'checking' || state === 'downloading'}>
+          {state === 'checking' ? t('set.checking') : t('set.checkUpdate')}
+        </button>
+      </div>
+      <div className="field grow">
+        <label>&nbsp;</label>
+        <div className="muted small" style={{ marginTop: 7 }}>
+          {t('set.versionLine', { ver: info?.version || __APP_VERSION__, built: info?.buildTime || __BUILD_TIME__ })}
+        </div>
+        <div className="muted small" style={{ marginTop: 4 }}>{status}</div>
+        {res?.hasUpdate && !info?.packaged && (
+          <div className="muted small" style={{ marginTop: 4 }}>{t('set.updateDevBuild')}</div>
+        )}
+        {res?.hasUpdate && !res.asset && (
+          <div className="muted small" style={{ marginTop: 4 }}>{t('set.updateNoAsset')}</div>
+        )}
+        {state === 'downloading' && (
+          <div className="upbar" style={{ marginTop: 6 }}><i style={{ width: `${pct}%` }} /></div>
+        )}
+        {(res?.hasUpdate || res?.error) && (
+          <div style={{ display: 'flex', gap: 8, marginTop: 8, flexWrap: 'wrap' }}>
+            {canInstall && state !== 'ready' && (
+              <button className="btn primary" onClick={download} disabled={state === 'downloading'}>
+                {state === 'downloading' ? t('set.downloading', { pct }) : t('set.download')}
+              </button>
+            )}
+            {state === 'ready' && <button className="btn primary" onClick={install}>{t('set.installNow')}</button>}
+            <button className="btn" onClick={releases}>{t('set.openReleases')}</button>
+          </div>
+        )}
+        {res?.hasUpdate && res.notes && (
+          <details style={{ marginTop: 8 }}>
+            <summary className="muted small" style={{ cursor: 'pointer' }}>{t('set.releaseNotes')}</summary>
+            <pre className="relnotes">{res.notes}</pre>
+          </details>
+        )}
+      </div>
     </div>
   )
 }
