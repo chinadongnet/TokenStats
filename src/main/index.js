@@ -487,30 +487,37 @@ function openSettings() {
 }
 
 // Screenshot a window as PNG, then either save it to disk or copy it to the
-// clipboard. `fullHeight` grows the window to fit its whole page first (used
-// by the report, whose content extends past the viewport); the tray popup is
-// captured as-is since its overflow lives in an inner scroll region.
+// clipboard. Both windows scroll their content in an inner region (body is
+// overflow:hidden), so a plain capture would clip everything below the fold —
+// the popup's off-screen model cards, the report's lower charts. So we grow the
+// window to fit its full content first, capped to the display, then restore.
 async function exportPng({ which = 'report', mode = 'save' } = {}) {
   const targetWin = which === 'popup' ? win : reportWin
   if (!targetWin || targetWin.isDestroyed()) return { ok: false }
   const isPopup = which === 'popup'
   let restore = null
+  // Hold off the blur-hide for the WHOLE popup export: growing the window and
+  // capturing must not let the always-on-top popup vanish out from under us.
+  if (isPopup) popupExporting = true
   try {
-    if (!isPopup) {
-      // Grow the window to fit its full content so the screenshot isn't clipped.
-      // The .report container scrolls internally (body is overflow:hidden), so
-      // its scrollHeight — not body's — carries the true content height.
-      const h = await targetWin.webContents.executeJavaScript(
-        "Math.max(document.body.scrollHeight, document.querySelector('.report')?.scrollHeight ?? 0)"
-      )
-      const bounds = targetWin.getBounds()
-      const display = screen.getDisplayMatching(bounds)
-      const target = Math.min(Math.ceil(h) + 8, display.workArea.height)
-      if (target > bounds.height) {
-        restore = bounds
-        targetWin.setBounds({ ...bounds, height: target })
-        await new Promise((r) => setTimeout(r, 250))
-      }
+    // Extra height needed to reveal everything currently scrolled out of view.
+    // The popup's overflow lives in `.scroll` (header/footer pinned), so its
+    // hidden overflow is what to add; the report scrolls `.report` as a whole.
+    const extra = await targetWin.webContents.executeJavaScript(
+      isPopup
+        ? "(() => { const e = document.querySelector('.scroll'); return e ? e.scrollHeight - e.clientHeight : 0 })()"
+        : "Math.max(0, (document.querySelector('.report')?.scrollHeight ?? document.body.scrollHeight) - document.documentElement.clientHeight)"
+    )
+    const bounds = targetWin.getBounds()
+    const display = screen.getDisplayMatching(bounds)
+    const target = Math.min(bounds.height + Math.ceil(extra) + (isPopup ? 0 : 8), display.workArea.height)
+    if (target > bounds.height + 1) {
+      restore = bounds
+      // The popup is created non-resizable, which makes setBounds a no-op on
+      // Windows — flip it on for the duration of the capture, then back.
+      if (isPopup) targetWin.setResizable(true)
+      targetWin.setBounds({ ...bounds, height: target })
+      await new Promise((r) => setTimeout(r, isPopup ? 120 : 250))
     }
     const img = await targetWin.webContents.capturePage()
     if (mode === 'copy') {
@@ -521,25 +528,22 @@ async function exportPng({ which = 'report', mode = 'save' } = {}) {
       app.getPath('pictures'),
       `tokenstats-${which}-${new Date().toISOString().slice(0, 19).replace(/[:T]/g, '-')}.png`
     )
-    if (isPopup) popupExporting = true
-    try {
-      const { canceled, filePath } = await dialog.showSaveDialog(targetWin, {
-        title: 'Export screenshot as PNG',
-        defaultPath,
-        filters: [{ name: 'PNG image', extensions: ['png'] }],
-      })
-      if (canceled || !filePath) return { ok: false }
-      fs.writeFileSync(filePath, img.toPNG())
-      shell.showItemInFolder(filePath)
-      return { ok: true, filePath }
-    } finally {
-      if (isPopup) popupExporting = false
-    }
+    const { canceled, filePath } = await dialog.showSaveDialog(targetWin, {
+      title: 'Export screenshot as PNG',
+      defaultPath,
+      filters: [{ name: 'PNG image', extensions: ['png'] }],
+    })
+    if (canceled || !filePath) return { ok: false }
+    fs.writeFileSync(filePath, img.toPNG())
+    shell.showItemInFolder(filePath)
+    return { ok: true, filePath }
   } catch (e) {
     console.error('export png failed:', e)
     return { ok: false, error: String(e) }
   } finally {
     if (restore) targetWin.setBounds(restore)
+    if (isPopup && restore) targetWin.setResizable(false)
+    if (isPopup) popupExporting = false
   }
 }
 

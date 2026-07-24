@@ -41,10 +41,11 @@ header {
 .drag { -webkit-app-region: drag; }
 .hwin, button { -webkit-app-region: no-drag; }
 .brand { display: flex; align-items: center; gap: 8px; font-weight: 600; }
-/* popup header controls: keep the Today/All toggle + icon buttons compact so
-   they fit beside the brand at 380px. */
-.hwin { display: flex; align-items: center; gap: 3px; }
-.hwin .seg { margin-right: 3px; }
+/* popup header controls: the scope toggle + a row of equal-size icon buttons,
+   kept compact so they fit beside the brand at 380px. */
+.hwin { display: flex; align-items: center; gap: 2px; }
+/* Hairline divider between the scope segment and the icon toolbar. */
+.hwin .seg { margin-right: 6px; padding-right: 0; }
 .hwin .seg button { padding: 4px 9px; font-size: 11px; }
 .logo {
   width: 16px; height: 16px; border-radius: 5px;
@@ -55,11 +56,20 @@ header {
   cursor: pointer; font-size: 15px; padding: 2px 7px; border-radius: 6px;
 }
 .ghost:hover { background: var(--panel2); color: var(--text); }
+/* Uniform 28px square icon buttons so the whole toolbar aligns to one grid. */
+.ghost.ico {
+  display: inline-flex; align-items: center; justify-content: center;
+  width: 28px; height: 28px; padding: 0; color: var(--muted);
+  transition: background .12s ease, color .12s ease;
+}
+.ghost.ico svg { width: 17px; height: 17px; display: block; }
+.ghost.ico:hover { background: var(--panel2); color: var(--text); }
+.ghost.ico.on { background: var(--panel2); color: var(--accent); }
 
 /* Screenshot button dropdown (copy / save) in the popup header. */
-.shot { position: relative; display: inline-block; }
+.shot { position: relative; display: inline-flex; }
 .shot-menu {
-  position: absolute; top: 26px; right: 0; z-index: 10;
+  position: absolute; top: 32px; right: 0; z-index: 10;
   background: var(--panel2); border: 1px solid var(--line); border-radius: 8px;
   padding: 4px; display: flex; flex-direction: column; min-width: 150px;
   box-shadow: 0 6px 18px rgba(0, 0, 0, 0.45);
@@ -71,7 +81,7 @@ header {
 }
 .shot-menu button:hover { background: var(--panel); }
 .shot-toast {
-  position: absolute; top: 26px; right: 0; z-index: 10;
+  position: absolute; top: 32px; right: 0; z-index: 10;
   background: var(--panel2); border: 1px solid var(--line); border-radius: 6px;
   padding: 4px 10px; font-size: 12px; color: #7ee0b8; white-space: nowrap;
 }
