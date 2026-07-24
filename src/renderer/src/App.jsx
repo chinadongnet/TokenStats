@@ -110,6 +110,36 @@ const BillIcon = () => (
   </svg>
 )
 
+// Header-toolbar icons — one shared line-icon idiom (24-grid, round caps/joins,
+// currentColor stroke) so every button reads as part of the same set. Sized via
+// the `.ghost svg` rule, not per-icon, so they all align to one box.
+const IconBase = ({ children }) => (
+  <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8"
+    strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">{children}</svg>
+)
+const ReportIcon = () => (
+  <IconBase><path d="M4 20V10M10 20V4M16 20v-7M4 20h16" /></IconBase>
+)
+const SettingsIcon = () => (
+  <IconBase>
+    <circle cx="12" cy="12" r="3" />
+    <path d="M12 2.5v2.2M12 19.3v2.2M4.2 4.2l1.6 1.6M18.2 18.2l1.6 1.6M2.5 12h2.2M19.3 12h2.2M4.2 19.8l1.6-1.6M18.2 5.8l1.6-1.6" />
+  </IconBase>
+)
+// A camera, so the screenshot button reads as "capture" at a glance.
+const CameraIcon = () => (
+  <IconBase>
+    <path d="M4 8h3l1.6-2h6.8L17 8h3a1 1 0 0 1 1 1v9a1 1 0 0 1-1 1H4a1 1 0 0 1-1-1V9a1 1 0 0 1 1-1Z" />
+    <circle cx="12" cy="13" r="3.2" />
+  </IconBase>
+)
+const RefreshIcon = () => (
+  <IconBase><path d="M20 11a8 8 0 1 0-.6 4M20 5v6h-6" /></IconBase>
+)
+const MinimizeIcon = () => (
+  <IconBase><path d="M6 12h12" /></IconBase>
+)
+
 // Dedicated headroom gradient for the quota bars — green (ample) → yellow → red
 // (nearly gone). Its own HSL scale, deliberately unrelated to the CLI accent
 // colors used for the card wash / model segments, so a bar's color always means
@@ -355,10 +385,10 @@ export default function App() {
             <button className={scope === 'week' ? 'on' : ''} title={t('app.scopeWeek')} onClick={() => setScope('week')}>{t('scope.week')}</button>
             <button className={scope === 'month' ? 'on' : ''} title={t('app.scopeMonth')} onClick={() => setScope('month')}>{t('scope.month')}</button>
           </div>
-          <button className="ghost" title={t('app.reportTitle')} onClick={() => window.api.openReport()}>▤</button>
-          <button className="ghost" title={t('app.settingsTitle')} onClick={() => window.api.openSettings()}>⚙</button>
+          <button className="ghost ico" title={t('app.reportTitle')} onClick={() => window.api.openReport()}><ReportIcon /></button>
+          <button className="ghost ico" title={t('app.settingsTitle')} onClick={() => window.api.openSettings()}><SettingsIcon /></button>
           <div className="shot">
-            <button className="ghost" title={t('app.screenshot')} onClick={() => setShotMenu((v) => !v)}>⎙</button>
+            <button className={'ghost ico' + (shotMenu ? ' on' : '')} title={t('app.screenshot')} onClick={() => setShotMenu((v) => !v)}><CameraIcon /></button>
             {shotMenu && (
               <div className="shot-menu">
                 <button onClick={() => screenshot('copy')}>{t('app.copyClipboard')}</button>
@@ -367,8 +397,8 @@ export default function App() {
             )}
             {copied && <div className="shot-toast">{t('app.copied')}</div>}
           </div>
-          <button className="ghost" title={t('app.refresh')} onClick={() => window.api.getSnapshot().then(setSnap)}>⟳</button>
-          <button className="ghost" title={t('app.hide')} onClick={() => window.api.hide()}>—</button>
+          <button className="ghost ico" title={t('app.refresh')} onClick={() => window.api.getSnapshot().then(setSnap)}><RefreshIcon /></button>
+          <button className="ghost ico" title={t('app.hide')} onClick={() => window.api.hide()}><MinimizeIcon /></button>
         </div>
       </header>
 
