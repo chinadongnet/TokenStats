@@ -241,7 +241,7 @@ export class Store extends EventEmitter {
       }
       p.total += r.total
       p.cost += costFor(r)
-      p.turns += 1
+      p.turns += r.turns || 1
       if (r.ts > p.lastTs) p.lastTs = r.ts
     }
     return [...map.values()].sort((a, b) => b.total - a.total)
@@ -448,7 +448,7 @@ function add(acc, r, cost) {
   acc.cacheCreate += r.cacheCreate
   acc.reasoning += r.reasoning
   acc.cost += cost
-  acc.count += 1
+  acc.count += r.turns || 1
 }
 
 function sumCli(perCli) {

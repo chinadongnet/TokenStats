@@ -101,6 +101,9 @@ function flatten(dayResults, providerId) {
           reasoning: 0,
           total,
           cost: Number(m.spend) || 0,
+          // One record = one (day, model, key) bucket, not one request — carry
+          // the bucket's real request count so turn totals stay meaningful.
+          turns: Number(m.successful_requests) || Number(m.api_requests) || 1,
           dedupKey: `litellm:${providerId}:${day.date}:${model}:${keyHash}`,
         })
       }

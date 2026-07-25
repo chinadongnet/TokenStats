@@ -161,7 +161,7 @@ export function computeSubscriptionStats(sub, records, nowMs = Date.now()) {
       const c = cycles[lo]
       c.cost += costFor(r)
       c.tokens += r.total
-      c.turns += 1
+      c.turns += r.turns || 1
       const mb = monthBucket(r.ts)
       mb.cost += costFor(r)
       mb.tokens += r.total
@@ -291,7 +291,7 @@ export function computePlanTimeline(subs, records, fromMs, toMs, nowMs = Date.no
     const cost = costFor(r)
     b.cost += cost
     b.tokens += r.total
-    b.turns += 1
+    b.turns += r.turns || 1
     const mkey = r.cli + '|' + r.model
     let m = b.models.get(mkey)
     if (!m) {
@@ -300,7 +300,7 @@ export function computePlanTimeline(subs, records, fromMs, toMs, nowMs = Date.no
     }
     m.total += r.total
     m.cost += cost
-    m.turns += 1
+    m.turns += r.turns || 1
     if (e) {
       const cy = b.cycles.find((c) => r.ts >= c.start && r.ts < c.end)
       if (cy) {
@@ -418,7 +418,7 @@ function usageIn(rs, start, end) {
     if (r.ts >= end) break
     tokens += r.total
     cost += costFor(r)
-    turns += 1
+    turns += r.turns || 1
   }
   return { tokens, cost, turns }
 }
@@ -633,7 +633,7 @@ export function computePlanBreakdown(subs, records, fromMs, toMs, nowMs = Date.n
     const cost = costFor(r)
     b.cost += cost
     b.tokens += r.total
-    b.turns += 1
+    b.turns += r.turns || 1
     totalCost += cost
     const key = r.cli + '|' + r.model
     let m = b.models.get(key)
@@ -643,7 +643,7 @@ export function computePlanBreakdown(subs, records, fromMs, toMs, nowMs = Date.n
     }
     m.total += r.total
     m.cost += cost
-    m.turns += 1
+    m.turns += r.turns || 1
   }
 
   const finish = ({ models, ...b }) => ({

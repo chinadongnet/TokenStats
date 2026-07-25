@@ -193,9 +193,10 @@ export default function Settings() {
   async function loadModels(p) {
     setModelsByProvider((m) => ({ ...m, [p.id]: { loading: true, error: null, rows: m[p.id]?.rows || [] } }))
     try {
-      const [res, settings] = await Promise.all([
+      const [res, settings, known] = await Promise.all([
         window.api.litellmListModels({ baseUrl: p.baseUrl, apiKey: p.apiKey }),
         window.api.litellmGetModelSettings(p.id),
+        window.api.litellmKnownModels(p.id),
       ])
       if (!res.ok) {
         setModelsByProvider((m) => ({ ...m, [p.id]: { loading: false, error: res.error, rows: [] } }))
@@ -209,6 +210,21 @@ export default function Settings() {
         visible: settingsMap.get(mo.model)?.visible ?? true,
         displayName: settingsMap.get(mo.model)?.displayName || '',
       }))
+      // Models with historical usage that the proxy no longer registers: still
+      // listed (tagged retired) so they can be hidden/renamed — otherwise a
+      // removed model's old rows would be stuck visible forever.
+      const registered = new Set(rows.map((r) => r.model))
+      for (const k of known || []) {
+        if (registered.has(k.model)) continue
+        rows.push({
+          model: k.model,
+          total: k.total,
+          cost: k.cost,
+          visible: settingsMap.get(k.model)?.visible ?? true,
+          displayName: settingsMap.get(k.model)?.displayName || '',
+          retired: true,
+        })
+      }
       setModelsByProvider((m) => ({ ...m, [p.id]: { loading: false, error: null, rows } }))
     } catch (e) {
       setModelsByProvider((m) => ({ ...m, [p.id]: { loading: false, error: String(e), rows: [] } }))
@@ -387,6 +403,14 @@ export default function Settings() {
         <UpdateRow />
       </section>
 
+      {/* ---------------- Cloud sync ---------------- */}
+      <div className="group-head">
+        <h2>{t('set.cloudSection')}</h2>
+      </div>
+      <section className="card">
+        <CloudSyncCard />
+      </section>
+
       {/* ---------------- Subscription plans ---------------- */}
       <div className="group-head">
         <h2>{t('set.tokenPlans')}</h2>
@@ -521,6 +545,133 @@ export default function Settings() {
 // Version + the GitHub-release update flow (main/updater.js). Three explicit
 // steps — check, download, install — because installing quits the app; nothing
 // here runs on its own, and no check happens until the user asks for one.
+// Cloud sync (tokenstat-web): endpoint + per-device TokenStat Key. Save persists
+// to the cloud_sync DB table and (when enabled) triggers an immediate push;
+// the periodic push runs in main (see index.js startCloudSyncTimer).
+function CloudSyncCard() {
+  const [cfg, setCfg] = useState(null) // null = loading
+  const [draft, setDraftState] = useState(null)
+  const [dirty, setDirty] = useState(false)
+  const [busy, setBusy] = useState(false)
+  const [testResult, setTestResult] = useState(null)
+  const [notice, setNotice] = useState(null)
+
+  const load = async () => {
+    const c = await window.api.cloudSyncGet()
+    setCfg(c)
+    setDraftState((d) => d && dirty ? d : {
+      enabled: !!c?.enabled,
+      endpoint: c?.endpoint || c?.defaultEndpoint || '',
+      apiKey: c?.apiKey || '',
+      syncMinutes: c?.syncMinutes || 10,
+    })
+  }
+  useEffect(() => { load() }, [])
+
+  const setDraft = (patch) => { setDirty(true); setNotice(null); setDraftState((d) => ({ ...d, ...patch })) }
+
+  async function save() {
+    setBusy(true)
+    try {
+      const saved = await window.api.cloudSyncSave({
+        enabled: draft.enabled,
+        endpoint: draft.endpoint.trim(),
+        apiKey: draft.apiKey.trim(),
+        syncMinutes: Number(draft.syncMinutes) || 10,
+      })
+      setCfg((c) => ({ ...c, ...saved }))
+      setDirty(false)
+      setNotice(t('set.cloudSaved'))
+    } finally {
+      setBusy(false)
+    }
+  }
+
+  async function test() {
+    setBusy(true)
+    setTestResult(null)
+    try {
+      setTestResult(await window.api.cloudSyncTest({ endpoint: draft.endpoint, apiKey: draft.apiKey }))
+    } finally {
+      setBusy(false)
+    }
+  }
+
+  async function syncNow(full) {
+    setBusy(true)
+    setNotice(t('set.cloudSyncing'))
+    try {
+      const res = await window.api.cloudSyncNow({ full })
+      if (res?.state) setCfg((c) => ({ ...c, ...res.state }))
+      setNotice(res?.ok ? null : res?.error ? t('set.cloudLastError', { error: res.error }) : null)
+    } finally {
+      setBusy(false)
+    }
+  }
+
+  if (!draft) return <div className="empty">{t('common.loading')}</div>
+
+  const statusLine = cfg?.lastError
+    ? t('set.cloudLastError', { error: cfg.lastError })
+    : cfg?.lastSyncAt
+      ? t('set.cloudLastSync', { time: new Date(cfg.lastSyncAt).toLocaleString() })
+      : t('set.cloudNever')
+
+  return (
+    <>
+      <div className="field-row" style={{ alignItems: 'center' }}>
+        <div className="field shrink" style={{ width: 200 }}>
+          <label>{t('set.cloudSection')}</label>
+          <label className="check" style={{ marginTop: 7 }}>
+            <input type="checkbox" checked={draft.enabled} onChange={(e) => setDraft({ enabled: e.target.checked })} />
+            {t('set.cloudEnabled')}
+          </label>
+        </div>
+        <div className="field grow">
+          <label>&nbsp;</label>
+          <div className="muted small" style={{ marginTop: 7 }}>{t('set.cloudHint')}</div>
+        </div>
+      </div>
+      <div className="field-row" style={{ marginTop: 4 }}>
+        <div className="field grow">
+          <label>{t('set.cloudEndpoint')}</label>
+          <input className="inp" value={draft.endpoint} placeholder={cfg?.defaultEndpoint}
+            onChange={(e) => setDraft({ endpoint: e.target.value })} />
+        </div>
+        <div className="field shrink" style={{ width: 130 }}>
+          <label>{t('set.cloudInterval')}</label>
+          <input className="inp" type="number" min="1" value={draft.syncMinutes}
+            onChange={(e) => setDraft({ syncMinutes: e.target.value })} />
+        </div>
+      </div>
+      <div className="field-row" style={{ marginTop: 4 }}>
+        <div className="field grow">
+          <label>{t('set.cloudKey')}</label>
+          <input className="inp" type="password" value={draft.apiKey} placeholder="tsk_…"
+            onChange={(e) => setDraft({ apiKey: e.target.value })} />
+          <div className="muted small" style={{ marginTop: 4 }}>
+            {t('set.cloudKeyHint', { url: (draft.endpoint || cfg?.defaultEndpoint || '').replace(/\/$/, '') })}
+          </div>
+        </div>
+      </div>
+      <div className="field-row" style={{ marginTop: 8, alignItems: 'center', gap: 8, flexWrap: 'wrap' }}>
+        <button className="btn primary" onClick={save} disabled={busy || !dirty}>{t('set.save')}</button>
+        <button className="btn" onClick={test} disabled={busy || !draft.apiKey.trim()}>{t('set.cloudTest')}</button>
+        <button className="btn" onClick={() => syncNow(false)} disabled={busy || !cfg?.enabled}>{t('set.cloudSyncNow')}</button>
+        <button className="btn" onClick={() => syncNow(true)} disabled={busy || !cfg?.enabled}>{t('set.cloudFullResync')}</button>
+        <span className="muted small">{notice || statusLine}</span>
+      </div>
+      {testResult && (
+        <div className={testResult.ok ? 'muted small' : 'small'} style={{ marginTop: 6, color: testResult.ok ? undefined : 'var(--crit)' }}>
+          {testResult.ok
+            ? t('set.cloudTestOk', { username: testResult.username, deviceName: testResult.deviceName, rows: testResult.rowCount })
+            : t('set.cloudTestFail', { error: testResult.error })}
+        </div>
+      )}
+    </>
+  )
+}
+
 function UpdateRow() {
   const [info, setInfo] = useState(null)      // { version, buildTime, repo, releasesUrl, packaged }
   const [state, setState] = useState('idle')  // idle | checking | checked | downloading | ready
@@ -913,7 +1064,10 @@ function ModelList({ state, onReload, onToggle, onRename, onCommitRename }) {
             onChange={(e) => onToggle(r.model, e.target.checked)}
             title={t('set.showInApp')}
           />
-          <span className="mname" title={r.model}>{r.model}</span>
+          <span className="mname" title={r.model}>
+            {r.model}
+            {r.retired && <span className="muted small" style={{ marginLeft: 6 }}>({t('set.modelRetired')})</span>}
+          </span>
           <span className="mtok">{compact(r.total)}</span>
           <span className="mcost">{usd(r.cost)}</span>
           <input

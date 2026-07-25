@@ -52,6 +52,17 @@ CREATE TABLE IF NOT EXISTS litellm_model_settings (
 );
 CREATE INDEX IF NOT EXISTS idx_lms_provider ON litellm_model_settings(provider_id);
 
+CREATE TABLE IF NOT EXISTS cloud_sync (
+  id           INTEGER PRIMARY KEY CHECK (id = 1),  -- single-row config
+  endpoint     TEXT    NOT NULL DEFAULT '',
+  api_key      TEXT    NOT NULL DEFAULT '',
+  enabled      INTEGER NOT NULL DEFAULT 0,
+  sync_minutes INTEGER NOT NULL DEFAULT 10,
+  full_resync  INTEGER NOT NULL DEFAULT 1,  -- next sync pushes ALL hours (set on config change)
+  last_sync_at INTEGER,
+  last_error   TEXT
+);
+
 CREATE TABLE IF NOT EXISTS subscriptions (
   id          TEXT    PRIMARY KEY,
   name        TEXT    NOT NULL,
@@ -148,7 +159,7 @@ export class UsageDb {
       b.reasoning += r.reasoning
       b.total += r.total
       b.cost += r.cost != null ? r.cost : costFor(r)
-      b.turns += 1
+      b.turns += r.turns || 1
     }
 
     this.db.run('BEGIN')
@@ -236,6 +247,74 @@ export class UsageDb {
       [providerId, model, v, name]
     )
     this.persist()
+  }
+
+  // ---- cloud sync (token.chinadong.net / self-hosted tokenstat-web) -------
+
+  // Single-row config; the row is created lazily with defaults on first read.
+  getCloudSync() {
+    let r = this.rows('SELECT * FROM cloud_sync WHERE id = 1')[0]
+    if (!r) {
+      this.db.run('INSERT INTO cloud_sync (id) VALUES (1)')
+      r = this.rows('SELECT * FROM cloud_sync WHERE id = 1')[0]
+    }
+    return {
+      endpoint: r.endpoint || '',
+      apiKey: r.api_key || '',
+      enabled: !!r.enabled,
+      syncMinutes: r.sync_minutes > 0 ? r.sync_minutes : 10,
+      fullResync: !!r.full_resync,
+      lastSyncAt: r.last_sync_at ?? null,
+      lastError: r.last_error || null,
+    }
+  }
+
+  // Any config change flags full_resync so the next push re-sends everything —
+  // a new key/endpoint means the cloud side has none (or someone else's window)
+  // of this device's history.
+  saveCloudSync({ endpoint, apiKey, enabled, syncMinutes }) {
+    this.getCloudSync() // ensure row
+    this.db.run(
+      'UPDATE cloud_sync SET endpoint=?, api_key=?, enabled=?, sync_minutes=?, full_resync=1, last_error=NULL WHERE id=1',
+      [String(endpoint || '').trim(), String(apiKey || '').trim(), enabled ? 1 : 0, Number(syncMinutes) > 0 ? Number(syncMinutes) : 10]
+    )
+    this.persist()
+    return this.getCloudSync()
+  }
+
+  // Post-sync bookkeeping (lastSyncAt/lastError/fullResync), not user config.
+  updateCloudSyncState({ lastSyncAt, lastError, fullResync } = {}) {
+    this.getCloudSync() // ensure row
+    const sets = []
+    const args = []
+    if (lastSyncAt !== undefined) { sets.push('last_sync_at=?'); args.push(lastSyncAt) }
+    if (lastError !== undefined) { sets.push('last_error=?'); args.push(lastError) }
+    if (fullResync !== undefined) { sets.push('full_resync=?'); args.push(fullResync ? 1 : 0) }
+    if (!sets.length) return
+    this.db.run(`UPDATE cloud_sync SET ${sets.join(', ')} WHERE id=1`, args)
+    this.persist()
+  }
+
+  // Distinct models ever recorded for one CLI (the Settings model list unions
+  // this with the provider's live /model/info so models that were removed from
+  // the proxy but still have historical usage stay hide-able/renameable).
+  modelsForCli(cli) {
+    return this.rows(
+      'SELECT model, SUM(total) AS total, SUM(cost) AS cost FROM usage_hourly WHERE cli = ? GROUP BY model ORDER BY total DESC',
+      [cli]
+    )
+  }
+
+  // All hourly rows since fromMs, in the sync API's camelCase shape.
+  hourlySince(fromMs) {
+    return this.rows(
+      'SELECT hour, cli, model, input, output, cache_read, cache_create, reasoning, total, cost, turns FROM usage_hourly WHERE hour >= ? ORDER BY hour',
+      [fromMs]
+    ).map((r) => ({
+      hour: r.hour, cli: r.cli, model: r.model,
+      input: r.input, output: r.output, cacheRead: r.cache_read, cacheCreate: r.cache_create,
+      reasoning: r.reasoning, total: r.total, cost: r.cost, turns: r.turns,
+    }))
   }
 
   // ---- subscription plans (monthly flat-fee tracking) ---------------------

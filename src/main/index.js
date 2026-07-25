@@ -14,6 +14,7 @@ import { migrateLegacyLitellmConfig } from './core/migrateLitellm.js'
 import { isAutoLaunch, setAutoLaunch, migrateLegacyRunKeys } from './autoLaunch.js'
 import { agyResetWindows, getAgyQuotaState, enableAgyQuota, disableAgyQuota, ensureAgyHook, AGY_MIRROR_PATH } from './agyQuota.js'
 import { makeTrayIcon } from './trayIcon.js'
+import { performSync, testCloudSync, normalizeEndpoint, DEFAULT_ENDPOINT } from './core/cloudSync.js'
 import { checkForUpdate, downloadUpdate, launchInstaller, UPDATE_REPO, RELEASES_URL } from './updater.js'
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url))
@@ -280,9 +281,25 @@ async function init() {
     // real tokens/cost over that window's own span.
     const index = planRecordIndex(subs, recs, now)
     const entries = computeResetWindows(subs, recs, now, index)
-    const liveByCli = { codex: codexResetWindows(), claude: claudeResetWindows(), cursor: cursorResetWindows(), agy: agyResetWindows() }
     const labels = Object.fromEntries(Object.entries(CLI_META).map(([k, v]) => [k, v.label]))
-    return mergeLiveLimits(entries, liveByCli, now, labels, index)
+    return mergeLiveLimits(entries, buildLiveByCli(), now, labels, index)
+  })
+
+  // Cloud sync (token.chinadong.net / any self-hosted tokenstat-web).
+  // Config lives in the cloud_sync DB table; the engine is core/cloudSync.js.
+  ipcMain.handle('cloudsync:get', () => (db ? { ...db.getCloudSync(), defaultEndpoint: DEFAULT_ENDPOINT } : null))
+  ipcMain.handle('cloudsync:save', async (_e, payload) => {
+    if (!db) return null
+    const saved = db.saveCloudSync({ ...payload, endpoint: normalizeEndpoint(payload.endpoint || DEFAULT_ENDPOINT) })
+    if (saved.enabled) runCloudSync() // fire-and-forget; state lands in cloud_sync
+    return saved
+  })
+  ipcMain.handle('cloudsync:test', (_e, conn) =>
+    testCloudSync({ endpoint: normalizeEndpoint(conn?.endpoint || DEFAULT_ENDPOINT), apiKey: conn?.apiKey || '' })
+  )
+  ipcMain.handle('cloudsync:sync-now', async (_e, opts) => {
+    const res = await runCloudSync({ fullOverride: !!opts?.full })
+    return { ...res, state: db ? db.getCloudSync() : null }
   })
   ipcMain.handle('subs:timeline', (_e, fromMs, toMs) =>
     db && store
@@ -296,6 +313,9 @@ async function init() {
   )
 
   ipcMain.handle('litellm:get-model-settings', (_e, providerId) => db?.listModelSettings(providerId) ?? [])
+  // Historical models (from the hourly table) for the Settings model list — so
+  // a model deleted from the proxy can still be hidden/renamed.
+  ipcMain.handle('litellm:known-models', (_e, providerId) => db?.modelsForCli('litellm:' + providerId) ?? [])
   ipcMain.handle('litellm:save-model-setting', (_e, payload) => {
     if (!db) return
     db.saveModelSetting(payload)
@@ -307,12 +327,54 @@ async function init() {
   refreshLitellmPollers() // populate store.pollers before the initial scan/poll
   await store.start()
   ingestNow() // first full ingest after the initial scan
+  startCloudSyncTimer() // pushes to tokenstat-web when enabled (Settings → 云同步)
+  // First push shortly after startup so the cloud reflects a reboot-gap quickly;
+  // waits 30s so the initial scan/ingest has settled and doesn't race it.
+  setTimeout(() => runCloudSync(), 30000)
   // Prime Claude's live plan-quota (spawns `claude -p /usage` once) so the
   // popup's Quota-windows section can show it without waiting for the first
   // 15-min refresh. Fire-and-forget; a snapshot after it lands shows the data.
   primeClaudeLimits().then(() => broadcastSnapshot()).catch(() => {})
   if (process.env.AIMON_AUTO_REPORT) openReport() // dev/test convenience
   if ('AIMON_SET_AUTOLAUNCH' in process.env) setAutoLaunch(process.env.AIMON_SET_AUTOLAUNCH === '1') // headless toggle
+}
+
+// Live per-CLI quota windows, shared by the popup's subs:resets handler and
+// the cloud-sync status snapshot so both always show identical numbers.
+function buildLiveByCli() {
+  return { codex: codexResetWindows(), claude: claudeResetWindows(), cursor: cursorResetWindows(), agy: agyResetWindows() }
+}
+
+// One in-flight cloud sync at a time; a call while one runs just returns the
+// running promise (the next timer tick will pick up anything it missed).
+let cloudSyncInFlight = null
+let cloudSyncLastAttempt = 0
+function runCloudSync(opts = {}) {
+  if (!db || !store) return Promise.resolve({ ok: false, skipped: true })
+  if (cloudSyncInFlight) return cloudSyncInFlight
+  cloudSyncLastAttempt = Date.now()
+  cloudSyncInFlight = performSync({
+    db,
+    store,
+    liveByCli: buildLiveByCli(),
+    appVersion: __APP_VERSION__,
+    fullOverride: !!opts.fullOverride,
+  })
+    .catch((e) => ({ ok: false, error: String(e) }))
+    .finally(() => { cloudSyncInFlight = null })
+  return cloudSyncInFlight
+}
+
+// Check once a minute whether the configured interval elapsed — same pattern
+// as the store's poll-check timer: the timer is cheap, the network is gated.
+function startCloudSyncTimer() {
+  setInterval(() => {
+    if (!db) return
+    const cfg = db.getCloudSync()
+    if (!cfg.enabled || !cfg.apiKey || !cfg.endpoint) return
+    const due = cloudSyncLastAttempt + Math.max(1, cfg.syncMinutes) * 60000
+    if (Date.now() >= due) runCloudSync()
+  }, 60000)
 }
 
 // Throttle DB ingests: at most once every 4s, with a trailing run.

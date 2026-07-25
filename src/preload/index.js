@@ -62,6 +62,7 @@ contextBridge.exposeInMainWorld('api', {
   litellmDeleteProvider: (id) => ipcRenderer.invoke('litellm:delete-provider', id),
   litellmListModels: (conn) => ipcRenderer.invoke('litellm:list-models', conn),
   litellmGetModelSettings: (providerId) => ipcRenderer.invoke('litellm:get-model-settings', providerId),
+  litellmKnownModels: (providerId) => ipcRenderer.invoke('litellm:known-models', providerId),
   litellmSaveModelSetting: (setting) => ipcRenderer.invoke('litellm:save-model-setting', setting),
 
   // subscription plans — monthly flat fees vs actual usage cost
@@ -74,4 +75,10 @@ contextBridge.exposeInMainWorld('api', {
   subsResets: () => ipcRenderer.invoke('subs:resets'),
   subsBreakdown: (fromMs, toMs) => ipcRenderer.invoke('subs:breakdown', fromMs, toMs),
   subsTimeline: (fromMs, toMs) => ipcRenderer.invoke('subs:timeline', fromMs, toMs),
+
+  // cloud sync — push usage to tokenstat-web (token.chinadong.net)
+  cloudSyncGet: () => ipcRenderer.invoke('cloudsync:get'),
+  cloudSyncSave: (cfg) => ipcRenderer.invoke('cloudsync:save', cfg),
+  cloudSyncTest: (conn) => ipcRenderer.invoke('cloudsync:test', conn),
+  cloudSyncNow: (opts) => ipcRenderer.invoke('cloudsync:sync-now', opts),
 })
