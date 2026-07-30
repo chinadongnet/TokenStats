@@ -187,8 +187,9 @@ async function init() {
       return { ok: false, error: err.message || String(err) }
     }
   })
-  // Hands off to NSIS and quits: the installer can't overwrite a running exe,
-  // and `runAfterFinish` starts the new version once it's done.
+  // Hands off to NSIS and quits: the installer can't overwrite a running exe.
+  // It brings the new version back up only because launchInstaller passes
+  // --force-run (runAfterFinish is suppressed by /S) — see updater.js.
   ipcMain.handle('update:install', () => {
     try {
       launchInstaller(pendingInstaller)

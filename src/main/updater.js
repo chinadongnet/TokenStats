@@ -186,11 +186,24 @@ export async function downloadUpdate(asset, onProgress) {
 // ---- install ----------------------------------------------------------------
 
 // Runs the downloaded installer silently and detached, so it outlives the app it
-// is about to overwrite. The CALLER must quit right after (NSIS can't replace a
-// running TokenStats.exe); `runAfterFinish` brings the new version back up.
+// is about to overwrite. The CALLER must quit right after — NSIS can't replace a
+// running TokenStats.exe.
+//
+// The flags are not optional, and `runAfterFinish` alone does NOT cover them:
+//   --force-run  electron-builder's one-click installer only relaunches the app
+//                when `${ifNot} ${Silent} ${orIf} ${isForceRun}`
+//                (app-builder-lib/templates/nsis/installSection.nsh). `/S` makes
+//                it silent, so without this the update installs and the app just
+//                never comes back — which is exactly what 0.2.30 → 0.2.31 did.
+//   --updated    tells the installer this is an update, not a first install: it
+//                then waits for the running app to exit instead of prompting
+//                about it, removes the old dir atomically, and keeps the user's
+//                existing shortcuts rather than recreating deleted ones.
+// Both are the same flags electron-updater passes; NSIS parses them via
+// StdUtils.TestParameter, which wants the `--flag` form.
 export function launchInstaller(file) {
   if (!file || !fs.existsSync(file)) throw new Error('installer file is missing')
-  const child = spawn(file, ['/S'], { detached: true, stdio: 'ignore' })
+  const child = spawn(file, ['/S', '--updated', '--force-run'], { detached: true, stdio: 'ignore' })
   child.unref()
   return true
 }
