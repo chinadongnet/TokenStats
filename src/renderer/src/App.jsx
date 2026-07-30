@@ -120,10 +120,12 @@ const IconBase = ({ children }) => (
 const ReportIcon = () => (
   <IconBase><path d="M4 20V10M10 20V4M16 20v-7M4 20h16" /></IconBase>
 )
+// A real cog — one closed 6-tooth outline plus a hub. The earlier version drew
+// detached radial rays around a circle, which reads as a sun, not a gear.
 const SettingsIcon = () => (
   <IconBase>
-    <circle cx="12" cy="12" r="3" />
-    <path d="M12 2.5v2.2M12 19.3v2.2M4.2 4.2l1.6 1.6M18.2 18.2l1.6 1.6M2.5 12h2.2M19.3 12h2.2M4.2 19.8l1.6-1.6M18.2 5.8l1.6-1.6" />
+    <path d="M9.5 2.7L14.5 2.7L14.7 5.6L16.2 6.5L18.8 5.2L21.3 9.5L18.8 11.2L18.8 12.8L21.3 14.5L18.8 18.8L16.2 17.5L14.7 18.4L14.5 21.3L9.5 21.3L9.3 18.4L7.8 17.5L5.2 18.8L2.7 14.5L5.2 12.8L5.2 11.2L2.7 9.5L5.2 5.2L7.8 6.5L9.3 5.6Z" />
+    <circle cx="12" cy="12" r="3.1" />
   </IconBase>
 )
 // A camera, so the screenshot button reads as "capture" at a glance.

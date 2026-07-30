@@ -329,7 +329,7 @@ const zh = {
   'scope.day': '日',
   'scope.week': '周',
   'scope.month': '月',
-  'common.tokens': '词元',
+  'common.tokens': 'Token',
   'common.est': '预估',
   'common.loading': '加载中…',
   'common.save': '保存',
@@ -383,7 +383,7 @@ const zh = {
   'app.scopeFee': '订阅费（按{scope}摊）',
   'app.scopeRateTip':
     '{scope}：按量计费约 ${cost}，对应同期订阅费摊销 ${fee}（${usd}/月 ÷ {div}）——相当于所付费用的 {pct}%',
-  'app.spentIn': '本窗口内已用 {tokens} 词元 · 约 ${cost}',
+  'app.spentIn': '本窗口内已用 {tokens} Token · 约 ${cost}',
   'app.cycleValue': '已用 ${cost}',
   'app.cycleValueTip': '本计费周期：按量计费约 ${cost}，订阅费 ${usd}——相当于所付费用的 {pct}%',
 
