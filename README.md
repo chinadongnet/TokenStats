@@ -188,9 +188,9 @@ the tray's right-click menu — to add a provider:
 - **Sync frequency** (minutes) — how often TokenStats polls that proxy.
 - Per-model **show/hide** and **rename** — "Models" lists every model the key has
   usage for, including ones the proxy no longer registers (tagged **retired**) so a
-  removed model's rows can still be hidden or renamed. That listing comes from recorded
-  usage, and LiteLLM usage is only fetched for the **last 35 days**, so a retired model
-  drops off the list once its last usage falls outside that window.
+  removed model's rows can still be hidden or renamed. Hiding and renaming apply to the
+  whole history, not just to new usage: they're display-time settings re-applied over
+  the stored raw buckets.
 
 Add as many providers as you like (e.g. one per team or per proxy instance); each shows
 up as its own independent row everywhere the built-in CLIs do — no code changes needed.
@@ -198,6 +198,14 @@ Unlike every other source here, LiteLLM's admin API reports **actual spend**, no
 `pricing.js` estimate, and real request counts. Usage arrives as
 (day, model, key-alias) buckets — the API has no per-request timestamps — and the key
 alias becomes the record's "project".
+
+LiteLLM is also the only source whose history isn't already on your disk: its admin API
+serves a **35-day** window. TokenStats therefore keeps a local **archive** of every
+bucket it has ever fetched, so usage stays in the report and the charts after the proxy
+stops serving it. Inside the 35-day window the proxy remains authoritative (totals are
+corrected, and a bucket deleted server-side disappears locally too); older days live
+only in the archive. It can't recover anything from before you configured the provider —
+that data was never fetched.
 
 Provider configuration (including the API key) is stored locally in
 `~/.tokenstats/usage.sqlite`, never sent anywhere except to the proxy you configured.

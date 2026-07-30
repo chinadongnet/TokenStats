@@ -44,8 +44,11 @@ async function fetchPage(baseUrl, apiKey, startDate, endDate, page) {
   return res.json()
 }
 
-// Fetches every page across the lookback window and returns the raw flattened
-// per-day results (no provider/model-settings knowledge yet).
+// Fetches every page across the lookback window and returns the raw per-day
+// results (no provider/model-settings knowledge yet) plus the window it asked
+// for — callers need `startDate` to know which days this fetch is authoritative
+// for, since anything older lives only in the local archive (see db.js's
+// litellm_usage).
 async function fetchRawRecords(baseUrl, apiKey) {
   const end = new Date()
   const start = new Date(end.getTime() - (LOOKBACK_DAYS - 1) * 86400000)
@@ -60,7 +63,7 @@ async function fetchRawRecords(baseUrl, apiKey) {
     if (!body.metadata?.has_more) break
     page++
   }
-  return dayResults
+  return { dayResults, startDate, endDate }
 }
 
 // Flatten every per-model/per-key leaf across the whole date range into
@@ -112,6 +115,50 @@ function flatten(dayResults, providerId) {
   return records
 }
 
+// ---- archive mapping -------------------------------------------------------
+//
+// The raw (pre-settings) record set is persisted so history outlives the API's
+// 35-day lookback. These two keep the record shape owned here rather than in
+// db.js: a bucket row is the raw record with the day it belongs to, and nothing
+// display-related (rename/visibility is re-applied on the way out, so editing a
+// model's settings retroactively fixes the whole archive).
+function bucketFromRecord(r) {
+  return {
+    dedupKey: r.dedupKey,
+    day: new Date(r.ts).toISOString().slice(0, 10), // ts is noon UTC of that day
+    ts: r.ts,
+    model: r.model,
+    keyHash: r.sessionId || null,
+    keyAlias: r.project && r.project !== 'litellm' ? r.project : null,
+    input: r.input,
+    output: r.output,
+    cacheRead: r.cacheRead,
+    cacheCreate: r.cacheCreate,
+    total: r.total,
+    cost: r.cost,
+    turns: r.turns,
+  }
+}
+
+function recordFromBucket(b, providerId) {
+  return {
+    cli: `litellm:${providerId}`,
+    ts: b.ts,
+    model: b.model,
+    sessionId: b.keyHash || '',
+    project: b.keyAlias || 'litellm',
+    input: b.input || 0,
+    output: b.output || 0,
+    cacheRead: b.cacheRead || 0,
+    cacheCreate: b.cacheCreate || 0,
+    reasoning: 0,
+    total: b.total || 0,
+    cost: b.cost || 0,
+    turns: b.turns || 1,
+    dedupKey: b.dedupKey,
+  }
+}
+
 // Applies live visibility/rename settings to a raw flattened record set. This
 // is the only step that needs to re-run when the user edits Settings — it
 // never re-fetches, so toggling a model's visibility or renaming it takes
@@ -137,9 +184,26 @@ function applyModelSettings(records, modelSettings) {
 // change detection is a reference check, so keeping `cache.applied` stable
 // between fetches avoids spuriously re-broadcasting a snapshot every timer
 // tick just because a settings map lookup happened to run again.
-export function createLitellmPoller({ id, name, baseUrl, apiKey, color, syncMinutes, getModelSettings }) {
+export function createLitellmPoller({
+  id, name, baseUrl, apiKey, color, syncMinutes, getModelSettings,
+  // Archive hooks (index.js wires them to db.js). Optional so the poller still
+  // works without persistence — the headless test scripts don't build any.
+  loadArchive, saveArchive,
+}) {
   const intervalMs = Math.max(1, Number(syncMinutes) || DEFAULT_SYNC_MINUTES) * 60 * 1000
+  // Seeded from the archive so usage older than the API's lookback is present
+  // from the first snapshot, before any fetch completes. `hasBaseline` stays
+  // false on purpose: it gates the "what just grew?" live-activity detection,
+  // and comparing a fresh fetch against rows persisted hours ago would claim
+  // stale usage as live. The first fetch of a session only rebases.
   const cache = { raw: [], applied: [], fetchedAt: 0, hasBaseline: false }
+  if (loadArchive) {
+    try {
+      cache.raw = (loadArchive() || []).map((b) => recordFromBucket(b, id))
+    } catch {
+      // a broken archive must not stop live polling
+    }
+  }
   // Set when a fetch brings NEW usage (a bucket's total grew vs the previous
   // fetch): { ts: <sync time>, model, project }. Record timestamps here are
   // synthetic (noon UTC of the usage day — the API has no per-request times),
@@ -154,21 +218,33 @@ export function createLitellmPoller({ id, name, baseUrl, apiKey, color, syncMinu
   async function refreshRaw() {
     cache.fetchedAt = Date.now() // set before awaiting so overlapping triggers don't pile up calls
     try {
-      const dayResults = await fetchRawRecords(baseUrl, apiKey)
-      const next = flatten(dayResults, id)
+      const { dayResults, startDate } = await fetchRawRecords(baseUrl, apiKey)
+      const fetched = flatten(dayResults, id)
       if (cache.hasBaseline) {
         // Which bucket grew? Prefer the newest usage day, then the biggest jump.
         const prevTotals = new Map(cache.raw.map((r) => [r.dedupKey, r.total]))
         let best = null
-        for (const r of next) {
+        for (const r of fetched) {
           const delta = r.total - (prevTotals.get(r.dedupKey) || 0)
           if (delta <= 0) continue
           if (!best || r.ts > best.ts || (r.ts === best.ts && delta > best.delta)) best = { ...r, delta }
         }
         if (best) lastChange = { ts: Date.now(), model: best.model, project: best.project }
       }
-      cache.raw = next
+      // The fetch is authoritative for its own window and nothing else: days
+      // before it are kept from the archive (that's the only place they exist),
+      // days inside it are replaced wholesale so a bucket deleted server-side
+      // disappears here too instead of being frozen forever.
+      const archived = cache.raw.filter((r) => new Date(r.ts).toISOString().slice(0, 10) < startDate)
+      cache.raw = [...archived, ...fetched]
       cache.hasBaseline = true // the first fetch only sets the comparison baseline
+      if (saveArchive) {
+        try {
+          saveArchive(fetched.map(bucketFromRecord), startDate)
+        } catch {
+          // persistence is best-effort; the in-memory set is still correct
+        }
+      }
     } catch {
       // undocumented internal admin API: keep the previous cache on error
     }
@@ -227,7 +303,7 @@ export function createLitellmPoller({ id, name, baseUrl, apiKey, color, syncMinu
 // ignoring any visibility/rename settings (the settings screen needs to see
 // every model, including currently-hidden ones, to let the user re-show them).
 export async function listModels({ baseUrl, apiKey }) {
-  const dayResults = await fetchRawRecords(baseUrl, apiKey)
+  const { dayResults } = await fetchRawRecords(baseUrl, apiKey)
   const raw = flatten(dayResults, '_draft')
   const byModel = new Map()
   for (const r of raw) {

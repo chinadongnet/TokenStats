@@ -52,6 +52,33 @@ CREATE TABLE IF NOT EXISTS litellm_model_settings (
 );
 CREATE INDEX IF NOT EXISTS idx_lms_provider ON litellm_model_settings(provider_id);
 
+-- The local ARCHIVE of LiteLLM's raw daily buckets, one row per
+-- (day, model, api key) exactly as the admin API reported it, keyed by the
+-- poller's dedupKey. This exists because LiteLLM is the only source whose
+-- history isn't on this machine: the admin API serves a 35-day window, and
+-- ingest() rebuilds usage_hourly from whatever the parsers currently see, so
+-- without a copy every LiteLLM bucket silently vanished from the database (and
+-- from the report, and from the retired-model list) the day it aged out.
+-- The model column is the RAW api model id — visibility/rename stay display-
+-- time concerns applied by the poller, so a rename can't fork a bucket's id.
+CREATE TABLE IF NOT EXISTS litellm_usage (
+  dedup_key    TEXT    PRIMARY KEY,
+  provider_id  TEXT    NOT NULL,
+  day          TEXT    NOT NULL,   -- 'YYYY-MM-DD' (UTC), the API's own bucket key
+  ts           INTEGER NOT NULL,   -- epoch ms, noon UTC of that day (see litellm.js)
+  model        TEXT    NOT NULL,
+  key_hash     TEXT,
+  key_alias    TEXT,
+  input        INTEGER NOT NULL DEFAULT 0,
+  output       INTEGER NOT NULL DEFAULT 0,
+  cache_read   INTEGER NOT NULL DEFAULT 0,
+  cache_create INTEGER NOT NULL DEFAULT 0,
+  total        INTEGER NOT NULL DEFAULT 0,
+  cost         REAL    NOT NULL DEFAULT 0,
+  turns        INTEGER NOT NULL DEFAULT 0
+);
+CREATE INDEX IF NOT EXISTS idx_litellm_usage_provider ON litellm_usage(provider_id, day);
+
 CREATE TABLE IF NOT EXISTS cloud_sync (
   id           INTEGER PRIMARY KEY CHECK (id = 1),  -- single-row config
   endpoint     TEXT    NOT NULL DEFAULT '',
@@ -224,6 +251,7 @@ export class UsageDb {
   deleteLitellmProvider(id) {
     this.db.run('DELETE FROM litellm_providers WHERE id = ?', [id])
     this.db.run('DELETE FROM litellm_model_settings WHERE provider_id = ?', [id])
+    this.db.run('DELETE FROM litellm_usage WHERE provider_id = ?', [id])
     this.persist()
   }
 
@@ -246,6 +274,68 @@ export class UsageDb {
        ON CONFLICT(provider_id, model) DO UPDATE SET visible=excluded.visible, display_name=excluded.display_name`,
       [providerId, model, v, name]
     )
+    this.persist()
+  }
+
+  // ---- LiteLLM usage archive (see the litellm_usage table comment) --------
+
+  // Every bucket ever seen for this provider, oldest first. The poller seeds
+  // itself from this on startup so history the proxy no longer serves still
+  // reaches snapshot()/ingest(). Shape matches what saveLitellmUsage takes.
+  listLitellmUsage(providerId) {
+    return this.rows(
+      `SELECT dedup_key, day, ts, model, key_hash, key_alias,
+              input, output, cache_read, cache_create, total, cost, turns
+         FROM litellm_usage WHERE provider_id = ? ORDER BY ts`,
+      [providerId]
+    ).map((r) => ({
+      dedupKey: r.dedup_key,
+      day: r.day,
+      ts: r.ts,
+      model: r.model,
+      keyHash: r.key_hash || null,
+      keyAlias: r.key_alias || null,
+      input: r.input,
+      output: r.output,
+      cacheRead: r.cache_read,
+      cacheCreate: r.cache_create,
+      total: r.total,
+      cost: r.cost,
+      turns: r.turns,
+    }))
+  }
+  // Stores one fetch. `fromDay` (the first day of the fetched window) is what
+  // keeps this an archive rather than an append-only pile: inside the window the
+  // API is authoritative, so those days are dropped and rewritten — a bucket
+  // deleted server-side disappears here too, and a day whose totals grew is
+  // corrected rather than duplicated. Days BEFORE the window are never touched;
+  // they only exist here. Omitting `fromDay` upserts without clearing.
+  saveLitellmUsage(providerId, buckets, fromDay) {
+    this.db.run('BEGIN')
+    if (fromDay) {
+      this.db.run('DELETE FROM litellm_usage WHERE provider_id = ? AND day >= ?', [providerId, fromDay])
+    }
+    const stmt = this.db.prepare(
+      `INSERT INTO litellm_usage
+         (dedup_key, provider_id, day, ts, model, key_hash, key_alias,
+          input, output, cache_read, cache_create, total, cost, turns)
+       VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+       ON CONFLICT(dedup_key) DO UPDATE SET
+         day=excluded.day, ts=excluded.ts, model=excluded.model,
+         key_hash=excluded.key_hash, key_alias=excluded.key_alias,
+         input=excluded.input, output=excluded.output,
+         cache_read=excluded.cache_read, cache_create=excluded.cache_create,
+         total=excluded.total, cost=excluded.cost, turns=excluded.turns`
+    )
+    for (const b of buckets || []) {
+      stmt.run([
+        b.dedupKey, providerId, b.day, b.ts, b.model, b.keyHash ?? null, b.keyAlias ?? null,
+        b.input || 0, b.output || 0, b.cacheRead || 0, b.cacheCreate || 0,
+        b.total || 0, b.cost || 0, b.turns || 0,
+      ])
+    }
+    stmt.free()
+    this.db.run('COMMIT')
     this.persist()
   }
 

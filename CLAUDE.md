@@ -117,8 +117,10 @@ testable via `npm run test:parsers`.
   Gemini ships two parser objects (`geminiJsonl` + `geminiJson`) sharing one root.
   `parsers/litellm.js` is the odd one out — it has no roots/files at all (see below)
   and isn't in `PARSERS` at all: it exports a `createLitellmPoller({id, name, baseUrl,
-  apiKey, color, syncMinutes, getModelSettings})` factory (one call per configured
-  provider, made by `index.js`'s `refreshLitellmPollers()`) plus a throttle-free
+  apiKey, color, syncMinutes, getModelSettings, loadArchive?, saveArchive?})` factory
+  (one call per configured provider, made by `index.js`'s `refreshLitellmPollers()`;
+  the archive hooks are what make its history outlive the API's 35-day window — see
+  the LiteLLM notes under Conventions) plus a throttle-free
   `listModels({baseUrl, apiKey})` used by the Settings UI's "load models"/"test
   connection" actions. `store.js` holds the resulting pollers in an instance field
   (`this.pollers`), not a static array — see "Pollers" below.
@@ -208,6 +210,14 @@ testable via `npm run test:parsers`.
     `listModelSettings(providerId)`, `getModelSettingsMap(providerId)` (hot path —
     called on every poller `poll()`/`reapplySettings()`), `saveModelSetting({...})`
     (upsert via `ON CONFLICT`).
+  - **LiteLLM usage archive** — `litellm_usage` (dedup_key PK, provider_id, day, ts,
+    model = the **raw** api id, key_hash, key_alias, token components, cost, turns):
+    the local copy of every daily bucket ever fetched, because the admin API only
+    serves 35 days and `ingest()` rebuilds `usage_hourly` from live parser output.
+    `listLitellmUsage(providerId)` (poller seed) / `saveLitellmUsage(providerId,
+    buckets, fromDay?)` — `fromDay` deletes that provider's rows from that day on
+    before upserting, which is what keeps the fetched window authoritative instead of
+    the table becoming an append-only pile. See the LiteLLM notes under Conventions.
   - **subscription plans** — `subscriptions` (id, name, monthly_usd, start_date,
     active, end_date, bindings-as-JSON, reset_period). CRUD: `listSubscriptions()`,
     `getSubscription(id)`, `upsertSubscription({id?, ...})`,
@@ -631,8 +641,25 @@ below. No router, no state library.
     (same "zero-usage dropped" precedent as above). This is safe against
     `pricing.js`'s cost estimate table too: `costFor()` prefers a record's real
     `cost` over any model-name lookup, and LiteLLM records always carry one.
+  - **The 35-day lookback is why `litellm_usage` (the archive) exists.** LiteLLM is
+    the only source whose history isn't on this machine, and `db.ingest()` *replaces*
+    `usage_hourly` from whatever the parsers currently hold — so before the archive,
+    every bucket silently dropped out of the DB (report, charts, `modelsForCli()`'s
+    retired-model list, plan math) the day it aged past the window. The poller now
+    seeds `cache.raw` from `loadArchive()` at construction and, on each fetch, keeps
+    cached rows with `day < startDate` while replacing everything from `startDate`
+    on: **inside the window the API stays authoritative** (totals get corrected, a
+    server-side deletion propagates), outside it we're the only copy. `saveArchive()`
+    (→ `db.saveLitellmUsage`) mirrors that with a `DELETE ... WHERE day >= fromDay`
+    before its upserts. Rows store the **raw** model id, so `applyModelSettings()`
+    still runs last and a hide/rename retroactively covers the whole archive.
+    `loadArchive`/`saveArchive` are optional constructor hooks (index.js wires them
+    to the DB) so a poller built without them still works, just without persistence.
+    Deleting a provider cascades to its archive rows.
   - `test:parsers`/`test:db` (the headless scripts) don't wire any LiteLLM pollers —
     they only exercise `PARSERS` (file-based CLIs). LiteLLM pollers are built
     exclusively by `index.js`'s `refreshLitellmPollers()` from DB provider rows, so
     testing LiteLLM changes requires the real Electron app (`npm run dev`) with at
-    least one provider configured via Settings.
+    least one provider configured via Settings — or a script that stubs
+    `globalThis.fetch` and builds a poller by hand against a temp `UsageDb`, which is
+    how the archive's window semantics were verified.

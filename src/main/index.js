@@ -414,6 +414,12 @@ function refreshLitellmPollers() {
         color: p.color,
         syncMinutes: p.syncMinutes,
         getModelSettings: () => db.getModelSettingsMap(p.id),
+        // Local archive of the raw daily buckets — the proxy's admin API only
+        // serves 35 days, so without this a provider's older usage would drop
+        // out of usage_hourly on the next ingest (which rebuilds the table from
+        // whatever the parsers currently hold).
+        loadArchive: () => db.listLitellmUsage(p.id),
+        saveArchive: (buckets, fromDay) => db.saveLitellmUsage(p.id, buckets, fromDay),
       })
     )
   )
