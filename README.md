@@ -79,22 +79,25 @@ aggregation.
 
 ## Live quota windows
 
-A plan can declare any subset of **5h / weekly / monthly** quota windows, and the popup
-shows each one as a headroom bar plus a draining-clock countdown. Where the tool itself
-reports its remaining quota, the number is **live**:
+A plan can declare any subset of **5h / weekly / monthly** quota windows. Only windows
+the tool itself reports — **live** ones — get a headroom bar and a draining-clock
+countdown:
 
 | Tool | How its live window is obtained |
 |------|--------------------------------|
 | Codex | rate-limit fields already present in its local logs — free |
 | Claude Code | runs `claude -p /usage` and parses the CLI's own usage view, throttled to once every 15 min (spawns the CLI, so it does hit the network) |
-| Cursor | comes with the usage export it already fetches |
+| Cursor | a **second** request alongside the usage export (`/api/usage-summary`), which can fail independently — usage numbers may be current while the quota window is stale |
 | Antigravity | opt-in statusLine hook — see [Antigravity live quota](#antigravity-live-quota) |
 
-Windows with no live source are shown as estimates. Hover a bar for the tokens and cost
-actually spent inside that window. **5h is rolling** (it opens on the first request
-after the previous window expired — Claude's rate limit — so there is nothing to
-configure), while **weekly/monthly are anchored** to a date (and, for weekly, a time)
-you set per plan.
+Windows with **no** live source are deliberately **not drawn at all** — an estimated
+headroom bar would look authoritative while being guesswork. A plan bound only to such
+sources still shows its usage, worth, and billing countdown, just no quota bars. Hover a
+live bar for the tokens and cost actually spent inside that window.
+
+**5h is rolling** (it opens on the first request after the previous window expired —
+Claude's rate limit — so there is nothing to configure), while **weekly/monthly are
+anchored** to a date (and, for weekly, a time) you set per plan.
 
 The billing renewal countdown below the bars is a **separate clock**: quota can reset on
 the 20th while the fee bills on the 5th, and neither is derived from the other.
@@ -128,7 +131,9 @@ Open it from the popup's chart button or the tray menu. It's backed by a local
   actual **plan fees** billed in the range, and a breakdown card with **By plan**
   (default), **By model**, or **By project**.
 - **By hour** — hour-by-hour stacked bars for a chosen day.
-- **Logs** — the per-request table.
+- **Logs** — the per-request table. LiteLLM is the exception: its admin API has no
+  per-request timestamps, so its rows are (day, model, key alias) **aggregates** stamped
+  at noon UTC, not individual requests.
 - **Token plans** — active $/mo, total paid, usage worth and value %; a **zoomable
   timeline** (a Gantt lane per plan with one fee-labeled segment per billing cycle, a
   per-day usage band colored by owning plan, wheel to zoom / drag to pan); a per-plan
@@ -183,7 +188,9 @@ the tray's right-click menu — to add a provider:
 - **Sync frequency** (minutes) — how often TokenStats polls that proxy.
 - Per-model **show/hide** and **rename** — "Models" lists every model the key has
   usage for, including ones the proxy no longer registers (tagged **retired**) so a
-  removed model's historical rows can still be hidden or renamed.
+  removed model's rows can still be hidden or renamed. That listing comes from recorded
+  usage, and LiteLLM usage is only fetched for the **last 35 days**, so a retired model
+  drops off the list once its last usage falls outside that window.
 
 Add as many providers as you like (e.g. one per team or per proxy instance); each shows
 up as its own independent row everywhere the built-in CLIs do — no code changes needed.
@@ -226,9 +233,13 @@ What leaves the machine is a deliberately narrow contract:
 
 - **Hourly usage rows** — (hour, CLI, model, token component sums, cost, request
   count).
-- **A status snapshot** — CLI names/colors, live quota windows, plan names/fees/renewal
-  dates: exactly what the tray popup renders.
-- **Never** project paths, session ids, key aliases, or any prompt/response content.
+- **A status snapshot** — CLI names/colors, live quota windows, and per plan its
+  name, fee, renewal date and **bindings** (which CLIs it covers, plus its model
+  allowlist if it has one). The bindings are what let the website redraw the same
+  per-card "usage worth vs fee share" line the app popup shows.
+- **Never** project paths, session ids, prompt/response content, or **key aliases** —
+  a binding's key-alias filter is stripped before the snapshot is sent, and the uploaded
+  rows carry no key dimension to apply it to anyway.
 
 Each sync re-pushes a rolling 7-day window (recent hours keep changing) and tells the
 server to drop its copy of that window first, so rows that disappear locally — a model
@@ -298,8 +309,15 @@ Every parser emits the same **normalized record**, so aggregation is CLI-agnosti
 ```
 { cli, ts, model, sessionId, project,
   input, output, cacheRead, cacheCreate, reasoning, total,
-  dedupKey?, cost?, rawModel? }
+  dedupKey?, cost?, turns?, rawModel? }
 ```
+
+The optional fields carry what a plain per-request row can't: `dedupKey` for sources
+that write the same usage twice, `cost` to override the price-table estimate with real
+spend, `rawModel` so a renamed model keeps its identity for plan filters, and `turns`
+for **aggregate** sources — one LiteLLM record covers a whole (day, model, key) bucket,
+so it reports that bucket's real request count. A record without `turns` counts as one
+request, which is why a bucketed source that omits it would silently undercount.
 
 Key points:
 
@@ -311,9 +329,13 @@ Key points:
 - **De-duplication is accuracy-critical** — see [Data sources](#data-sources).
   `store.dedupedRecords()` is what feeds the snapshot, the database, and all plan math;
   the raw record list is never aggregated directly.
-- **One snapshot object** drives the whole UI: per-CLI / per-model buckets for day,
-  week, month and all-time, recent sessions, the current live model, and the active
-  LiteLLM providers' names/colors.
+- **One snapshot object** drives the **tray popup and icon**: per-CLI / per-model
+  buckets for day, week, month and all-time, recent sessions, the current live model,
+  and the active LiteLLM providers' names/colors. The report and Settings windows do
+  *not* consume it — the report reads the hourly SQLite table (plus the live store for
+  the request log and per-project totals, which the hourly table has no dimension for),
+  and both windows have their own plan / provider / cloud / updater IPC. Don't add
+  report or Settings state to the snapshot.
 - **LiteLLM providers are dynamic pseudo-CLIs** (`litellm:<id>`), built from database
   rows at runtime rather than hardcoded, and rendered anywhere a built-in CLI is.
 - **Schema changes need an explicit migration** — `db.js` only ever
