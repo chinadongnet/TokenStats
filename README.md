@@ -9,9 +9,11 @@ and surfaces per-CLI / per-model / per-day token counts, cost, and live quota wi
 in a popup that drops down from the tray icon.
 
 **Local-first**: everything comes from files on your machine, with four deliberate
-exceptions — [Cursor](#cursor-usage-network-fetched) and [LiteLLM](#litellm-providers)
-have no usable local usage data at all, [Claude's live quota](#live-quota-windows) is
-read by asking the Claude CLI itself, and [cloud sync](#cloud-sync-optional) is opt-in
+exceptions. [Cursor](#cursor-usage-local-token-cloud-counts) still starts locally — the login
+token is read out of the IDE's own `state.vscdb` — but the **counts** have to come from
+cursor.com, because that database stores them as zeros; [LiteLLM](#litellm-providers)
+is a server and has no local footprint at all; [Claude's live quota](#live-quota-windows)
+is read by asking the Claude CLI itself; and [cloud sync](#cloud-sync-optional) is opt-in
 and off by default.
 
 ```
@@ -67,7 +69,7 @@ System tray:  [▮ AI] ◄ click
 | Codex       | `~/.codex/sessions/YYYY/MM/DD/rollout-*.jsonl`        | per-turn delta of the cumulative `total_token_usage` | watched |
 | Gemini      | `~/.gemini/tmp/<project>/chats/session-*.jsonl` (and older `.json`) | per-message `tokens` | watched |
 | Antigravity | `~/.gemini/antigravity-cli/conversations/<uuid>.db` (SQLite) | per-turn usage decoded from a protobuf blob | watched |
-| Cursor      | cursor.com usage export — **not** local files         | per-request token counts | fetched, ≤ 1× / 15 min |
+| Cursor      | `%APPDATA%/Cursor/User/globalStorage/state.vscdb` for the **session token**, then cursor.com's usage export for the numbers | per-request token counts (the local db's own `tokenCount` fields are all zeros) | local read + fetch, ≤ 1× / 15 min |
 | LiteLLM     | your proxy's admin API — **not** local files          | real spend + per-model tokens and request counts | polled, per-provider interval |
 
 Token totals are made comparable across tools: Claude's includes cache creation +
@@ -141,15 +143,18 @@ Open it from the popup's chart button or the tray menu. It's backed by a local
   fees-vs-worth-by-month chart; and a per-cycle table per plan.
 - **Export PNG** — captures the whole scrollable report, not just the visible part.
 
-## Cursor usage (network-fetched)
+## Cursor usage (local token, cloud counts)
 
-Cursor's local chat database (`state.vscdb`) writes every message's token count as
-zeros in current versions — real usage is tracked **server-side only**, on the
-cursor.com dashboard. So instead of parsing local files, TokenStats:
+Cursor's local chat database — `%APPDATA%/Cursor/User/globalStorage/state.vscdb`, the
+same file the IDE writes — is still where this starts, but it writes every message's
+`tokenCount` as **zero** in current versions (confirmed by raw-scanning the whole db and
+its WAL). Real usage is tracked **server-side only**, on the cursor.com dashboard. So
+TokenStats reads that local file for the credential and gets the numbers from the
+network:
 
-1. Reads the session token the Cursor **IDE itself already stores** after you log in
-   (from `state.vscdb`) — no separate API key needed, just be logged into Cursor on
-   this machine.
+1. Opens `state.vscdb` just far enough to read the session token the Cursor **IDE
+   itself already stores** after you log in (`cursorAuth/accessToken`) — no separate API
+   key needed, just be logged into Cursor on this machine.
 2. Uses that token to call the same (undocumented) usage-export endpoint the
    cursor.com dashboard's **Usage** tab uses, and gets back real per-request token
    counts.
