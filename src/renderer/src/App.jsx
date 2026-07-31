@@ -167,26 +167,20 @@ const md = (ms) => {
 }
 const spanText = (start, end) => `${md(start)} - ${md(end - 1)}`
 
-// The week/month period THIS plan actually runs on — every plan is anchored
-// differently, so there is no global range to show. Month uses the plan's own
-// billing cycle (that's what the fee on this line is), week its weekly quota
-// window; a plan that declares neither falls back to the calendar scope the
-// numbers on the card are bucketed by.
-const planSpan = (scope, plan, ranges) => {
+// The exact global range used for the card's aggregate. Plan-specific quota and
+// billing cycles are shown separately below, and can have different anchors;
+// labeling this line with one of those cycles would misdescribe these numbers.
+const scopeSpan = (scope, ranges) => {
   if (scope === 'day') return ''
-  const w = (plan?.windows || []).find(
-    (x) => x.period === (scope === 'week' ? 'weekly' : 'monthly') && x.open && x.start != null,
-  )
-  const own = scope === 'month' ? plan?.renewal || w : w
-  if (own && own.start != null && own.end != null) return spanText(own.start, own.end)
   if (!ranges) return ''
   if (scope === 'week') {
     if (!ranges.weekStart) return ''
     return spanText(ranges.weekStart, ranges.weekStart + 7 * 864e5)
   }
-  if (!ranges.monthStart) return ''
-  const s = new Date(ranges.monthStart)
-  return spanText(ranges.monthStart, new Date(s.getFullYear(), s.getMonth() + 1, 1).getTime())
+  if (!ranges.monthStart || !ranges.dayStart) return ''
+  const end = new Date(ranges.dayStart)
+  end.setDate(end.getDate() + 1)
+  return spanText(ranges.monthStart, end.getTime())
 }
 
 // Above 100% the window's usage is worth more than its slice of the fee — the
@@ -380,8 +374,8 @@ export default function App() {
           <span>TokenStats</span>
         </div>
         <div className="hwin">
-          {/* Calendar-aligned scopes (day / week / month), so what a card shows
-              lines up with the cycles a subscription is actually counted in. */}
+          {/* Day/week use calendar boundaries; month is the latest 30 calendar
+              days so it does not collapse to day on the first of a month. */}
           <div className="seg">
             <button className={scope === 'day' ? 'on' : ''} title={t('app.scopeDay')} onClick={() => setScope('day')}>{t('scope.day')}</button>
             <button className={scope === 'week' ? 'on' : ''} title={t('app.scopeWeek')} onClick={() => setScope('week')}>{t('scope.week')}</button>
@@ -467,7 +461,7 @@ export default function App() {
                 {plan && plan.monthlyUsd > 0 && (() => {
                   const fee = scopeFee(plan.monthlyUsd, scope)
                   const pct = (d.cost / fee) * 100
-                  const span = planSpan(scope, plan, snap.ranges)
+                  const span = scopeSpan(scope, snap.ranges)
                   return (
                     <div
                       className="scoperate"

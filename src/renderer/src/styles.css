@@ -108,7 +108,7 @@ header {
 .scoperate { display: flex; align-items: baseline; gap: 4px; margin-top: 7px;
   font-size: 10.5px; color: var(--faint); font-variant-numeric: tabular-nums; }
 .scoperate b { color: var(--muted); font-weight: 600; }
-/* The plan's own week/month period — every plan is anchored differently. */
+/* Exact date range covered by the aggregate on this line. */
 .scoperate .span { color: var(--faint); }
 .scoperate em { margin-left: auto; }
 

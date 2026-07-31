@@ -71,7 +71,7 @@ const en = {
   'app.renewsTip': 'Renews {time} · ${usd}/mo',
   'app.scopeDay': 'Today (since midnight)',
   'app.scopeWeek': 'This week (since Monday)',
-  'app.scopeMonth': 'This calendar month',
+  'app.scopeMonth': 'Last 30 days (including today)',
   'app.scopeFee': 'plan {scope} share',
   'app.scopeRateTip':
     '{scope}: ${cost} of usage at pay-as-you-go rates vs ${fee} of the subscription fee for the same span (${usd}/mo ÷ {div}) — {pct}% of what it costs you',
@@ -379,7 +379,7 @@ const zh = {
   'app.renewsTip': '续订时间 {time} · ${usd}/月',
   'app.scopeDay': '今天（从零点起）',
   'app.scopeWeek': '本周（从周一起）',
-  'app.scopeMonth': '本自然月',
+  'app.scopeMonth': '最近 30 个自然日（含今天）',
   'app.scopeFee': '订阅费（按{scope}摊）',
   'app.scopeRateTip':
     '{scope}：按量计费约 ${cost}，对应同期订阅费摊销 ${fee}（${usd}/月 ÷ {div}）——相当于所付费用的 {pct}%',

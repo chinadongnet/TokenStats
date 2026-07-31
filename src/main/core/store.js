@@ -248,19 +248,20 @@ export class Store extends EventEmitter {
   }
 
   // Build the snapshot consumed by the UI.
-  snapshot() {
+  snapshot(nowMs = Date.now()) {
     const records = this.dedupedRecords()
-    const now = new Date()
+    const now = new Date(nowMs)
     const todayKey = dayKey(now.getTime())
-    // The popup's scopes are CALENDAR-aligned (day / week / month), not rolling
-    // windows, so they line up with how a subscription's quota and billing
-    // cycles are actually counted — a rolling "last 7 days" would never match
-    // the week a plan resets on.
+    // Day and week are calendar-aligned. Month is the latest 30 local calendar
+    // days (including today), so it remains a useful monthly view on the first
+    // day of a new calendar month instead of collapsing to the day view.
     const midnight = new Date(now)
     midnight.setHours(0, 0, 0, 0)
     // Week starts Monday (ISO), the common convention in both UI languages.
     const weekStart = midnight.getTime() - ((midnight.getDay() + 6) % 7) * 86400000
-    const monthStart = new Date(midnight.getFullYear(), midnight.getMonth(), 1).getTime()
+    const monthStartDate = new Date(midnight)
+    monthStartDate.setDate(monthStartDate.getDate() - 29)
+    const monthStart = monthStartDate.getTime()
 
     // 5 fixed built-in CLIs + whatever LiteLLM providers are currently active,
     // so a dynamic `litellm:<id>` cli id never hits a missing blank accumulator.
@@ -326,8 +327,8 @@ export class Store extends EventEmitter {
 
     return {
       generatedAt: now.getTime(),
-      // Calendar-aligned scope boundaries (local), so the popup can say exactly
-      // what range a scope covers.
+      // Local scope boundaries, so the popup can say exactly what range a
+      // scope covers. `monthStart` is the start of the 30-day monthly view.
       ranges: { dayStart: midnight.getTime(), weekStart, monthStart },
       totals: {
         all: sumCli(perCli),

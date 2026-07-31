@@ -11,6 +11,7 @@
     "build": "electron-vite build",
     "start": "electron-vite preview",
     "test:parsers": "node scripts/test-parsers.mjs",
+    "test:scopes": "node scripts/test-scopes.mjs",
     "test:db": "node scripts/test-db.mjs",
     "package": "electron-vite build && electron-builder --dir",
     "release": "powershell -ExecutionPolicy Bypass -File scripts/release.ps1"
