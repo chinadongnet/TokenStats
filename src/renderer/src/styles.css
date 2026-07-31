@@ -376,5 +376,25 @@ footer {
 }
 .provider-title input[type="text"]:focus { border-bottom-color: var(--line); outline: none; }
 .provider-meta { color: var(--muted); font-size: 11px; margin-top: 2px; }
+.sub-cycle-card {
+  margin-top: 10px; padding: 10px 12px; border: 1px solid var(--line); border-radius: 9px;
+  background: var(--panel2);
+}
+.sub-cycle-head, .sub-cycle-foot { display: flex; align-items: center; justify-content: space-between; gap: 12px; }
+.sub-cycle-head { margin-bottom: 8px; font-size: 11px; color: var(--muted); }
+.sub-cycle-head b { color: var(--text); font-size: 12px; }
+.sub-cycle-row {
+  display: grid; grid-template-columns: minmax(105px, 145px) 1fr 66px;
+  align-items: center; gap: 10px; min-height: 22px; color: var(--muted); font-size: 11px;
+}
+.sub-cycle-row > b { color: var(--text); text-align: right; font-variant-numeric: tabular-nums; }
+.sub-cycle-track { height: 7px; overflow: hidden; border-radius: 4px; background: rgba(255,255,255,.055); }
+.sub-cycle-track i { display: block; height: 100%; min-width: 2px; border-radius: 4px; }
+.sub-cycle-track i.fee { background: #6478cf; }
+.sub-cycle-track i.worth { background: #1fa87c; }
+.sub-cycle-foot { margin-top: 7px; color: var(--muted); font-size: 10.5px; }
+.sub-cycle-foot strong { font-size: 11px; font-weight: 700; }
+.sub-cycle-foot strong.good { color: #7ee0b8; }
+.sub-cycle-foot strong.pending { color: #e0c97e; }
 .btn.danger { color: #e07e7e; }
 .btn.danger:hover:not(:disabled) { background: rgba(224,126,126,.12); }

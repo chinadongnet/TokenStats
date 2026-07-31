@@ -392,6 +392,7 @@ function ingestNow() {
   try {
     db.ingest(store.dedupedRecords())
     if (reportWin && !reportWin.isDestroyed()) reportWin.webContents.send('report-updated')
+    if (settingsWin && !settingsWin.isDestroyed()) settingsWin.webContents.send('report-updated')
   } catch (e) {
     console.error('ingest failed:', e)
   }

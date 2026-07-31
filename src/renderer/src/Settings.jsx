@@ -76,6 +76,46 @@ const compact = (n) => {
   return String(Math.round(n))
 }
 const usd = (n) => (Number(n) || 0).toFixed(2)
+const shortDate = (ms) => new Date(ms).toLocaleDateString(undefined, { month: 'short', day: 'numeric' })
+
+function CurrentCycleCompare({ cycle }) {
+  if (!cycle) return null
+  const fee = Number(cycle.fee) || 0
+  const cost = Number(cycle.cost) || 0
+  const max = Math.max(fee, cost, 1e-9)
+  const ratio = fee > 0 ? Math.round((100 * cost) / fee) : null
+  const tone = ratio != null && ratio >= 100 ? 'good' : 'pending'
+  const bar = (value, className) => (
+    <span className="sub-cycle-track">
+      <i className={className} style={{ width: `${(100 * value) / max}%` }} />
+    </span>
+  )
+
+  return (
+    <div className="sub-cycle-card">
+      <div className="sub-cycle-head">
+        <b>{t('set.currentCycle')}</b>
+        <span>{shortDate(cycle.start)} – {shortDate(cycle.end - 1)}</span>
+      </div>
+      <div className="sub-cycle-row">
+        <span>{t('set.subscriptionFee')}</span>
+        {bar(fee, 'fee')}
+        <b>${usd(fee)}</b>
+      </div>
+      <div className="sub-cycle-row">
+        <span>{t('set.tokenUsageCost')}</span>
+        {bar(cost, 'worth')}
+        <b>${usd(cost)}</b>
+      </div>
+      <div className="sub-cycle-foot">
+        <span>{t('set.cycleTokens', { tokens: compact(cycle.tokens) })}</span>
+        <strong className={tone}>
+          {ratio == null ? t('set.noFeeRatio') : t('set.cycleValueRatio', { ratio })}
+        </strong>
+      </div>
+    </div>
+  )
+}
 
 export default function Settings() {
   const { lang, setLang } = useLang() // re-render on language switch
@@ -111,6 +151,7 @@ export default function Settings() {
     setSubStats(Object.fromEntries((stats || []).map((s) => [s.id, s])))
   }
   useEffect(() => { loadSubs() }, [])
+  useEffect(() => window.api.onReportUpdated(() => loadSubs()), [])
 
   useEffect(() => { window.api.agyGetState().then(setAgy) }, [])
   async function toggleAgy(on) {
@@ -471,6 +512,9 @@ export default function Settings() {
                     <> ({Math.round((100 * subStats[s.id].totalCost) / subStats[s.id].totalPaid)}%)</>
                   )}
                 </div>
+              )}
+              {s.active && subStats[s.id]?.currentCycle && (
+                <CurrentCycleCompare cycle={subStats[s.id].currentCycle} />
               )}
             </>
           )}

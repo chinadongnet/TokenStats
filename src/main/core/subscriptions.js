@@ -122,7 +122,7 @@ export function computeSubscriptionStats(sub, records, nowMs = Date.now()) {
     bindings: sub.bindings || [],
   }
   if (!Number.isFinite(startMs)) {
-    return { ...base, invalid: true, monthsBilled: 0, totalPaid: 0, totalCost: 0, totalTokens: 0, totalTurns: 0, cycles: [], months: [] }
+    return { ...base, invalid: true, monthsBilled: 0, totalPaid: 0, totalCost: 0, totalTokens: 0, totalTurns: 0, currentCycle: null, cycles: [], months: [] }
   }
 
   const cycles = billedCycles(sub, nowMs)
@@ -182,6 +182,10 @@ export function computeSubscriptionStats(sub, records, nowMs = Date.now()) {
     totalCost,
     totalTokens,
     totalTurns,
+    // Active plans expose their currently-open billing cycle directly so
+    // compact consumers (notably Settings) do not have to infer it from the
+    // newest-first history array.
+    currentCycle: base.active && cycles.length ? cycles[cycles.length - 1] : null,
     // newest-first, capped — the UI shows recent cycles; totals above cover all
     cycles: cycles.slice(-24).reverse(),
     // chronological calendar months (capped), for the fee-vs-worth chart
