@@ -122,7 +122,7 @@ export function computeSubscriptionStats(sub, records, nowMs = Date.now()) {
     bindings: sub.bindings || [],
   }
   if (!Number.isFinite(startMs)) {
-    return { ...base, invalid: true, monthsBilled: 0, totalPaid: 0, totalCost: 0, totalTokens: 0, totalTurns: 0, currentCycle: null, cycles: [], months: [] }
+    return { ...base, invalid: true, monthsBilled: 0, totalPaid: 0, totalCost: 0, totalTokens: 0, totalTurns: 0, currentCycle: null, peakCycle: null, cycles: [], months: [] }
   }
 
   const cycles = billedCycles(sub, nowMs)
@@ -168,11 +168,12 @@ export function computeSubscriptionStats(sub, records, nowMs = Date.now()) {
     }
   }
 
-  let totalCost = 0, totalTokens = 0, totalTurns = 0
+  let totalCost = 0, totalTokens = 0, totalTurns = 0, peakCycle = null
   for (const c of cycles) {
     totalCost += c.cost
     totalTokens += c.tokens
     totalTurns += c.turns
+    if (!peakCycle || c.tokens > peakCycle.tokens) peakCycle = c
   }
 
   return {
@@ -186,6 +187,8 @@ export function computeSubscriptionStats(sub, records, nowMs = Date.now()) {
     // compact consumers (notably Settings) do not have to infer it from the
     // newest-first history array.
     currentCycle: base.active && cycles.length ? cycles[cycles.length - 1] : null,
+    // True all-history maximum, computed before the UI history is capped to 24.
+    peakCycle,
     // newest-first, capped — the UI shows recent cycles; totals above cover all
     cycles: cycles.slice(-24).reverse(),
     // chronological calendar months (capped), for the fee-vs-worth chart

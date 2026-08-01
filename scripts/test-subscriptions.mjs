@@ -25,7 +25,7 @@ const record = (ts, total, cost) => ({
   cost,
 })
 const records = [
-  record(at(2026, 7, 20), 100, 5),
+  record(at(2026, 7, 20), 300, 5),
   record(at(2026, 8, 16), 200, 7),
 ]
 
@@ -36,8 +36,11 @@ assert.equal(active.currentCycle.fee, 20)
 assert.equal(active.currentCycle.cost, 7)
 assert.equal(active.currentCycle.tokens, 200)
 assert.equal(active.totalCost, 12)
+assert.equal(active.peakCycle.tokens, 300)
+assert.equal(active.peakCycle.cost, 5)
 
 const ended = computeSubscriptionStats({ ...plan, active: false, endDate: '2026-08-20' }, records, at(2026, 8, 20))
 assert.equal(ended.currentCycle, null)
+assert.equal(ended.peakCycle.tokens, 300)
 
 console.log('OK: active subscription exposes its current billing-cycle comparison')

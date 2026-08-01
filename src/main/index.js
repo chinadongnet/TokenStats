@@ -28,6 +28,7 @@ let tray = null
 let win = null
 let reportWin = null
 let settingsWin = null
+let cyclesWin = null
 let store = null
 let db = null
 let lastSnapshot = null
@@ -51,6 +52,7 @@ const TRAY_STRINGS = {
   en: {
     open: 'Open TokenStats',
     report: 'Token report…',
+    cycles: 'Subscription cycles…',
     settings: 'Settings…',
     refresh: 'Refresh now',
     editSources: 'Edit data sources… (other devices)',
@@ -61,6 +63,7 @@ const TRAY_STRINGS = {
   zh: {
     open: '打开 TokenStats',
     report: '用量报表…',
+    cycles: '订阅周期…',
     settings: '设置…',
     refresh: '立即刷新',
     editSources: '编辑数据源…（其他设备）',
@@ -96,7 +99,7 @@ async function init() {
   ensureConfigFile() // create ~/.tokenstats/config.json template on first run
 
   // UI language: renderer owns the instant switch (localStorage); this persists
-  // it for the tray menu and rebroadcasts to every window so all three stay in
+  // it for the tray menu and rebroadcasts to every window so all surfaces stay in
   // sync even if a cross-window storage event is missed. Registered BEFORE the
   // window loads: a renderer with no stored choice invokes 'get-language'
   // immediately, and anything registered after createWindow() can lose that race.
@@ -252,14 +255,14 @@ async function init() {
   ipcMain.handle('subs:save', (_e, payload) => {
     if (!db) return null
     const saved = db.upsertSubscription(payload)
-    if (reportWin && !reportWin.isDestroyed()) reportWin.webContents.send('report-updated')
+    notifyReportUpdated()
     broadcastSnapshot()
     return saved
   })
   ipcMain.handle('subs:delete', (_e, id) => {
     if (!db) return
     db.deleteSubscription(id)
-    if (reportWin && !reportWin.isDestroyed()) reportWin.webContents.send('report-updated')
+    notifyReportUpdated()
     broadcastSnapshot()
   })
   ipcMain.handle('subs:stats', () =>
@@ -391,8 +394,7 @@ function ingestNow() {
   lastIngest = Date.now()
   try {
     db.ingest(store.dedupedRecords())
-    if (reportWin && !reportWin.isDestroyed()) reportWin.webContents.send('report-updated')
-    if (settingsWin && !settingsWin.isDestroyed()) settingsWin.webContents.send('report-updated')
+    notifyReportUpdated()
   } catch (e) {
     console.error('ingest failed:', e)
   }
@@ -556,6 +558,44 @@ function openSettings() {
   settingsWin.on('closed', () => { settingsWin = null })
 }
 
+function openCycles() {
+  if (cyclesWin && !cyclesWin.isDestroyed()) {
+    cyclesWin.show()
+    cyclesWin.focus()
+    return
+  }
+  cyclesWin = new BrowserWindow({
+    width: 880,
+    height: 720,
+    minWidth: 640,
+    minHeight: 480,
+    show: false,
+    backgroundColor: '#0e0f13',
+    title: 'TokenStats — Subscription Cycles',
+    autoHideMenuBar: true,
+    webPreferences: {
+      preload: path.join(__dirname, '../preload/index.cjs'),
+      sandbox: false,
+    },
+  })
+  cyclesWin.removeMenu()
+  cyclesWin.webContents.on('console-message', (_e, level, message) => {
+    if (level >= 2) console.error('[cycles]', message)
+  })
+  cyclesWin.webContents.on('render-process-gone', (_e, d) => console.error('[cycles] render gone:', d.reason))
+  const devUrl = process.env.ELECTRON_RENDERER_URL
+  if (devUrl) cyclesWin.loadURL(devUrl + '#cycles')
+  else cyclesWin.loadFile(path.join(__dirname, '../renderer/index.html'), { hash: 'cycles' })
+  cyclesWin.once('ready-to-show', () => cyclesWin.show())
+  cyclesWin.on('closed', () => { cyclesWin = null })
+}
+
+function notifyReportUpdated() {
+  for (const target of [reportWin, settingsWin, cyclesWin]) {
+    if (target && !target.isDestroyed()) target.webContents.send('report-updated')
+  }
+}
+
 // Screenshot a window as PNG, then either save it to disk or copy it to the
 // clipboard. Both windows scroll their content in an inner region (body is
 // overflow:hidden), so a plain capture would clip everything below the fold —
@@ -625,6 +665,7 @@ function createTray() {
     const menu = Menu.buildFromTemplate([
       { label: tray_t('open'), click: () => showWindow() },
       { label: tray_t('report'), click: () => openReport() },
+      { label: tray_t('cycles'), click: () => openCycles() },
       { label: tray_t('settings'), click: () => openSettings() },
       { type: 'separator' },
       { label: tray_t('refresh'), click: async () => { await store.scanAll(); await store.refreshNetworkParsers(); await Promise.all(store.pollers.map((p) => store.forcePoll(p.cli))); broadcastSnapshot() } },

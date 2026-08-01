@@ -245,6 +245,32 @@ footer {
 
 .rep-foot { color: var(--muted); font-size: 11px; text-align: center; margin-top: 6px; }
 
+/* ---------------- Dedicated subscription-cycle window ---------------- */
+.cycles-view { padding: 18px 20px 24px; }
+.cycle-summary .cycle-metric { background: var(--panel); border: 1px solid var(--line); }
+.cycle-card-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(330px, 1fr)); gap: 14px; }
+.cycle-card { background: var(--panel); border: 1px solid var(--line); border-radius: 14px; padding: 15px 16px; }
+.cycle-card-head { display: flex; align-items: flex-start; justify-content: space-between; gap: 12px; margin-bottom: 13px; }
+.cycle-card-head h2 { margin: 0 0 4px; font-size: 16px; }
+.cycle-card-head > div > span { color: var(--muted); font-size: 11px; }
+.cycle-metrics { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 8px; }
+.cycle-metric { min-width: 0; padding: 10px 11px; border-radius: 9px; background: var(--panel2); }
+.cycle-metric > span { display: block; color: var(--muted); font-size: 10.5px; text-transform: uppercase; letter-spacing: .35px; }
+.cycle-metric > b { display: block; margin: 4px 0 2px; font-size: 21px; line-height: 1.1; font-variant-numeric: tabular-nums; overflow: hidden; text-overflow: ellipsis; }
+.cycle-metric > b.worth, .cycle-metric > b.good { color: #7ee0b8; }
+.cycle-metric > b.pending { color: #e0c97e; }
+.cycle-metric > small { display: block; min-height: 13px; color: var(--faint); font-size: 10px; }
+.cycle-bars { margin-top: 12px; padding-top: 10px; border-top: 1px solid var(--line); }
+.cycle-bar-row { display: grid; grid-template-columns: 112px 1fr 62px; align-items: center; gap: 9px; min-height: 23px; color: var(--muted); font-size: 11px; }
+.cycle-bar-row > i { height: 7px; overflow: hidden; border-radius: 4px; background: var(--panel2); }
+.cycle-bar-row > i > em { display: block; min-width: 2px; height: 100%; border-radius: 4px; }
+.cycle-bar-row > i > em.fee { background: #6478cf; }
+.cycle-bar-row > i > em.worth { background: #1fa87c; }
+.cycle-bar-row > b { color: var(--text); text-align: right; font-variant-numeric: tabular-nums; }
+.cycle-peak { display: grid; grid-template-columns: 1fr auto auto; align-items: baseline; gap: 5px 10px; margin-top: 10px; padding: 9px 10px; border-radius: 8px; background: rgba(255,255,255,.025); color: var(--muted); font-size: 11px; }
+.cycle-peak b { color: var(--text); font-variant-numeric: tabular-nums; }
+.cycle-peak > small { grid-column: 1 / -1; color: var(--faint); }
+
 /* --- request log --- */
 .sel { background: var(--panel); border: 1px solid var(--line); color: var(--text);
   border-radius: 8px; padding: 6px 10px; font-size: 12px; cursor: pointer; }
