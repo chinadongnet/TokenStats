@@ -234,6 +234,10 @@ async function init() {
     db.deleteLitellmProvider(id)
     refreshLitellmPollers()
     broadcastSnapshot()
+    // The deleted provider's rows vanish locally on the next ingest, but the
+    // cloud only replaces a rolling recent window per sync — schedule a full
+    // push so its older rows don't linger on tokenstat-web forever.
+    db.updateCloudSyncState({ fullResync: true })
   })
   // Throttle-free live fetch for the Settings UI's "load models" action —
   // works for a not-yet-saved draft provider too.
@@ -324,6 +328,11 @@ async function init() {
     if (!db) return
     db.saveModelSetting(payload)
     if (store?.reapplyPoller('litellm:' + payload.providerId)) broadcastSnapshot()
+    // Hiding/renaming a model rewrites the WHOLE local history (the archive
+    // keeps raw ids and settings re-apply on load), but a normal sync only
+    // replaces the recent window server-side — without a full push the cloud
+    // would keep showing the old name (or a hidden model's rows) beyond it.
+    db.updateCloudSyncState({ fullResync: true })
   })
 
   ensureAgyHook() // re-assert the agy statusLine hook file if the user enabled it
