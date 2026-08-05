@@ -95,6 +95,10 @@ if (!app.requestSingleInstanceLock()) {
 
 async function init() {
   app.setAppUserModelId('com.tokenstats.app')
+  // Tray-only app: no Dock icon on macOS. The packaged .app also sets
+  // LSUIElement (package.json build.mac.extendInfo), but dev runs from out/
+  // with Electron's own Info.plist, so hide programmatically too.
+  if (process.platform === 'darwin') app.dock?.hide()
   migrateLegacyRunKeys() // one-time: drop the pre-rename com.tokenstatus.app Run value
   ensureConfigFile() // create ~/.tokenstats/config.json template on first run
 
@@ -175,8 +179,10 @@ async function init() {
     buildTime: __BUILD_TIME__,
     repo: UPDATE_REPO,
     releasesUrl: RELEASES_URL,
-    // Dev runs from out/ and can't be replaced by the installer.
-    packaged: app.isPackaged,
+    // Gates the one-click install button: dev runs from out/ and can't be
+    // replaced by the installer, and the release asset is a Windows NSIS .exe,
+    // so a packaged macOS build must fall back to "open the releases page" too.
+    packaged: app.isPackaged && process.platform === 'win32',
   }))
   ipcMain.handle('update:check', () => checkForUpdate(__APP_VERSION__))
   ipcMain.handle('update:download', async (e, asset) => {
