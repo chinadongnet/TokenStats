@@ -223,10 +223,21 @@ async function init() {
   ipcMain.handle('litellm:list-providers', () => db?.listLitellmProviders() ?? [])
   ipcMain.handle('litellm:save-provider', async (_e, payload) => {
     if (!db) return null
+    const prev = payload?.id ? db.getLitellmProvider(payload.id) : null
     const saved = db.upsertLitellmProvider(payload)
     refreshLitellmPollers()
     await store?.forcePoll('litellm:' + saved.id)
     broadcastSnapshot()
+    // Toggling a provider's enabled state changes history far beyond the
+    // rolling sync window: disabling drops all its rows from the next ingest,
+    // enabling (re-)surfaces archive rows older than the window. Either way
+    // the cloud needs a full push. Ingest synchronously first so the full
+    // pass can't capture pre-change rows through the 4s ingest throttle.
+    if (!!prev?.enabled !== !!saved.enabled) {
+      ingestNow()
+      db.updateCloudSyncState({ fullResync: true })
+      runCloudSync()
+    }
     return saved
   })
   ipcMain.handle('litellm:delete-provider', (_e, id) => {
@@ -234,6 +245,13 @@ async function init() {
     db.deleteLitellmProvider(id)
     refreshLitellmPollers()
     broadcastSnapshot()
+    // The deleted provider's rows vanish locally on the next ingest, but the
+    // cloud only replaces a rolling recent window per sync — do that ingest
+    // NOW (past the 4s throttle) and schedule a full push so its older rows
+    // don't linger on tokenstat-web forever.
+    ingestNow()
+    db.updateCloudSyncState({ fullResync: true })
+    runCloudSync()
   })
   // Throttle-free live fetch for the Settings UI's "load models" action —
   // works for a not-yet-saved draft provider too.
@@ -322,8 +340,26 @@ async function init() {
   ipcMain.handle('litellm:known-models', (_e, providerId) => db?.modelsForCli('litellm:' + providerId) ?? [])
   ipcMain.handle('litellm:save-model-setting', (_e, payload) => {
     if (!db) return
+    // The Settings UI fires this on every rename-input blur, edited or not —
+    // bail on no-ops, or focusing and leaving a field would schedule a full
+    // history resync each time. Compare against the same normalization
+    // saveModelSetting applies (visible defaults true, name trimmed-or-null).
+    const prev = db.getModelSettingsMap(payload.providerId).get(payload.model)
+    const nextVisible = payload.visible !== false
+    const nextName =
+      typeof payload.displayName === 'string' && payload.displayName.trim() ? payload.displayName.trim() : null
+    if ((prev ? prev.visible : true) === nextVisible && (prev?.displayName || null) === nextName) return
     db.saveModelSetting(payload)
     if (store?.reapplyPoller('litellm:' + payload.providerId)) broadcastSnapshot()
+    // Hiding/renaming a model rewrites the WHOLE local history (the archive
+    // keeps raw ids and settings re-apply on load), but a normal sync only
+    // replaces the recent window server-side — without a full push the cloud
+    // would keep showing the old name (or a hidden model's rows) beyond it.
+    // Ingest synchronously first so the full pass can't capture pre-change
+    // rows through the 4s ingest throttle.
+    ingestNow()
+    db.updateCloudSyncState({ fullResync: true })
+    runCloudSync()
   })
 
   ensureAgyHook() // re-assert the agy statusLine hook file if the user enabled it
@@ -349,13 +385,33 @@ function buildLiveByCli() {
   return { codex: codexResetWindows(), claude: claudeResetWindows(), cursor: cursorResetWindows(), agy: agyResetWindows() }
 }
 
-// One in-flight cloud sync at a time; a call while one runs just returns the
-// running promise (the next timer tick will pick up anything it missed).
+// One in-flight cloud sync at a time. A call while one runs does NOT just
+// coalesce onto it: the caller's reason (typically a Settings change that
+// rewrote rows and flagged full_resync) refers to state the running pass
+// already captured, so exactly one follow-up pass is queued behind it.
 let cloudSyncInFlight = null
+let cloudSyncQueued = null
+let cloudSyncQueuedFull = false
 let cloudSyncLastAttempt = 0
 function runCloudSync(opts = {}) {
   if (!db || !store) return Promise.resolve({ ok: false, skipped: true })
-  if (cloudSyncInFlight) return cloudSyncInFlight
+  if (cloudSyncInFlight) {
+    // Merge every joiner's intent into the one queued pass — a later
+    // { fullOverride: true } must upgrade it, not silently ride an
+    // incremental one.
+    cloudSyncQueuedFull = cloudSyncQueuedFull || !!opts.fullOverride
+    if (!cloudSyncQueued) {
+      cloudSyncQueued = cloudSyncInFlight
+        .catch(() => {})
+        .then(() => {
+          const full = cloudSyncQueuedFull
+          cloudSyncQueued = null
+          cloudSyncQueuedFull = false
+          return runCloudSync({ fullOverride: full })
+        })
+    }
+    return cloudSyncQueued
+  }
   cloudSyncLastAttempt = Date.now()
   cloudSyncInFlight = performSync({
     db,
