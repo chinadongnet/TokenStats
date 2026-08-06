@@ -83,10 +83,17 @@ export function buildStatusSnapshot({ db, store, liveByCli, appVersion }) {
         .filter((w) => w.source === 'live' && w.open)
         .map((w) => ({
           label: PERIOD_LABEL[w.period] || String(w.period),
+          // Structured window identity + span + usage, so the web can anchor a
+          // plan's 周/月 usage row to the actual quota cycle instead of the
+          // calendar week/month and land on the same numbers the popup shows.
+          period: w.period || null,
+          startMs: w.start ?? (w.end != null && w.periodMs > 0 ? w.end - w.periodMs : null),
           remainingPct: Math.round(
             w.remainingPercent != null ? w.remainingPercent : w.usedPercent != null ? 100 - w.usedPercent : 0
           ),
           endMs: w.end ?? null,
+          tokens: w.tokens || 0,
+          cost: round2(w.cost || 0),
           title: `窗口内已用 ${w.tokens || 0} tokens / $${(w.cost || 0).toFixed(2)}`,
         }))
       if (!windows.length && !(e.monthlyUsd > 0)) return null
