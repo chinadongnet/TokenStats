@@ -142,12 +142,13 @@ export async function performSync({ db, store, liveByCli, appVersion, fullOverri
 
   const now = Date.now()
   const full = fullOverride || cfg.fullResync
-  // Consume the flag NOW rather than clearing it after the pushes complete: a
-  // Settings change landing while this sync is in flight re-raises it, and a
-  // clear-at-completion would silently swallow that new request (whose rows
-  // were rewritten AFTER this pass captured its data). A failed full pass
-  // re-raises the flag below so the retry stays full.
-  if (cfg.fullResync) db.updateCloudSyncState({ fullResync: false })
+  // The full_resync flag stays SET on disk until every batch lands — the first
+  // full batch wipes the server with replaceFrom: 0, so a crash mid-loop must
+  // resume as a full push on restart, not shrink back to the rolling window.
+  // The generation counter tells a mid-flight re-raise (Settings change whose
+  // rewritten rows this pass captured too early) apart from the raise being
+  // consumed here; see db.updateCloudSyncState.
+  const genAtStart = db.fullResyncGen || 0
   const fromMs = full ? 0 : now - RESYNC_WINDOW_MS
   const rows = db.hourlySince(fromMs)
   const device = {
@@ -176,11 +177,12 @@ export async function performSync({ db, store, liveByCli, appVersion, fullOverri
       })
       sent += data.accepted || 0
     }
-    db.updateCloudSyncState({ lastSyncAt: now, lastError: null })
+    const clearFull = cfg.fullResync && (db.fullResyncGen || 0) === genAtStart
+    db.updateCloudSyncState({ lastSyncAt: now, lastError: null, ...(clearFull ? { fullResync: false } : {}) })
     return { ok: true, sent, full }
   } catch (e) {
     const msg = e.name === 'AbortError' ? 'timeout' : String(e.message || e)
-    db.updateCloudSyncState({ lastError: msg, ...(full ? { fullResync: true } : {}) })
+    db.updateCloudSyncState({ lastError: msg }) // flag untouched — a failed full pass retries full
     return { ok: false, error: msg }
   }
 }

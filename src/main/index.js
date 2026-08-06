@@ -391,14 +391,24 @@ function buildLiveByCli() {
 // already captured, so exactly one follow-up pass is queued behind it.
 let cloudSyncInFlight = null
 let cloudSyncQueued = null
+let cloudSyncQueuedFull = false
 let cloudSyncLastAttempt = 0
 function runCloudSync(opts = {}) {
   if (!db || !store) return Promise.resolve({ ok: false, skipped: true })
   if (cloudSyncInFlight) {
+    // Merge every joiner's intent into the one queued pass — a later
+    // { fullOverride: true } must upgrade it, not silently ride an
+    // incremental one.
+    cloudSyncQueuedFull = cloudSyncQueuedFull || !!opts.fullOverride
     if (!cloudSyncQueued) {
       cloudSyncQueued = cloudSyncInFlight
         .catch(() => {})
-        .then(() => { cloudSyncQueued = null; return runCloudSync(opts) })
+        .then(() => {
+          const full = cloudSyncQueuedFull
+          cloudSyncQueued = null
+          cloudSyncQueuedFull = false
+          return runCloudSync({ fullOverride: full })
+        })
     }
     return cloudSyncQueued
   }

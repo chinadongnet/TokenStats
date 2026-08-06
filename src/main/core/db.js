@@ -364,6 +364,7 @@ export class UsageDb {
   // of this device's history.
   saveCloudSync({ endpoint, apiKey, enabled, syncMinutes }) {
     this.getCloudSync() // ensure row
+    this.fullResyncGen = (this.fullResyncGen || 0) + 1
     this.db.run(
       'UPDATE cloud_sync SET endpoint=?, api_key=?, enabled=?, sync_minutes=?, full_resync=1, last_error=NULL WHERE id=1',
       [String(endpoint || '').trim(), String(apiKey || '').trim(), enabled ? 1 : 0, Number(syncMinutes) > 0 ? Number(syncMinutes) : 10]
@@ -373,6 +374,13 @@ export class UsageDb {
   }
 
   // Post-sync bookkeeping (lastSyncAt/lastError/fullResync), not user config.
+  // `fullResyncGen` (process-local, NOT persisted) counts every raise of the
+  // flag: performSync captures it before pushing and clears the flag afterward
+  // only if it hasn't moved, so a Settings change landing mid-sync — whose
+  // rewritten rows that pass captured too early — is never silently cleared.
+  // The flag itself stays SET on disk for the whole pass, so a crash between
+  // batches (the first of which already wiped the server with replaceFrom: 0)
+  // resumes as a full push on restart.
   updateCloudSyncState({ lastSyncAt, lastError, fullResync } = {}) {
     this.getCloudSync() // ensure row
     const sets = []
@@ -380,6 +388,7 @@ export class UsageDb {
     if (lastSyncAt !== undefined) { sets.push('last_sync_at=?'); args.push(lastSyncAt) }
     if (lastError !== undefined) { sets.push('last_error=?'); args.push(lastError) }
     if (fullResync !== undefined) { sets.push('full_resync=?'); args.push(fullResync ? 1 : 0) }
+    if (fullResync) this.fullResyncGen = (this.fullResyncGen || 0) + 1
     if (!sets.length) return
     this.db.run(`UPDATE cloud_sync SET ${sets.join(', ')} WHERE id=1`, args)
     this.persist()
