@@ -142,6 +142,12 @@ export async function performSync({ db, store, liveByCli, appVersion, fullOverri
 
   const now = Date.now()
   const full = fullOverride || cfg.fullResync
+  // Consume the flag NOW rather than clearing it after the pushes complete: a
+  // Settings change landing while this sync is in flight re-raises it, and a
+  // clear-at-completion would silently swallow that new request (whose rows
+  // were rewritten AFTER this pass captured its data). A failed full pass
+  // re-raises the flag below so the retry stays full.
+  if (cfg.fullResync) db.updateCloudSyncState({ fullResync: false })
   const fromMs = full ? 0 : now - RESYNC_WINDOW_MS
   const rows = db.hourlySince(fromMs)
   const device = {
@@ -170,11 +176,11 @@ export async function performSync({ db, store, liveByCli, appVersion, fullOverri
       })
       sent += data.accepted || 0
     }
-    db.updateCloudSyncState({ lastSyncAt: now, lastError: null, fullResync: false })
+    db.updateCloudSyncState({ lastSyncAt: now, lastError: null })
     return { ok: true, sent, full }
   } catch (e) {
     const msg = e.name === 'AbortError' ? 'timeout' : String(e.message || e)
-    db.updateCloudSyncState({ lastError: msg })
+    db.updateCloudSyncState({ lastError: msg, ...(full ? { fullResync: true } : {}) })
     return { ok: false, error: msg }
   }
 }
