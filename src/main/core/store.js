@@ -12,6 +12,13 @@ import { CLIS } from './paths.js'
 
 const PARSERS = [claude, codex, geminiJsonl, geminiJson, antigravity, cursor]
 
+// How often the stat sweep re-checks every known file (see start()). Codex
+// appends to its open rollout file without the mtime ever moving, so chokidar
+// stats the file on the OS event, sees no movement and drops it — measured on
+// a real machine, 98% of a day's Codex usage never reached the UI. A warm
+// sweep over ~2.6k files costs ~550ms and is almost entirely fs.stat.
+const SWEEP_MS = 15 * 1000
+
 // In-memory index of every parsed file:
 //   path -> { parser, size, mtimeMs, state, records[] }
 // JSONL files are tailed incrementally from the last byte offset; JSON files
@@ -138,14 +145,19 @@ export class Store extends EventEmitter {
     return true
   }
 
+  // Walks every root and re-ingests anything whose size or mtime moved.
+  // Returns true if any file's records changed, so callers (the sweep timer in
+  // start(), the tray's "refresh") can decide whether to emit an update.
   async scanAll() {
+    let changed = false
     for (const parser of PARSERS) {
       for (const root of parser.roots) {
         for (const file of await walk(root, parser.match)) {
-          await this.ingestFile(file)
+          if (await this.ingestFile(file)) changed = true
         }
       }
     }
+    return changed
   }
 
   // Force-refresh the network-backed file parsers (currently just Cursor, whose
@@ -384,6 +396,24 @@ export class Store extends EventEmitter {
       if (await this.refreshNetworkParsers()) this.emit('update', this.snapshot())
     }, 5 * 60 * 1000)
     this._pollTimers.push(netTimer)
+    // Stat-sweep fallback for writers the fs-event path goes deaf on. Codex
+    // holds its rollout file open for the whole session and appends without
+    // the mtime ever changing: the OS event does fire, but chokidar stats the
+    // file, sees neither mtime nor its own cached size move, and drops the
+    // event — so a session's usage only ever landed when a NEW rollout file
+    // was created. ingestFile() compares size as well as mtime, so a plain
+    // stat sweep catches exactly what chokidar throws away. Polling mode
+    // (usePolling) does NOT help — it makes the same stat comparison.
+    const sweepTimer = setInterval(async () => {
+      if (this._sweeping) return // a cold-ish sweep must not stack up
+      this._sweeping = true
+      try {
+        if (await this.scanAll()) this.emit('update', this.snapshot())
+      } finally {
+        this._sweeping = false
+      }
+    }, SWEEP_MS)
+    this._pollTimers.push(sweepTimer)
     const chokidar = (await import('chokidar')).default
     const roots = [...new Set(PARSERS.flatMap((p) => p.roots))]
     for (const root of roots) {

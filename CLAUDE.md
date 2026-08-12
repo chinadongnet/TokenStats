@@ -170,6 +170,17 @@ testable via `npm run test:parsers`.
     This is the only object the UI consumes.
   - `start()` does the initial scan, then sets up `chokidar` watchers and emits
     debounced `'update'` events (400ms) carrying a fresh snapshot.
+  - **The `chokidar` watchers are not sufficient on their own** — `start()` also
+    runs a **stat sweep** (`scanAll()`) every `SWEEP_MS` (15s) and emits an update
+    if anything moved. **Codex** holds its rollout file open for a whole session
+    and appends **without the mtime ever changing**; the OS event does fire, but
+    chokidar stats the file, sees no movement and drops it, so a session's usage
+    only ever landed when a *new* rollout file was created (measured: 98% of a
+    day's Codex usage never reached the UI). `ingestFile()` compares **size as
+    well as mtime**, so the sweep catches exactly what chokidar throws away.
+    `usePolling` does **not** help — it makes the same stat comparison. A warm
+    sweep over ~2.6k files costs ~550ms, nearly all of it `fs.stat`; the
+    `_sweeping` guard stops slow sweeps from stacking up.
   - **Pollers** (`this.pollers`, an **instance field**, not a static array) are usage
     sources with nothing on disk to watch — currently only LiteLLM providers, one
     poller per enabled provider row. `index.js`'s `refreshLitellmPollers()` rebuilds
@@ -598,6 +609,14 @@ below. No router, no state library.
   `total_token_usage`, Gemini `gemini`-type messages' `tokens`). A CLI update can change
   them — e.g. Gemini switched chat logs from `.json` to `.jsonl`, which is why both are
   parsed. Validate with `npm run test:parsers` against real data after any CLI update.
+  Codex's **`rate_limits`** block is the one that has actually moved: it used to report
+  `primary` = 5h and `secondary` = weekly, and since ~2026-07 reports **weekly in
+  `primary` with `secondary` null** (so the popup's Codex 5h card silently disappeared —
+  not a bug), alongside new `credits` / `plan_type` / `limit_id` keys. `codexResetWindows()`
+  therefore iterates **every value that looks like a window** (`normalizeWindow()` requires
+  a numeric `used_percent`, which the metadata keys lack), deduped by `windowMinutes` and
+  sorted shortest-first — never read fixed slot names here. Token usage itself
+  (`info.total_token_usage`) has not changed.
 - **De-duplication (accuracy-critical)**: two CLIs write the *same* usage row to disk
   multiple times, which would massively inflate totals if counted naively:
   - **Claude** emits one JSONL line per assistant *content block* (thinking / text /

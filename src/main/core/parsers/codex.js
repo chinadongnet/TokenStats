@@ -46,12 +46,27 @@ function normalizeWindow(w) {
   }
 }
 
-// Newest known plan-quota windows (5h / weekly), or [] if Codex never reported
-// any. Read by the `codex:limits` IPC handler.
+// Newest known plan-quota windows, shortest first, or [] if Codex never
+// reported any. Read by the `codex:limits` IPC handler.
+//
+// The slots this arrives in are NOT stable across Codex versions: it used to
+// report primary = 5h and secondary = weekly; since ~2026-07 it reports the
+// weekly window in `primary` and leaves `secondary` null, and the payload has
+// grown unrelated keys (`credits`, `plan_type`, `limit_id`, …). Reading fixed
+// key names silently dropped the surviving window's siblings, so instead take
+// every value that *looks* like a window — normalizeWindow() requires a
+// numeric used_percent, which the metadata keys don't have. A renamed or
+// added slot then shows up with no code change.
 export function codexResetWindows() {
   const rl = latestLimits?.rate_limits
-  if (!rl) return []
-  return [rl.primary, rl.secondary].map(normalizeWindow).filter(Boolean)
+  if (!rl || typeof rl !== 'object') return []
+  const byWindow = new Map()
+  for (const w of Object.values(rl)) {
+    const win = normalizeWindow(w)
+    // Same window reported under two keys: keep the first (they agree).
+    if (win && !byWindow.has(win.windowMinutes)) byWindow.set(win.windowMinutes, win)
+  }
+  return [...byWindow.values()].sort((a, b) => a.windowMinutes - b.windowMinutes)
 }
 
 export const codex = {
