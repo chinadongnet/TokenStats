@@ -20,15 +20,41 @@ import fs from 'node:fs'
 // weekly one; per-model weekly lines (e.g. Fable) are skipped to avoid clutter.
 //
 // Because each call spawns the CLI and hits the network (unlike Codex, whose
-// numbers sit in local logs), it is throttled to once every 15 minutes and the
-// accessor returns the cached value while a stale refresh runs in the
-// background — so the IPC handler stays synchronous and fast.
+// numbers sit in local logs), it is throttled and the accessor returns the
+// cached value while a stale refresh runs in the background — so the IPC
+// handler stays synchronous and fast.
+//
+// **The scrape is slow and fails intermittently** (measured 2026-08): `/usage`
+// now also renders a "What's contributing to your limits usage" analysis over
+// the local session history, and a plain `-p` run boots every configured MCP
+// server first — together 6-23s on a busy machine, against what used to be a
+// 30s timeout. Two things follow, and both are load-bearing:
+//   - `--strict-mcp-config` (with no --mcp-config alongside it) loads NO MCP
+//     servers, which is the single biggest win: ~3-4s instead of ~8-23s. The
+//     quota lines are account state, so none of them needs a server.
+//   - `-p` buffers its whole output and flushes at the end, so a run killed on
+//     timeout yields **empty stdout** — a failure is indistinguishable from
+//     "no data". Failures must therefore never be allowed to look like success:
+//     they retry sooner (with backoff), and claudeResetWindows() ages the cache
+//     out instead of serving it forever. A frozen cache is worse than none —
+//     mergeLiveLimits() drops a window whose reset time has passed (`open`),
+//     so a stale 5h window silently vanishes from the popup while the weekly
+//     one keeps showing a stuck percentage, with nothing anywhere saying why.
 
-const REFRESH_MS = 15 * 60 * 1000
-const RUN_TIMEOUT_MS = 30 * 1000
+const REFRESH_MS = 15 * 60 * 1000 // between successful scrapes
+const RETRY_MS = 2 * 60 * 1000 // after a failure, × consecutive failures, capped at REFRESH_MS
+const RUN_TIMEOUT_MS = 120 * 1000 // one scrape; the CLI got slow, see above
+const WATCHDOG_MS = RUN_TIMEOUT_MS + 15 * 1000 // hard settle guarantee for one run
+const STALE_MS = 45 * 60 * 1000 // stop serving a cache no refresh has renewed
 
-let cache = { windows: [], fetchedAt: 0 }
+const RUN_ARGS = ['-p', '--output-format', 'text', '--strict-mcp-config']
+
+let cache = { windows: [], okAt: 0 }
+let nextAt = 0 // earliest next attempt
+let fails = 0
 let inflight = null
+let inflightAt = 0
+let gen = 0 // guards an abandoned run from clobbering a newer one's result
 
 function findClaudeBin() {
   const home = os.homedir()
@@ -89,31 +115,80 @@ export function parseClaudeUsage(text) {
   return out
 }
 
+// execFile's own `timeout` only signals the direct child, and its callback waits
+// for the stdio pipes to close — helper processes that outlive the CLI keep them
+// open, so 'close' (and the callback) can never fire. Take the whole tree.
+function killTree(child) {
+  if (!child) return
+  try {
+    if (process.platform === 'win32' && child.pid) {
+      execFile('taskkill', ['/PID', String(child.pid), '/T', '/F'], { windowsHide: true }, () => {})
+    } else {
+      child.kill('SIGKILL')
+    }
+  } catch {
+    // already gone — nothing to kill
+  }
+}
+
+// Resolves the parsed windows, or null on any failure. ALWAYS settles.
 function runUsage() {
   return new Promise((resolve) => {
-    let child
+    let settled = false
+    let timer = null
+    let child = null
+    const finish = (v) => {
+      if (settled) return
+      settled = true
+      if (timer) clearTimeout(timer)
+      resolve(v)
+    }
     try {
       child = execFile(
         findClaudeBin(),
-        ['-p', '--output-format', 'text'],
+        RUN_ARGS,
         { timeout: RUN_TIMEOUT_MS, windowsHide: true, cwd: os.tmpdir(), maxBuffer: 1 << 20 },
-        (err, stdout) => resolve(err && !stdout ? null : parseClaudeUsage(stdout))
+        (err, stdout) => finish(err && !stdout ? null : parseClaudeUsage(stdout))
       )
+      // A child that exits early makes this write EPIPE, and an unhandled
+      // 'error' on a child stream takes the whole main process down with it.
+      child.stdin.on('error', () => {})
       child.stdin.end('/usage\n')
     } catch {
-      resolve(null) // claude not installed / spawn failed
+      finish(null) // claude not installed / spawn failed
+      return
     }
+    timer = setTimeout(() => {
+      killTree(child)
+      finish(null)
+    }, WATCHDOG_MS)
   })
 }
 
 function refresh() {
-  if (inflight) return inflight
+  const now = Date.now()
+  // A run that never settled must not wedge every later refresh: past the
+  // watchdog it is abandoned (its result is ignored via `gen`) and a fresh one
+  // starts.
+  if (inflight && now - inflightAt < WATCHDOG_MS) return inflight
+  const my = ++gen
+  inflightAt = now
   inflight = (async () => {
+    const startedAt = Date.now()
     const w = await runUsage()
-    // On success replace the cache; on failure just bump the timestamp so a
-    // broken/uninstalled CLI isn't re-spawned every snapshot.
-    if (w && w.length) cache = { windows: w, fetchedAt: Date.now() }
-    else cache = { windows: cache.windows, fetchedAt: Date.now() }
+    if (my !== gen) return cache.windows // abandoned run; a newer one owns the cache
+    if (w && w.length) {
+      fails = 0
+      cache = { windows: w, okAt: Date.now() }
+      nextAt = Date.now() + REFRESH_MS
+    } else {
+      // Keep the windows for now — claudeResetWindows() ages them out — but come
+      // back sooner than a full cycle, backing off if it keeps failing so a
+      // broken/uninstalled CLI isn't re-spawned every couple of minutes.
+      fails += 1
+      nextAt = Date.now() + Math.min(REFRESH_MS, RETRY_MS * fails)
+      console.error(`[claudeLimits] /usage scrape failed after ${Date.now() - startedAt}ms (${fails}x)`)
+    }
     inflight = null
     return cache.windows
   })()
@@ -125,9 +200,14 @@ export function primeClaudeLimits() {
   return refresh()
 }
 
-// Newest Claude plan-quota windows, or [] if none yet. Returns the cached value
-// immediately and kicks a background refresh when it's older than 15 minutes.
+// Newest Claude plan-quota windows, or [] if none is current. Returns the
+// cached value immediately and kicks a background refresh when one is due.
+// Nothing frozen is ever served: a window whose reset time has passed, and a
+// whole cache no refresh has renewed within STALE_MS, are dropped so the popup
+// falls back to the plan's estimate instead of showing a stuck number.
 export function claudeResetWindows() {
-  if (Date.now() - cache.fetchedAt >= REFRESH_MS) refresh()
-  return cache.windows
+  const now = Date.now()
+  if (now >= nextAt) refresh()
+  if (!cache.okAt || now - cache.okAt > STALE_MS) return []
+  return cache.windows.filter((w) => w.resetsAt == null || w.resetsAt > now)
 }

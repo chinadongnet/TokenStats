@@ -333,6 +333,23 @@ testable via `npm run test:parsers`.
   though it has a renewal date), and ownership goes through the same exclusive
   `planAssigner`, so overlapping plans never double-count. Consumed by the tray
   popup, not the report.
+- **`claudeLimits.js`** — Claude Code's **live** plan quota (5h + weekly), which is
+  server-side and absent from the jsonl logs. There's no endpoint, so it shells out
+  to `claude -p /usage` (`--strict-mcp-config`, so no MCP server is booted) and
+  scrapes the `Current session:` / `Current week (all models):` lines into the same
+  window shape `codexResetWindows()` returns, for `mergeLiveLimits()`'s overlay.
+  Cached; refreshed in the background so `claudeResetWindows()` stays synchronous.
+  **Two gotchas, both fixed the hard way**: the scrape got slow (`/usage` now also
+  analyzes the local session history — seconds to tens of seconds), and `-p`
+  **buffers its whole output to the end**, so a run killed on timeout returns
+  *empty stdout* — a failure looks exactly like "no data". Serving the last good
+  value on failure is therefore not safe: `mergeLiveLimits()` hides a window whose
+  reset time has passed, so a frozen cache makes the popup's Claude 5h card silently
+  disappear while the weekly one shows a stuck percentage. Hence the cache **ages
+  out** (`STALE_MS`), expired windows are dropped, failures retry with backoff and
+  log, and a run that never settles is abandoned rather than wedging every later
+  refresh. If the Claude quota card goes missing, look here first — and check
+  whether `/usage`'s wording changed.
 - **`paths.js`** — resolves the data roots and reads user config. Each of the 5 fixed
   CLIs has an array of roots (`CLI_ROOTS[cli]`): the local dir first (overridable via
   `AIMON_*_ROOT` env vars), then any **extra dirs** listed under `extraRoots` in
