@@ -1,9 +1,6 @@
-import fs from 'node:fs'
+import fsp from 'node:fs/promises'
 import path from 'node:path'
-import { createRequire } from 'node:module'
 import { CLI_ROOTS } from '../paths.js'
-
-const require = createRequire(import.meta.url)
 
 // Cursor's IDE keeps a local chat/composer db (state.vscdb, table cursorDiskKV)
 // but — verified 2026-07 by raw-scanning the whole db + WAL for token fields —
@@ -41,32 +38,64 @@ const require = createRequire(import.meta.url)
 // it) and throttled to at most once every 15 minutes to stay well clear of
 // whatever rate limit produced the 403s above.
 
-let sqlPromise = null
-function getSql() {
-  if (!sqlPromise) {
-    const initSqlJs = require('sql.js')
-    const wasmPath = path.join(path.dirname(require.resolve('sql.js')), 'sql-wasm.wasm')
-    sqlPromise = initSqlJs({ wasmBinary: fs.readFileSync(wasmPath) })
-  }
-  return sqlPromise
-}
-
-function toText(value) {
-  if (value == null) return null
-  if (typeof value === 'string') return value
-  try {
-    return Buffer.from(value).toString('utf8')
-  } catch {
-    return null
-  }
-}
-
 function decodeJwt(token) {
   try {
     const [, payloadB64] = token.split('.')
     return JSON.parse(Buffer.from(payloadB64, 'base64url').toString('utf8'))
   } catch {
     return null
+  }
+}
+
+// Cursor's SQLite database can become enormous (multi-gigabyte on active
+// installs). Loading it into sql.js first requires one Buffer for the entire
+// file, while Node's fs.readFile rejects files at 2 GiB. The ItemTable record
+// stores this key immediately before its JWT value, so locate and validate that
+// small record with bounded, overlapping reads instead. This also keeps the
+// parser free of native SQLite modules that need Electron-specific rebuilds.
+const ACCESS_TOKEN_KEY = Buffer.from('cursorAuth/accessToken')
+const TOKEN_LOOKAHEAD = 2048
+const TOKEN_SCAN_CHUNK = 256 * 1024
+const TOKEN_SCAN_LIMIT = 256 * 1024 * 1024
+const JWT_RE = /eyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+/g
+
+export async function readAccessToken(file) {
+  const handle = await fsp.open(file, 'r')
+  try {
+    const stat = await handle.stat()
+    const limit = Math.min(stat.size, TOKEN_SCAN_LIMIT)
+    const chunk = Buffer.allocUnsafe(TOKEN_SCAN_CHUNK)
+    const overlapSize = ACCESS_TOKEN_KEY.length + TOKEN_LOOKAHEAD
+    let overlap = Buffer.alloc(0)
+    let position = 0
+
+    while (position < limit) {
+      const length = Math.min(chunk.length, limit - position)
+      const { bytesRead } = await handle.read(chunk, 0, length, position)
+      if (!bytesRead) break
+      const block = overlap.length
+        ? Buffer.concat([overlap, chunk.subarray(0, bytesRead)])
+        : chunk.subarray(0, bytesRead)
+
+      let from = 0
+      while (from < block.length) {
+        const keyAt = block.indexOf(ACCESS_TOKEN_KEY, from)
+        if (keyAt < 0) break
+        const valueStart = keyAt + ACCESS_TOKEN_KEY.length
+        const text = block.subarray(valueStart, Math.min(block.length, valueStart + TOKEN_LOOKAHEAD)).toString('latin1')
+        for (const match of text.matchAll(JWT_RE)) {
+          const token = match[0]
+          if (decodeJwt(token)?.sub) return token
+        }
+        from = valueStart
+      }
+
+      overlap = Buffer.from(block.subarray(Math.max(0, block.length - overlapSize)))
+      position += bytesRead
+    }
+    return null
+  } finally {
+    await handle.close()
   }
 }
 
@@ -213,7 +242,7 @@ async function getCloudRecords(token) {
 export const cursor = {
   cli: 'cursor',
   roots: CLI_ROOTS.cursor,
-  kind: 'binary',
+  kind: 'path',
   // Usage is fetched over the network (see header comment), not read from the
   // local file — so it must be re-run on a timer, not only when state.vscdb
   // changes on disk. The IDE stops rewriting state.vscdb once it goes idle, so
@@ -223,23 +252,8 @@ export const cursor = {
   // still throttles the real HTTP call to once every 15 min.
   network: true,
   match: (file) => path.basename(file) === 'state.vscdb',
-  async parseFile(buf) {
-    const SQL = await getSql()
-    let db
-    try {
-      db = new SQL.Database(buf)
-    } catch {
-      return []
-    }
-    let token = null
-    try {
-      const res = db.exec("SELECT value FROM ItemTable WHERE key = 'cursorAuth/accessToken'")
-      token = toText(res[0]?.values?.[0]?.[0])
-    } catch {
-      // ItemTable missing/schema changed
-    } finally {
-      db.close()
-    }
+  async parseFile(file) {
+    const token = await readAccessToken(file)
     if (!token) return []
     return getCloudRecords(token)
   },

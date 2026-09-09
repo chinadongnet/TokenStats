@@ -77,30 +77,46 @@ export class Store extends EventEmitter {
     }
     if (stat.mtimeMs === entry.mtimeMs && stat.size === entry.size) return false
 
-    if (parser.kind === 'json') {
-      const text = await fsp.readFile(file, 'utf8')
-      entry.records = parser.parseFile(text, file)
-    } else if (parser.kind === 'binary') {
-      // whole-file binary formats (Antigravity SQLite): re-parse on change
-      const buf = await fsp.readFile(file)
-      entry.records = await parser.parseFile(buf, file)
-    } else {
-      // jsonl: if the file shrank/rotated, restart from scratch
-      let start = entry.size
-      if (stat.size < entry.size) {
-        entry.records = []
-        entry.state = {}
-        start = 0
-      }
-      if (stat.size > start) {
-        const chunk = await readRange(file, start, stat.size)
-        const lines = chunk.split('\n')
-        for (const line of lines) {
-          if (!line.trim()) continue
-          const rec = parser.parseLine(line, entry.state, file)
-          if (rec) entry.records.push(rec)
+    try {
+      if (parser.kind === 'json') {
+        const text = await fsp.readFile(file, 'utf8')
+        entry.records = parser.parseFile(text, file)
+      } else if (parser.kind === 'binary') {
+        // whole-file binary formats (Antigravity SQLite): re-parse on change
+        const buf = await fsp.readFile(file)
+        entry.records = await parser.parseFile(buf, file)
+      } else if (parser.kind === 'path') {
+        // File-backed parsers that need random/streamed access rather than a
+        // whole-file Buffer. Cursor's state.vscdb can grow well past 2 GiB.
+        entry.records = await parser.parseFile(file)
+      } else {
+        // jsonl: if the file shrank/rotated, restart from scratch
+        let start = entry.size
+        if (stat.size < entry.size) {
+          entry.records = []
+          entry.state = {}
+          start = 0
+        }
+        if (stat.size > start) {
+          const chunk = await readRange(file, start, stat.size)
+          const lines = chunk.split('\n')
+          for (const line of lines) {
+            if (!line.trim()) continue
+            const rec = parser.parseLine(line, entry.state, file)
+            if (rec) entry.records.push(rec)
+          }
         }
       }
+      entry.lastError = null
+    } catch (err) {
+      // A broken/oversized source must not abort scanAll(): that used to stop
+      // the shared sweep before it could emit updates for every other CLI.
+      const message = err?.message || String(err)
+      if (entry.lastError !== message) console.warn(`${parser.cli} parser failed for ${file}:`, message)
+      entry.lastError = message
+      entry.size = stat.size
+      entry.mtimeMs = stat.mtimeMs
+      return false
     }
     entry.size = stat.size
     entry.mtimeMs = stat.mtimeMs

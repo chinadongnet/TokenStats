@@ -1,6 +1,6 @@
 {
   "name": "tokenstats",
-  "version": "0.2.38",
+  "version": "0.2.39",
   "description": "TokenStats — tray-based token usage monitor for Claude Code, Codex, and Gemini CLIs",
   "type": "module",
   "main": "out/main/index.js",
@@ -10,6 +10,7 @@
     "dev": "electron-vite dev",
     "build": "electron-vite build",
     "start": "electron-vite preview",
+    "test:cursor": "node scripts/test-cursor-parser.mjs",
     "test:parsers": "node scripts/test-parsers.mjs",
     "test:scopes": "node scripts/test-scopes.mjs",
     "test:subscriptions": "node scripts/test-subscriptions.mjs",
