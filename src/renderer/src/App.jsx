@@ -271,7 +271,7 @@ function ModelBar({ models, color }) {
       </div>
       <div className="pleg">
         {models.map((m, i) => (
-          <span key={m.cli + m.model}>
+          <span key={m.cli + m.model} title={m.model}>
             <i style={{ background: cols[i] }} />
             {shortModel(m.model)} <b>{compact(m.total)}</b>
           </span>
@@ -429,7 +429,7 @@ export default function App() {
             const meta = CLI[c] || FALLBACK_META(c)
             const plan = planByCli.get(c)
             const live = !!(plan && plan.windows.some((w) => w.source === 'live'))
-            const ms = (modelsByCli.get(c) || []).slice(0, 4)
+            const ms = modelsByCli.get(c) || []
             return (
               <div
                 className="pcard"

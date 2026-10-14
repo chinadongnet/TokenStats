@@ -358,7 +358,7 @@ function Breakdown({ mode, setMode, models, projects, CLI, label, plans }) {
       ) : mode !== 'project' ? (
         <div className="models">
           {models.length === 0 && <div className="empty">{t('rep.noUsageRange')}</div>}
-          {models.slice(0, 15).map((m) => (
+          {models.map((m) => (
             <div className="mrow" key={m.cli + m.model}>
               <span className="dot" style={{ background: metaFor(CLI, m.cli).color }} />
               <span className="mname" title={m.model}>{m.model}</span>
