@@ -51,7 +51,7 @@ console.log('OK: active subscription exposes its current billing-cycle compariso
 
 const purchases = [
   { ...plan, id: 'january', groupId: 'same-plan', active: false, startDate: '2026-01-01', endDate: '2026-01-31', monthlyUsd: 20 },
-  { ...plan, id: 'march', groupId: 'same-plan', active: false, startDate: '2026-03-01', endDate: '2026-03-31', monthlyUsd: 30 },
+  { ...plan, id: 'march', groupId: 'same-plan', active: false, startDate: '2026-03-01', endDate: '2026-03-31', monthlyUsd: 30, bindings: [{ cli: 'claude', keyAlias: null, models: [] }] },
 ]
 const history = [record(at(2026, 1, 20), 100, 1), record(at(2026, 2, 20), 500, 5), record(at(2026, 3, 20), 200, 2), record(at(2026, 4, 20), 1000, 10)]
 const now = at(2026, 5, 1)
@@ -61,6 +61,7 @@ assert.equal(merged[0].periods.length, 2)
 assert.equal(merged[0].totalPaid, 50)
 assert.equal(merged[0].totalTokens, 300)
 assert.equal(merged[0].totalCost, 3)
+assert.equal(merged[0].bindings.length, 1, 'equivalent old/new source bindings share one label')
 assert.equal(merged[0].monthsBilled, 2)
 const breakdown = computePlanBreakdown(purchases, history, at(2026, 1, 1, 0), now, now)
 assert.equal(breakdown.plans.length, 1)

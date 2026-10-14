@@ -253,6 +253,11 @@ export function computeAllSubscriptionStats(subs, records, nowMs = Date.now()) {
   return groupSubscriptionStats((subs || []).map((s) => computeSubscriptionStats(s, owned.get(s.id) || [], nowMs)))
 }
 
+function bindingKey(binding) {
+  return JSON.stringify([binding.cli, binding.keyAlias?.trim() || null,
+    binding.models?.length ? [...new Set(binding.models)].sort() : null])
+}
+
 // Purchases keep their own billing anchors, prices and ownership. Only the
 // presentation is grouped: no continuous coverage is invented across gaps.
 export function groupSubscriptionStats(stats) {
@@ -285,7 +290,7 @@ export function groupSubscriptionStats(stats) {
       endDate: active.length ? null : periods.map((p) => p.endDate || '').sort().at(-1),
       active: active.length > 0,
       monthlyUsd: active.length ? active.filter((p) => p.currentCycle).reduce((n, p) => n + p.monthlyUsd, 0) : representative.monthlyUsd,
-      bindings: [...new Map(periods.flatMap((p) => p.bindings).map((b) => [JSON.stringify(b), b])).values()],
+      bindings: [...new Map(periods.flatMap((p) => p.bindings).map((b) => [bindingKey(b), b])).values()],
       ...Object.fromEntries(['monthsBilled', 'totalPaid', 'totalCost', 'totalTokens', 'totalTurns'].map((k) => [k, periods.reduce((n, p) => n + (p[k] || 0), 0)])),
       currentCycle, peakCycle: periods.map((p) => p.peakCycle).filter(Boolean).sort((a, b) => b.tokens - a.tokens)[0] || null,
       cycles: cycles.slice(0, 24), months: [...months.values()].sort((a, b) => a.month.localeCompare(b.month)).slice(-24),
@@ -314,7 +319,7 @@ function groupPlanBuckets(plans) {
     }
   }
   return [...groups.values()].map((g) => ({ ...g,
-    bindings: [...new Map(g.bindings.map((b) => [JSON.stringify(b), b])).values()],
+    bindings: [...new Map(g.bindings.map((b) => [bindingKey(b), b])).values()],
     cycles: g.cycles.sort((a, b) => a.start - b.start),
     models: [...g.models.values()].sort((a, b) => b.total - a.total),
   }))
