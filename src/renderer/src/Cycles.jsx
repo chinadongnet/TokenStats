@@ -20,11 +20,11 @@ function Metric({ label, value, sub, accent }) {
   return <div className={'cd-metric' + (accent ? ' accent' : '')}><span>{label}</span><strong title={String(value)}>{value}</strong><small>{sub}</small></div>
 }
 
-function Models({ models, total }) {
+function Models({ models, total, labels = {} }) {
   const [expanded, setExpanded] = useState(false)
   if (!models.length) return <div className="cd-empty">{t('cd.noUsage')}</div>
   return <div className="cd-models">{(expanded ? models : models.slice(0, 6)).map((m, i) => <div className="cd-model" key={JSON.stringify([m.cli, m.model])}>
-    <div><span title={`${m.cli} · ${m.model}`}>{m.model || '—'}</span><small>{m.cli} · {compact(m.turns)} {t('cd.requests')}</small></div>
+    <div><span title={m.model}>{m.model || '—'}</span><small>{labels[m.cli] || (m.cli.startsWith('litellm:') ? t('common.deletedProvider') : m.cli)} · {compact(m.turns)} {t('cd.requests')}</small></div>
     <b title={m.total.toLocaleString()}>{compact(m.total)} <small>{total > 0 ? (m.total / total * 100).toFixed(1) : 0}%</small></b>
     <div className="cd-track"><i style={{ width: `${total > 0 ? m.total / total * 100 : 0}%`, background: colors[i % colors.length] }} /></div><small>{money(m.cost)}</small>
   </div>)}{models.length > 6 && <button className="cd-text-button" onClick={() => setExpanded(!expanded)}>{t(expanded ? 'cd.lessModels' : 'cd.allModels', { count: models.length })}</button>}</div>
@@ -41,7 +41,7 @@ function UsageChart({ cycles, selected, onSelect }) {
   </div>
 }
 
-function Detail({ plan, asOf, onBack }) {
+function Detail({ plan, asOf, labels, onBack }) {
   const [chosen, setChosen] = useState(null)
   const cycle = plan.cycles.find((c) => cycleKey(c) === chosen) || plan.cycles[0]
   return <>
@@ -68,7 +68,7 @@ function Detail({ plan, asOf, onBack }) {
         <div className="cd-cost-compare">{[[t('cyc.subscriptionFee'), cycle.fee], [t('cd.worth'), cycle.cost]].map(([label, value], i) =>
           <div key={label}><span>{label}</span><div className="cd-track"><i style={{ width: `${value / Math.max(cycle.fee, cycle.cost, 1) * 100}%`, background: colors[i] }} /></div><b>{money(value)}</b></div>)}</div>
       </section><section className="cd-panel"><div className="cd-section-head"><h2>{t('cd.cycleModels')}</h2><span>{cycle.models.length} {t('cd.models')}</span></div>
-        <Models key={cycleKey(cycle)} models={cycle.models} total={cycle.tokens} /></section></div>
+        <Models key={cycleKey(cycle)} models={cycle.models} total={cycle.tokens} labels={labels} /></section></div>
       <section className="cd-panel"><div className="cd-section-head"><h2>{t('cd.fullHistory')}</h2><span>{plan.cycles.length} {t('cd.cycles')}</span></div>
         <div className="cd-table-wrap"><table className="cd-table"><thead><tr>{['cd.period', 'cyc.tokensUsed', 'cyc.subscriptionFee', 'cd.worth', 'cyc.valueRatio', 'cd.topModel'].map((k) => <th key={k}>{t(k)}</th>)}</tr></thead>
           <tbody>{plan.cycles.map((c) => <tr key={cycleKey(c)} className={cycleKey(c) === cycleKey(cycle) ? 'selected' : ''}>
@@ -102,7 +102,7 @@ function Overview({ data, onSelect }) {
           <div className="cd-track"><i style={{ width: `${p.ratio / maxRatio * 100}%`, background: colors[i % colors.length] }} /></div>
           <small>{money(p.totalCost)} / {money(p.totalPaid)} · {compact(p.totalTokens)} Token</small></div><span className="cd-arrow">↗</span>
       </button>)}</div>}<p className="cd-note">{t('cd.ratioNote')}</p>
-    </section><section className="cd-panel"><div className="cd-section-head"><h2>{t('cd.modelMix')}</h2><span>{t('cd.byTokens')}</span></div><Models models={models} total={s.totalTokens} /></section></div>
+    </section><section className="cd-panel"><div className="cd-section-head"><h2>{t('cd.modelMix')}</h2><span>{t('cd.byTokens')}</span></div><Models models={models} total={s.totalTokens} labels={data.cliLabels} /></section></div>
     <div className="cd-section-head"><h2>{t('cd.allSubscriptions')}</h2><span>{plans.length} {t('cd.plans')} · {t('cd.clickDetail')}</span></div>
     <div className="cd-plan-grid">{plans.map((p, i) => <button className="cd-plan-card" key={p.id} onClick={() => onSelect(p.id)} style={{ '--plan-color': colors[i % colors.length] }}>
       <div className="cd-plan-title"><h3>{p.name}</h3><span className={'cd-badge' + (p.isCurrent ? ' live' : '')}>{p.isCurrent ? t('cyc.active') : p.cycles.length ? t('cd.noCurrent') : t('cd.notStarted')}</span></div>
@@ -137,7 +137,7 @@ export default function Cycles() {
     <header className="cd-header"><div className="rep-title"><span className="logo" /> {t('cyc.title')}</div><div><span>{data ? t('cd.updated', { time: new Date(data.asOf).toLocaleTimeString() }) : ''}</span><button className="cd-text-button" onClick={() => window.api.openSettings()}>{t('cd.manage')} ↗</button></div></header>
     {error && <div className="cd-error" role="alert">{t('cd.loadError')} {error}</div>}
     {!data ? <div className="empty">{t('common.loading')}</div> : !data.plans.length ? <div className="cd-panel cd-empty">{t('cyc.empty')}</div>
-      : plan ? <Detail key={plan.id} plan={plan} asOf={data.asOf} onBack={() => select(null)} /> : <Overview data={data} onSelect={select} />}
+      : plan ? <Detail key={plan.id} plan={plan} asOf={data.asOf} labels={data.cliLabels} onBack={() => select(null)} /> : <Overview data={data} onSelect={select} />}
     <p className="cd-note cd-scope-foot">{t('cd.methodNote')}</p><footer className="rep-foot">{t('cyc.footer', { ver: __APP_VERSION__, built: __BUILD_TIME__ })}</footer>
   </div>
 }

@@ -312,7 +312,10 @@ async function init() {
   ipcMain.handle('subs:stats', () =>
     db && store ? computeAllSubscriptionStats(db.listSubscriptions(), store.dedupedRecords(), Date.now()) : []
   )
-  ipcMain.handle('subs:cycles', () => computeCycleDashboard(db?.listSubscriptions() || [], store?.dedupedRecords() || []))
+  ipcMain.handle('subs:cycles', () => ({
+    ...computeCycleDashboard(db?.listSubscriptions() || [], store?.dedupedRecords() || []),
+    cliLabels: Object.fromEntries(Object.entries({ ...CLI_META, ...dynamicCliMeta }).map(([id, meta]) => [id, meta.label])),
+  }))
   // Quota-reset windows for the tray popup. Recomputed per call (cheap) so the
   // popup's countdown always reflects the newest records. Where a plan is bound
   // to a CLI that reports its OWN quota (Codex, via the rate_limits snapshot in
