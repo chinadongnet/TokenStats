@@ -29,6 +29,11 @@ seconds after the CLI commits a usage event, assuming a healthy network; tokens
 the upstream CLI has not written yet cannot be observed. Network sources run
 separately so a slow Cursor export cannot stall Codex or AGY.
 
+Popup model totals are grouped by both source and model ID in every scope.
+For example, Cursor and AGY can both use `claude-opus-5-5-medium`; each source
+keeps its own model tokens, cost and request count instead of the first indexed
+source absorbing the other one's usage.
+
 `npm run test:live` (Node 22.13+ for the fixture writer) verifies split JSONL,
 concurrent ingestion, real SQLite WAL commits, a timed fallback with watchers
 disabled, API-model CSV rows, archive preservation, and rate-limit backoff.
