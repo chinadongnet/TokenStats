@@ -10,6 +10,29 @@ data the way each tool's own `/usage` (or `/status`) command does.
 Code lives in `src/main/core/parsers/*.js`; the store/watch/poll plumbing is in
 `src/main/core/store.js`.
 
+## Live collection and cloud sync
+
+Local sources have filesystem watchers plus an independent 5-second sweep.
+JSONL tails retain incomplete lines and UTF-8 bytes until the newline arrives;
+per-file ingestion is serialized. AGY checks SQLite header counters and WAL
+sidecars, overlays only checksum-valid committed frames, and retries changing
+snapshots without clearing previously parsed usage. Source files are read only.
+New AGY timestamps are read from model-response step metadata when the legacy
+generation timestamp is absent; the file's modification time is the stable last
+fallback. Existing AGY hourly totals before the oldest retained conversation are
+preserved on startup, so pruned logs do not erase older history.
+
+New usage triggers cloud sync after the DB ingest (at most a 4-second ingest
+delay), with a 1-second debounce and a 5-second minimum request interval. The
+configured minute interval applies to idle refreshes. The target is under 30
+seconds after the CLI commits a usage event, assuming a healthy network; tokens
+the upstream CLI has not written yet cannot be observed. Network sources run
+separately so a slow Cursor export cannot stall Codex or AGY.
+
+`npm run test:live` (Node 22.13+ for the fixture writer) verifies split JSONL,
+concurrent ingestion, real SQLite WAL commits, a timed fallback with watchers
+disabled, API-model CSV rows, archive preservation, and rate-limit backoff.
+
 ## Summary table
 
 | Source      | Transport   | Where the data comes from                                   | Token counts | Quota / limits |
@@ -67,9 +90,14 @@ Returns CSV, one row per request. Columns consumed:
 | `Output Tokens`            | `output` |
 | `Total Tokens`             | `total` |
 
-- Rows with a blank/absent `Total Tokens` (errored / "no charge" requests) are
-  skipped.
-- `startDate=0` pulls **full history** every call. The response carries no
+- A blank/absent `Total Tokens` falls back to the sum of the four component
+  columns. Only rows with no positive token usage are skipped. Model names are
+  preserved verbatim, including API-key requests and `claude-opus-5-5-medium`.
+- `startDate=0` bootstraps full history on a new account. Subsequent calls replace
+  the latest 48 hours, aligned to complete hourly buckets. Older usage remains in
+  the account-specific `cursor_usage_archive` SQLite table. Existing installs
+  seed the archive from hourly totals; those old buckets remain aggregates.
+  The response carries no
   conversationId/project, so all Cursor records are attributed to one synthetic
   `project=cursor` / `session=cloud` bucket.
 - A sibling JSON endpoint (`get-filtered-usage-events`) also returns
@@ -78,21 +106,21 @@ Returns CSV, one row per request. Columns consumed:
   what's used.
 
 ### Caching and throttle
-Results are cached per account (keyed by `userId`, since usage is identical
-regardless of which device's token fetched it). The actual HTTP call is throttled
-to **at most once every 15 minutes** to stay clear of the rate limit that produced
-the 403s above. On any error (rate-limit / expired session / network) the previous
-cache is kept rather than cleared.
+Results are cached and archived per account. Overlapping calls share one request.
+Successful fetches have a 20-second minimum interval; HTTP 403/429 backs off for
+15 minutes, other failures for 20 seconds. Recent exports time out after 20
+seconds, initial full-history exports after 60 seconds, and quota requests after
+10 seconds. Errors retain history and log a diagnostic without credentials.
 
 ### When a refresh actually happens
-The Cursor parser is a **file-watched** parser (`kind: 'binary'`, matches
+The Cursor parser is a file-backed parser (`kind: 'path'`, matches
 `state.vscdb`) but its data is network-backed, so it is also marked `network: true`
 and re-run on a timer. It refreshes on:
 
-1. **App startup** — the initial `store.scanAll()`.
-2. A **5-minute timer** — `store.refreshNetworkParsers()`, which force-reingests
+1. **App startup** — an independent background network refresh.
+2. A **10-second timer** — `store.refreshNetworkParsers()`, which force-reingests
    `network: true` parsers by clearing the cached mtime/size so `ingestFile` doesn't
-   short-circuit. (The parser's own 15-min HTTP throttle still bounds real calls.)
+   short-circuit. The parser's own throttle/backoff bounds actual HTTP calls.
 3. The tray's **"Refresh now"** menu item.
 
 > History note: before the 5-minute timer existed, Cursor usage refreshed **only**

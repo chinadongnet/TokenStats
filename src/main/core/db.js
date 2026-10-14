@@ -79,6 +79,11 @@ CREATE TABLE IF NOT EXISTS litellm_usage (
 );
 CREATE INDEX IF NOT EXISTS idx_litellm_usage_provider ON litellm_usage(provider_id, day);
 
+CREATE TABLE IF NOT EXISTS cursor_usage_archive (
+  user_id TEXT PRIMARY KEY,
+  records_json TEXT NOT NULL
+);
+
 CREATE TABLE IF NOT EXISTS cloud_sync (
   id           INTEGER PRIMARY KEY CHECK (id = 1),  -- single-row config
   endpoint     TEXT    NOT NULL DEFAULT '',
@@ -414,6 +419,24 @@ export class UsageDb {
       input: r.input, output: r.output, cacheRead: r.cache_read, cacheCreate: r.cache_create,
       reasoning: r.reasoning, total: r.total, cost: r.cost, turns: r.turns,
     }))
+  }
+
+  listCursorUsage(userId, legacyRows = null) {
+    const row = this.rows('SELECT records_json FROM cursor_usage_archive WHERE user_id = ?', [userId])[0]
+    if (row) return JSON.parse(row.records_json)
+    // Upgrade existing installs without losing older hourly totals. Historical
+    // buckets remain aggregates; recent buckets become real request rows.
+    if (this.rows('SELECT user_id FROM cursor_usage_archive LIMIT 1').length) return []
+    return (legacyRows || this.hourlySince(0)).filter((r) => r.cli === 'cursor').map((r) => ({
+      ...r, ts: r.hour, sessionId: 'cloud', project: 'cursor',
+      dedupKey: `cursor-legacy:${r.hour}:${r.model}`,
+    }))
+  }
+
+  saveCursorUsage(userId, records) {
+    this.db.run('INSERT INTO cursor_usage_archive (user_id, records_json) VALUES (?, ?) ON CONFLICT(user_id) DO UPDATE SET records_json=excluded.records_json',
+      [userId, JSON.stringify(records)])
+    this.persist()
   }
 
   // ---- subscription plans (monthly flat-fee tracking) ---------------------

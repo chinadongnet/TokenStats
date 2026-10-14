@@ -35,8 +35,8 @@ import { CLI_ROOTS } from '../paths.js'
 //
 // Fetches are cached per account (keyed by the JWT's user id, since an
 // account's usage is identical regardless of which device's token fetched
-// it) and throttled to at most once every 15 minutes to stay well clear of
-// whatever rate limit produced the 403s above.
+// it). Successful requests use a 20-second minimum interval; HTTP 403/429
+// backs off for 15 minutes while keeping the previously archived records.
 
 function decodeJwt(token) {
   try {
@@ -133,45 +133,54 @@ function parseCsvLine(line) {
   return out
 }
 
-function parseUsageCsv(text) {
+export function parseUsageCsv(text) {
   const lines = text.split('\n').filter((l) => l.trim())
   if (lines.length < 2) return []
-  const header = parseCsvLine(lines[0])
+  const header = parseCsvLine(lines[0]).map((h) => h.replace(/^\uFEFF/, '').trim())
   const col = Object.fromEntries(header.map((h, i) => [h, i]))
+  if (col.Date == null || col.Model == null || col['Output Tokens'] == null) throw new Error('Unrecognized Cursor CSV columns')
   const records = []
+  const occurrences = new Map()
+  const number = (s) => Number(String(s || '').replace(/,/g, '')) || 0
   for (const line of lines.slice(1)) {
     const cells = parseCsvLine(line)
     const ts = Date.parse(cells[col['Date']])
-    const total = Number(cells[col['Total Tokens']])
-    if (!ts || !total) continue // errored/no-usage rows leave the token columns blank
+    const input = number(cells[col['Input (w/o Cache Write)']])
+    const output = number(cells[col['Output Tokens']])
+    const cacheRead = number(cells[col['Cache Read']])
+    const cacheCreate = number(cells[col['Input (w/ Cache Write)']])
+    const total = number(cells[col['Total Tokens']]) || input + output + cacheRead + cacheCreate
+    if (!Number.isFinite(ts) || total <= 0) continue
     const model = cells[col['Model']] || 'auto'
+    const key = `cursor-cloud:${ts}:${model}:${input}:${output}:${cacheRead}:${cacheCreate}:${total}`
+    const occurrence = occurrences.get(key) || 0
+    occurrences.set(key, occurrence + 1)
     records.push({
       cli: 'cursor',
       ts,
       model,
       sessionId: 'cloud',
       project: 'cursor',
-      input: Number(cells[col['Input (w/o Cache Write)']]) || 0,
-      output: Number(cells[col['Output Tokens']]) || 0,
-      cacheRead: Number(cells[col['Cache Read']]) || 0,
-      cacheCreate: Number(cells[col['Input (w/ Cache Write)']]) || 0,
+      input,
+      output,
+      cacheRead,
+      cacheCreate,
       reasoning: 0,
       total,
-      dedupKey: `cursor-cloud:${ts}:${model}:${total}`,
+      dedupKey: `${key}:${occurrence}`,
     })
   }
   return records
 }
 
-async function fetchUsageCsv(token) {
+async function fetchUsageCsv(token, fromMs = 0) {
   const payload = decodeJwt(token)
-  if (!payload?.sub) return []
-  if (payload.exp && payload.exp * 1000 < Date.now()) return [] // stale session; needs a fresh IDE login
+  if (!payload?.sub || (payload.exp && payload.exp * 1000 < Date.now())) throw new Error('Cursor session expired; sign in again')
   const userId = String(payload.sub).split('|').pop()
   const cookie = `WorkosCursorSessionToken=${encodeURIComponent(userId + '::' + token)}`
-  const url = `https://cursor.com/api/dashboard/export-usage-events-csv?startDate=0&endDate=${Date.now()}&strategy=tokens`
-  const res = await fetch(url, { headers: { Cookie: cookie, Accept: 'text/csv,*/*' } })
-  if (!res.ok) throw new Error(`cursor usage export HTTP ${res.status}`)
+  const url = `https://cursor.com/api/dashboard/export-usage-events-csv?startDate=${fromMs}&endDate=${Date.now()}&strategy=tokens`
+  const res = await fetch(url, { headers: { Cookie: cookie, Accept: 'text/csv,*/*' }, signal: AbortSignal.timeout(fromMs ? 20000 : 60000) })
+  if (!res.ok) throw Object.assign(new Error(`cursor usage export HTTP ${res.status}`), { status: res.status })
   return parseUsageCsv(await res.text())
 }
 
@@ -203,15 +212,20 @@ async function fetchUsageSummary(token) {
   if (payload.exp && payload.exp * 1000 < Date.now()) return []
   const userId = String(payload.sub).split('|').pop()
   const cookie = `WorkosCursorSessionToken=${encodeURIComponent(userId + '::' + token)}`
-  const res = await fetch('https://cursor.com/api/usage-summary', { headers: { Cookie: cookie, Accept: 'application/json' } })
+  const res = await fetch('https://cursor.com/api/usage-summary', { headers: { Cookie: cookie, Accept: 'application/json' }, signal: AbortSignal.timeout(10000) })
   if (!res.ok) throw new Error(`cursor usage-summary HTTP ${res.status}`)
   return parseUsageSummary(await res.json())
 }
 
-const MIN_FETCH_INTERVAL_MS = 15 * 60 * 1000
+const MIN_FETCH_INTERVAL_MS = 20 * 1000
 const cacheByUser = new Map() // userId -> { records, fetchedAt }
+let archive = {}
+export function configureCursorArchive(hooks) {
+  archive = hooks || {}
+  cacheByUser.clear()
+}
 
-// Newest monthly quota window (used %, reset), refreshed on the same 15-min
+// Newest monthly quota window (used %, reset), refreshed on the same
 // cadence as the CSV fetch. Read by the `cursor:limits` path (via index.js) to
 // overlay the Cursor plan's Quota window.
 let latestWindows = []
@@ -222,21 +236,36 @@ export function cursorResetWindows() {
 async function getCloudRecords(token) {
   const payload = decodeJwt(token)
   const userId = payload?.sub ? String(payload.sub) : 'unknown'
-  const entry = cacheByUser.get(userId) || { records: [], fetchedAt: 0 }
-  if (Date.now() - entry.fetchedAt < MIN_FETCH_INTERVAL_MS) return entry.records
-  entry.fetchedAt = Date.now() // set before awaiting so overlapping triggers don't pile up calls
+  const entry = cacheByUser.get(userId) || { records: archive.load?.(userId) || [], fetchedAt: 0, retryAt: 0 }
   cacheByUser.set(userId, entry)
-  try {
-    entry.records = await fetchUsageCsv(token)
-  } catch {
-    // undocumented endpoint: keep the previous cache on rate-limit/expired-session/network errors
-  }
-  try {
-    latestWindows = await fetchUsageSummary(token)
-  } catch {
-    // keep the previous quota window on error (same reasoning as the CSV fetch)
-  }
-  return entry.records
+  if (entry.inFlight) return entry.inFlight
+  if (Date.now() < entry.retryAt || Date.now() - entry.fetchedAt < MIN_FETCH_INTERVAL_MS) return entry.records
+  entry.inFlight = (async () => {
+    // Replace recent complete hourly buckets and retain archived history. Small
+    // exports avoid downloading the account's entire lifetime on every tick.
+    const fromMs = entry.records.length ? Math.floor((Date.now() - 2 * 86400000) / 3600000) * 3600000 : 0
+    const [usage, summary] = await Promise.allSettled([fetchUsageCsv(token, fromMs), fetchUsageSummary(token)])
+    if (usage.status === 'fulfilled') {
+      const records = [...entry.records.filter((r) => r.ts < fromMs), ...usage.value]
+      if (JSON.stringify(records) !== JSON.stringify(entry.records)) {
+        entry.records = records
+        cursor.revision++
+      }
+      archive.save?.(userId, entry.records)
+      entry.fetchedAt = Date.now()
+      entry.retryAt = 0
+    } else {
+      const err = usage.reason
+      entry.retryAt = Date.now() + ([403, 429].includes(err.status) ? 15 * 60000 : MIN_FETCH_INTERVAL_MS)
+      console.warn('Cursor usage refresh failed; retaining history:', err.message)
+    }
+    if (summary.status === 'fulfilled' && JSON.stringify(latestWindows) !== JSON.stringify(summary.value)) {
+      latestWindows = summary.value
+      cursor.revision++
+    }
+    return entry.records
+  })().finally(() => { entry.inFlight = null })
+  return entry.inFlight
 }
 
 export const cursor = {
@@ -249,12 +278,13 @@ export const cursor = {
   // without a timer the last fetch (often the app-startup one) goes stale and
   // newer cloud usage never shows up. This flag opts the parser into the
   // store's periodic refreshNetworkParsers() sweep; the getCloudRecords cache
-  // still throttles the real HTTP call to once every 15 min.
+  // throttles real HTTP calls and applies rate-limit backoff.
   network: true,
+  revision: 0,
   match: (file) => path.basename(file) === 'state.vscdb',
   async parseFile(file) {
     const token = await readAccessToken(file)
-    if (!token) return []
+    if (!token) throw new Error('Cursor access token unavailable')
     return getCloudRecords(token)
   },
 }
