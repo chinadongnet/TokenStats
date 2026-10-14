@@ -415,6 +415,10 @@ Value ratio is estimated usage cost divided by billed fees (1× = equal value);
 free plans are excluded from that ranking. Statistics refresh on data updates
 and every 30 seconds. Only collected usage at or before the displayed update
 time contributes to the totals.
+The usage report's **Subscription plans** tab shares the same overview and
+cycle drilldown, including the same data endpoint and refresh behavior. Expand
+the analysis section below its subscription cards for the existing zoomable
+timeline, fee comparison and monthly trend charts.
 
 - Cost numbers are **estimates** — they depend on your plan and current list prices.
   Edit `src/main/core/pricing.js` to match your rates. LiteLLM is exempt: it reports

@@ -410,6 +410,11 @@ footer {
 /* Subscription portfolio and complete cycle drilldown */
 .cycles-view { display: flex; flex-direction: column; padding: 24px 32px 30px; background: radial-gradient(ellipse at 90% 0%, #182336 0%, transparent 42%), #0e1119; gap: 20px; }
 .cycles-view > * { flex-shrink: 0; }
+.cycles-view.cycles-embedded { padding: 24px; border-radius: 18px; height: auto; overflow: visible; }
+.cd-extra-analysis { border: 1px solid #283347; border-radius: 14px; background: #141b28; }
+.cd-extra-analysis > summary { padding: 17px 22px; color: #a8bcff; cursor: pointer; font-size: 13px; }
+.cd-extra-analysis > summary:focus-visible { outline: 2px solid #a8bcff; outline-offset: 2px; }
+.cd-extra-content { display: flex; flex-direction: column; gap: 20px; min-width: 0; padding: 0 20px 20px; }
 .cd-header { padding: 0 0 14px; border: 0; }
 .cd-header > div:last-child { display: flex; gap: 18px; align-items: center; color: #8e9bb3; font-size: 11px; }
 .cd-text-button { border: 0; background: transparent; color: #a8bcff; padding: 4px 0; font: inherit; cursor: pointer; text-align: left; }

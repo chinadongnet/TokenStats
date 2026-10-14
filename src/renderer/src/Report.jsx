@@ -1,5 +1,6 @@
 import React, { useEffect, useMemo, useRef, useState } from 'react'
 import { t, useLang } from './i18n.js'
+import { SubscriptionDashboard } from './Cycles.jsx'
 
 // The 5 fixed built-in CLIs. LiteLLM providers are NOT listed here — they're
 // dynamic, DB-backed entries (`litellm:<providerId>`) fetched via
@@ -465,10 +466,8 @@ function Legend({ brands, onToggle, CLI, ORDER }) {
   )
 }
 
-// Subscription plans: monthly flat fees vs what the covered usage would have
-// cost. Stats come pre-computed from the main process (subs:stats) — one entry
-// per plan with billed cycles (newest first), calendar months, total paid, and
-// actual cost.
+// Subscription plans share the cycle window's all-history dashboard and data.
+// These extra charts retain the report's calendar-month and timeline views.
 // Chart series colors (fee = reference, worth = the point) — validated as a
 // 2-slot categorical pair on the dark panel surface (CVD ΔE ≥ 52, ≥3:1
 // contrast), distinct from every CLI brand color used elsewhere in the window.
@@ -476,172 +475,38 @@ const FEE_COLOR = '#6478cf'
 const WORTH_COLOR = '#1fa87c'
 
 function SubsView({ CLI }) {
-  const [stats, setStats] = useState(null) // null = loading
-  async function load() {
-    setStats((await window.api.subsStats()) || [])
-  }
-  useEffect(() => { load() }, [])
-  useEffect(() => window.api.onReportUpdated(() => load()), [])
+  return <SubscriptionDashboard embedded renderOverviewExtra={(data) => <SubscriptionAnalysis stats={data.plans} CLI={CLI} />} />
+}
 
-  const summary = useMemo(() => {
-    const out = { monthly: 0, paid: 0, cost: 0 }
-    for (const s of stats || []) {
-      if (s.active) out.monthly += s.monthlyUsd
-      out.paid += s.totalPaid
-      out.cost += s.totalCost
-    }
-    return out
-  }, [stats])
-
-  // Calendar months merged across all plans (fees align to charge month,
-  // usage to its own month), most recent 12 — the fee-vs-worth chart's data.
+// Preserve the report's existing time-window exploration below the shared
+// all-cycle overview. Both use the same grouped purchase/ownership rules.
+function SubscriptionAnalysis({ stats, CLI }) {
   const monthly = useMemo(() => {
     const map = new Map()
-    for (const s of stats || []) {
-      for (const m of s.months || []) {
-        let b = map.get(m.month)
-        if (!b) {
-          b = { month: m.month, monthStart: m.monthStart, paid: 0, cost: 0 }
-          map.set(m.month, b)
-        }
-        b.paid += m.paid
-        b.cost += m.cost
-      }
+    for (const s of stats) for (const m of s.months || []) {
+      const bucket = map.get(m.month) || { month: m.month, monthStart: m.monthStart, paid: 0, cost: 0 }
+      bucket.paid += m.paid
+      bucket.cost += m.cost
+      map.set(m.month, bucket)
     }
     return [...map.values()].sort((a, b) => a.month.localeCompare(b.month)).slice(-12)
   }, [stats])
-
-  if (stats === null) return <div className="empty">{t('common.loading')}</div>
-  if (stats.length === 0) {
-    return <div className="empty">{t('rep.noPlansAdd')}</div>
-  }
-
-  const pct = (cost, paid) => (paid > 0 ? Math.round((100 * cost) / paid) : null)
-
-  return (
-    <>
-      <div className="tiles">
-        <Tile label={t('rep.activePlans')} value={'$' + usd(summary.monthly)} sub={t('rep.usdPerMonth')} />
-        <Tile label={t('rep.totalPaid')} value={'$' + usd(summary.paid)} sub={t('rep.allBilledMonths')} />
-        <Tile label={t('rep.usageWorth')} value={'$' + usd(summary.cost)} sub={t('rep.estApiCost')} accent="#7ee0b8" />
-        <Tile
-          label={t('rep.valueLabel')}
-          value={pct(summary.cost, summary.paid) != null ? pct(summary.cost, summary.paid) + '%' : '—'}
-          sub={t('rep.worthDivPaid')}
-          accent={summary.cost >= summary.paid ? '#7ee0b8' : '#e0c97e'}
-        />
-      </div>
-
+  return <details className="cd-extra-analysis">
+    <summary>{t('cd.moreAnalysis')}</summary>
+    <div className="cd-extra-content">
       <PlanTimeline CLI={CLI} />
-
-      <div className="rep-actions" style={{ margin: '12px 0' }}>
-        <button className="btn" onClick={() => window.api.openSettings()}>{t('set.managePlanGroups')}</button>
-      </div>
-
       <PlanCompare stats={stats} />
-
-      {monthly.length > 0 && (
-        <section className="card">
-          <div className="card-head">
-            <h3>{t('rep.feesVsWorthMonth')}</h3>
-            <div className="legend" style={{ margin: 0 }}>
-              <span className="leg"><span className="dot" style={{ background: FEE_COLOR }} />{t('rep.feePaid')}</span>
-              <span className="leg"><span className="dot" style={{ background: WORTH_COLOR }} />{t('rep.usageWorthLegend')}</span>
-            </div>
+      {monthly.length > 0 && <section className="card">
+        <div className="card-head"><h3>{t('rep.feesVsWorthMonth')}</h3>
+          <div className="legend" style={{ margin: 0 }}>
+            <span className="leg"><span className="dot" style={{ background: FEE_COLOR }} />{t('rep.feePaid')}</span>
+            <span className="leg"><span className="dot" style={{ background: WORTH_COLOR }} />{t('rep.usageWorthLegend')}</span>
           </div>
-          <PairedBars data={monthly} />
-        </section>
-      )}
-
-      {stats.map((s) => {
-        const ratio = pct(s.totalCost, s.totalPaid)
-        return (
-          <section className="card" key={s.id}>
-            <div className="card-head">
-              <h3>
-                {s.name}
-                <span className={'sub-status' + (s.active ? ' on' : '')}>{s.active ? t('rep.active') : t('rep.endedOn', { date: s.endDate || '' })}</span>
-              </h3>
-              <span className="card-sub">{s.purchaseCount > 1 ? t('set.purchasesSince', { n: s.purchaseCount, date: s.startDate }) : t('rep.moSince', { usd: usd(s.monthlyUsd), date: s.startDate })}</span>
-            </div>
-            <div className="chips">
-              {(s.bindings || []).map((b, i) => (
-                <span className="chip" key={i}>
-                  <span className="dot sm" style={{ background: metaFor(CLI, b.cli).color, display: 'inline-block', marginRight: 5 }} />
-                  {metaFor(CLI, b.cli).label}
-                  {b.keyAlias ? ` · ${b.keyAlias}` : ''}
-                  {b.models?.length ? ` · ${b.models.length} ${b.models.length === 1 ? t('common.model') : t('common.models')}` : ''}
-                </span>
-              ))}
-              {(s.bindings || []).length === 0 && <span className="chip">{t('rep.noSourcesBound')}</span>}
-            </div>
-            <div className="sub-totals">
-              <span>{t('rep.billedMonths')} <b>{s.monthsBilled}</b> {s.monthsBilled === 1 ? t('common.month') : t('common.months')}</span>
-              <span>{t('rep.paidLabel')} <b>${usd(s.totalPaid)}</b></span>
-              <span>{t('rep.usageWorthInline')} <b className="mcost">${usd(s.totalCost)}</b> {t('rep.tokensParen', { tokens: compact(s.totalTokens) })}</span>
-              {ratio != null && (
-                <span>{t('rep.valueInline')} <b style={{ color: ratio >= 100 ? '#7ee0b8' : '#e0c97e' }}>{ratio}%</b></span>
-              )}
-            </div>
-
-            {s.cycles.length > 0 && (
-              <div className="reqwrap">
-                <table className="reqtable">
-                  <thead>
-                    <tr>
-                      <th>{t('rep.billingCycle')}</th>
-                      <th className="r">{t('rep.fee')}</th>
-                      <th className="r">{t('rep.usageWorthCol')}</th>
-                      <th className="r">{t('rep.tokensCol')}</th>
-                      <th className="r">{t('rep.valueCol')}</th>
-                    </tr>
-                  </thead>
-                  <tbody>
-                    {s.cycles.map((c, i) => {
-                      const cr = pct(c.cost, c.fee)
-                      return (
-                        <tr key={(c.periodId || s.id) + ':' + c.start}>
-                          <td className="mono">
-                            {dayLabel(c.start)} – {dayLabel(c.end - DAY)}
-                            {i === 0 && s.active && <span className="muted"> {t('rep.current')}</span>}
-                          </td>
-                          <td className="r">{usd(c.fee)}</td>
-                          <td className="r cost">{usd(c.cost)}</td>
-                          <td className="r">{compact(c.tokens)}</td>
-                          <td className="r">
-                            <div className="vwrap">
-                              <span style={{ color: cr != null && cr >= 100 ? '#7ee0b8' : '#e0c97e' }}>
-                                {cr != null ? cr + '%' : '—'}
-                              </span>
-                              {cr != null && (
-                                <div className="vtrack" title={t('rep.valueTickTip', { cr })}>
-                                  <div
-                                    className="vfill"
-                                    style={{
-                                      width: (Math.min(cr, 150) / 150) * 100 + '%',
-                                      background: cr >= 100 ? WORTH_COLOR : '#e0c97e',
-                                    }}
-                                  />
-                                </div>
-                              )}
-                            </div>
-                          </td>
-                        </tr>
-                      )
-                    })}
-                  </tbody>
-                </table>
-              </div>
-            )}
-          </section>
-        )
-      })}
-
-      <div className="empty small">
-        {t('rep.worthFootnote')}
-      </div>
-    </>
-  )
+        </div>
+        <PairedBars data={monthly} />
+      </section>}
+    </div>
+  </details>
 }
 
 // Zoomable subscription timeline (stock-chart interaction: wheel = zoom around
@@ -966,7 +831,7 @@ function PlanCompare({ stats }) {
           <div className="cmp-row" key={s.id}>
             <span className="cmp-name" title={s.name + ' · ' + (s.purchaseCount > 1 ? t('set.purchaseCount', { n: s.purchaseCount }) : '$' + usd(s.monthlyUsd) + '/mo') + ' · ' + s.startDate}>
               {s.name}
-              {!s.active && <span className="muted small"> {t('rep.endedTag')}</span>}
+              {!s.isCurrent && <span className="muted small"> {t('cd.noCurrent')}</span>}
             </span>
             <div className="cmp-bars">
               {hbar(s.totalPaid, usdMax, FEE_COLOR, '$' + usd(s.totalPaid))}

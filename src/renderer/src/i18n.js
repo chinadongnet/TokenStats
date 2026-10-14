@@ -14,6 +14,7 @@ export const LANGS = [
 ]
 
 const en = {
+  'cd.moreAnalysis': 'Explore subscription timeline, comparison and monthly costs',
   'cd.overview': "SUBSCRIPTION OVERVIEW",
   'cd.headline': "Your subscriptions, in perspective",
   'cd.scopeNote': "All purchased billing cycles. Usage is assigned strictly within each purchase’s configured dates.",
@@ -411,6 +412,7 @@ const en = {
 }
 
 const zh = {
+  'cd.moreAnalysis': '查看订阅时间线、费用对比与月度趋势',
   'cd.overview': "订阅总览",
   'cd.headline': "每一份订阅，都有迹可循",
   'cd.scopeNote': "汇总所有已购买计费周期，Token 严格按每次购买填写的起止日期归属。",

@@ -113,7 +113,8 @@ function Overview({ data, onSelect }) {
   </>
 }
 
-export default function Cycles() {
+// Shared by the dedicated cycle window and the report's subscription tab.
+export function SubscriptionDashboard({ embedded = false, renderOverviewExtra }) {
   useLang()
   const [data, setData] = useState(null)
   const [error, setError] = useState(null)
@@ -131,13 +132,22 @@ export default function Cycles() {
     const timer = setInterval(load, 30000)
     return () => { alive = false; unsubscribe(); clearInterval(timer) }
   }, [])
-  const select = (id) => { setSelected(id); view.current?.scrollTo({ top: 0 }) }
+  const select = (id) => {
+    setSelected(id)
+    const scroller = embedded ? view.current?.closest('.report') : view.current
+    scroller?.scrollTo({ top: 0 })
+  }
   const plan = data?.plans.find((p) => p.id === selected)
-  return <div className="report cycles-view" ref={view}>
-    <header className="cd-header"><div className="rep-title"><span className="logo" /> {t('cyc.title')}</div><div><span>{data ? t('cd.updated', { time: new Date(data.asOf).toLocaleTimeString() }) : ''}</span><button className="cd-text-button" onClick={() => window.api.openSettings()}>{t('cd.manage')} ↗</button></div></header>
+  return <div className={embedded ? 'cycles-view cycles-embedded' : 'report cycles-view'} ref={view}>
+    <header className="cd-header"><div className="rep-title"><span className="logo" /> {t(embedded ? 'rep.tokenPlans' : 'cyc.title')}</div><div><span>{data ? t('cd.updated', { time: new Date(data.asOf).toLocaleTimeString() }) : ''}</span><button className="cd-text-button" onClick={() => window.api.openSettings()}>{t('cd.manage')} ↗</button></div></header>
     {error && <div className="cd-error" role="alert">{t('cd.loadError')} {error}</div>}
     {!data ? <div className="empty">{t('common.loading')}</div> : !data.plans.length ? <div className="cd-panel cd-empty">{t('cyc.empty')}</div>
-      : plan ? <Detail key={plan.id} plan={plan} asOf={data.asOf} labels={data.cliLabels} onBack={() => select(null)} /> : <Overview data={data} onSelect={select} />}
-    <p className="cd-note cd-scope-foot">{t('cd.methodNote')}</p><footer className="rep-foot">{t('cyc.footer', { ver: __APP_VERSION__, built: __BUILD_TIME__ })}</footer>
+      : plan ? <Detail key={plan.id} plan={plan} asOf={data.asOf} labels={data.cliLabels} onBack={() => select(null)} /> : <><Overview data={data} onSelect={select} />{renderOverviewExtra?.(data)}</>}
+    <p className="cd-note cd-scope-foot">{t('cd.methodNote')}</p>
+    {!embedded && <footer className="rep-foot">{t('cyc.footer', { ver: __APP_VERSION__, built: __BUILD_TIME__ })}</footer>}
   </div>
+}
+
+export default function Cycles() {
+  return <SubscriptionDashboard />
 }
