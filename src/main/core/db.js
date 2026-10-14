@@ -84,6 +84,10 @@ CREATE TABLE IF NOT EXISTS cursor_usage_archive (
   records_json TEXT NOT NULL
 );
 
+CREATE TABLE IF NOT EXISTS applied_migrations (
+  name TEXT PRIMARY KEY
+);
+
 CREATE TABLE IF NOT EXISTS cloud_sync (
   id           INTEGER PRIMARY KEY CHECK (id = 1),  -- single-row config
   endpoint     TEXT    NOT NULL DEFAULT '',
@@ -437,6 +441,13 @@ export class UsageDb {
     this.db.run('INSERT INTO cursor_usage_archive (user_id, records_json) VALUES (?, ?) ON CONFLICT(user_id) DO UPDATE SET records_json=excluded.records_json',
       [userId, JSON.stringify(records)])
     this.persist()
+  }
+
+  markMigration(name) {
+    if (this.rows('SELECT name FROM applied_migrations WHERE name = ?', [name]).length) return false
+    this.db.run('INSERT INTO applied_migrations (name) VALUES (?)', [name])
+    this.persist()
+    return true
   }
 
   // ---- subscription plans (monthly flat-fee tracking) ---------------------

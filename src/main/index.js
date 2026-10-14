@@ -9,6 +9,7 @@ import { createLitellmPoller, listModels } from './core/parsers/litellm.js'
 import { codexResetWindows } from './core/parsers/codex.js'
 import { cursor, cursorResetWindows, configureCursorArchive } from './core/parsers/cursor.js'
 import { claudeResetWindows, primeClaudeLimits } from './core/claudeLimits.js'
+import { primeAgyLimits } from './core/agyLimits.js'
 import { computeAllSubscriptionStats, computePlanBreakdown, computePlanTimeline, computeResetWindows, mergeLiveLimits, planRecordIndex } from './core/subscriptions.js'
 import { migrateLegacyLitellmConfig } from './core/migrateLitellm.js'
 import { isAutoLaunch, setAutoLaunch, migrateLegacyRunKeys } from './autoLaunch.js'
@@ -174,6 +175,7 @@ async function init() {
   ipcMain.handle('agy:set-enabled', (_e, on) => {
     const res = on ? enableAgyQuota() : disableAgyQuota()
     broadcastSnapshot()
+    if (on) refreshAgyLimits(true)
     return res
   })
 
@@ -377,6 +379,10 @@ async function init() {
   refreshLitellmPollers() // populate store.pollers before the initial scan/poll
   await store.start()
   ingestNow() // first full ingest after the initial scan
+  if (db?.markMigration('agy-output-cost-and-response-id-v1')) {
+    // Corrected historical AGY costs lie outside the normal 7-day sync window.
+    db.updateCloudSyncState({ fullResync: true })
+  }
   startCloudSyncTimer() // pushes to tokenstat-web when enabled (Settings → 云同步)
   // First push shortly after startup so the cloud reflects a reboot-gap quickly;
   // waits 5s so the initial local scan/ingest has settled.
@@ -385,8 +391,15 @@ async function init() {
   // popup's Quota-windows section can show it without waiting for the first
   // 15-min refresh. Fire-and-forget; a snapshot after it lands shows the data.
   primeClaudeLimits().then(() => broadcastSnapshot()).catch(() => {})
+  refreshAgyLimits()
+  setInterval(() => refreshAgyLimits(), 20000)
   if (process.env.AIMON_AUTO_REPORT) openReport() // dev/test convenience
   if ('AIMON_SET_AUTOLAUNCH' in process.env) setAutoLaunch(process.env.AIMON_SET_AUTOLAUNCH === '1') // headless toggle
+}
+
+function refreshAgyLimits(force = false) {
+  if (!getAgyQuotaState().enabled) return
+  primeAgyLimits({ force }).then(() => broadcastSnapshot()).catch(() => {})
 }
 
 // Live per-CLI quota windows, shared by the popup's subs:resets handler and

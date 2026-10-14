@@ -396,7 +396,7 @@ export default function Settings() {
     if (!agy.enabled) return t('set.agyQuotaHint')
     if (agy.mirrorAgeMs == null) return t('set.agyEnabledWaiting')
     const mins = Math.max(0, Math.round(agy.mirrorAgeMs / 60000))
-    return t(mins > 60 ? 'set.agyEnabledStale' : 'set.agyEnabledFresh', { mins })
+    return t(agy.mirrorAgeMs > 60000 ? 'set.agyEnabledStale' : 'set.agyEnabledFresh', { mins })
   })()
   const agyDisabled = agyBusy || !agy || !agy.agyFound || (agy.foreign && !agy.enabled)
 

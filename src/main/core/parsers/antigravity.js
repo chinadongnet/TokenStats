@@ -101,16 +101,20 @@ function timestamp(msg) {
 
 function modelStepTimes(db) {
   try {
-    // Current AGY keeps generation timestamps on MODEL_RESPONSE steps (15),
-    // ordered like gen_metadata's zero-based generation index. The last step
-    // may still be running and have no gen_metadata row yet.
-    return (db.exec('SELECT metadata FROM steps WHERE step_type = 15 ORDER BY idx')[0]?.values || [])
-      .map(([blob]) => {
-        const meta = decodeProto(Buffer.from(blob))
-        return timestamp(sub(meta, 8)) || timestamp(sub(meta, 7)) || timestamp(sub(meta, 6)) || timestamp(sub(meta, 1))
-      })
+    // Join generation usage to step completion by response ID. Positional
+    // fallback is only for old rows without IDs; retries can shift step order.
+    const byResponse = new Map()
+    const byIndex = []
+    for (const [type, blob] of db.exec('SELECT step_type, metadata FROM steps ORDER BY idx')[0]?.values || []) {
+      const meta = decodeProto(Buffer.from(blob))
+      const ts = timestamp(sub(meta, 8)) || timestamp(sub(meta, 7)) || timestamp(sub(meta, 6)) || timestamp(sub(meta, 1))
+      const responseId = first(sub(meta, 9), 11)
+      if (Buffer.isBuffer(responseId) && ts) byResponse.set(responseId.toString('utf8'), ts)
+      if (type === 15) byIndex.push(ts)
+    }
+    return { byResponse, byIndex }
   } catch {
-    return []
+    return { byResponse: new Map(), byIndex: [] }
   }
 }
 
@@ -155,11 +159,12 @@ export const antigravity = {
         const output = first(usage, 3) || 0
         const cacheRead = first(usage, 5) || 0
         const reasoning = first(usage, 9) || 0
+        const responseId = first(usage, 11)?.toString('utf8')
         const tsMsg = sub(sub(gen, 9) || [], 4)
         const modelRaw = first(gen, 21) || first(gen, 19)
         records.push({
           cli: 'agy',
-          ts: timestamp(tsMsg) || stepTimes[idx] || fallbackTs,
+          ts: timestamp(tsMsg) || stepTimes.byResponse.get(responseId) || (!responseId && stepTimes.byIndex[idx]) || fallbackTs,
           model: modelRaw ? modelRaw.toString('utf8') : 'antigravity',
           sessionId,
           project,
@@ -168,7 +173,9 @@ export const antigravity = {
           cacheRead,
           cacheCreate: 0,
           reasoning,
+          reasoningIncludedInOutput: true,
           total: input + output + cacheRead,
+          dedupKey: responseId ? `agy-response:${responseId}` : `agy:${sessionId}:${idx}`,
         })
       }
     } finally {

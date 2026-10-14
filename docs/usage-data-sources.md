@@ -247,50 +247,41 @@ runs in the background (the IPC handler stays synchronous). Per-model weekly lin
 individuals — migrate to the Antigravity suite`. So the old Gemini CLI is a dead end;
 its successor is Antigravity (below).
 
-### Antigravity (`agy`) — done, via a statusLine mirror hook ✅
-`agy` **is** a real CLI (`%LOCALAPPDATA%\agy\bin\agy.exe`), the successor to the Gemini
-CLI. It has no local quota file and no usable public API — the numbers live only in the
-running CLI's memory, rendered by its interactive `/usage` view. Two dead ends first:
+### Antigravity (`agy`) — live built-in JSON quota
 
-- `agy -p "/usage"` (print mode) does **not** run the built-in — it treats the slash
-  command as an *agent prompt* (given `/status` it went and ran `git status`). So unlike
-  Claude, print mode can't surface the usage view.
-- Driving the **interactive TUI** over a pty needs a fresh ~30 s sign-in plus
-  alternate-screen scraping across dozens of model lines — too fragile to poll.
+On agy 1.3.5, `agy --print /usage --output-format json` executes the built-in
+usage command without requesting model generation (verified: zero token usage).
+`command.data.groups[].buckets[]` provides Gemini weekly and 5-hour windows with
+`remaining_fraction` and `reset_time`. `core/agyLimits.js` refreshes every 20s
+while the Settings integration is enabled, coalesces concurrent queries, and
+bounds each child process to 15s. Results older than 60s or past their reset are
+not displayed as live.
 
-The clean route is agy's **statusLine hook**. Like Claude Code, agy pipes its live
-session-state JSON to a user-configured command's stdin on every render — including a
-`quota` map of per-model-pool `{remaining_fraction, reset_time, reset_in_seconds}`
-(inspired by [Ranteck/agy-statusline](https://github.com/Ranteck/agy-statusline)).
-`src/main/agyQuota.js` registers (opt-in, from **Settings → App → Track agy quota**) a
-tiny hook as agy's `statusLine.command` that mirrors that JSON to
-`~/.tokenstats/agy_status.json`, then prints a compact status line back so the user still
-gets a useful agy status bar. `agyResetWindows()` reads the mirror and surfaces the
-**Gemini** pools (driven by the most-consumed one) as a weekly live window through
-`mergeLiveLimits()` under `liveByCli.agy`, so the popup shows an **Antigravity**
-live-quota card. It refreshes for free whenever the user runs the `agy` CLI — no OAuth,
-no spawning agy, no quota spent — and never overwrites a statusLine the user set
-themselves (the toggle cleanly removes it).
+The existing opt-in statusLine mirror remains a fallback only when updated in
+the last 60s. Headless sessions don't render statusLine, so a mirror-only reader
+can show weeks-old quota. `agyQuota.js` preserves the reversible hook toggle
+and custom statusLine protection; it now returns both independent quota windows.
 
-Gotchas worth recording:
-- agy executes `statusLine.command` by **naive space-splitting with no shell and no quote
-  handling** (verified on Windows), so the installed command must be **unquoted**
-  (`node C:/Users/…/.tokenstats/agyStatusHook.cjs`); a quoted path is passed to node
-  literally and never runs. A hook path containing a space is therefore unsupported.
-- The mirror only refreshes on `agy` **CLI** use — the Antigravity **IDE** doesn't
-  trigger it. And this agy version (1.1.4) exposed only ~7-day (weekly) per-pool windows,
-  no separate 5-hour bucket.
-- There's an alternate, OAuth-based source — `POST daily-cloudcode-pa.googleapis.com/
-  v1internal:retrieveUserQuotaSummary`, which agy's `quota_manager` polls — but it needs
-  the account token and a `v1internal` request shape, so the token-free statusLine mirror
-  is preferred.
+Per-generation usage comes from `ModelUsageStats` in SQLite protobuf blobs.
+AGY 1.3.5's embedded descriptor confirms field 2=input, 3=total output,
+5=cache read, 9=thinking output, 10=visible response output, 11=response ID.
+Thinking is a subset of field 3 and must not be charged twice. Totals include
+cached input consistently with the other sources; AGY's headless `total_tokens`
+excludes cache reads, so it is a different accounting measure.
+
+Step metadata's usage response ID joins each generation to its completion time;
+this avoids assigning timestamps by row position when steps are retried or
+missing. Response IDs deduplicate copied/resumed generations across source roots.
+Older pruned-session aggregates cannot be reconstructed from missing files and
+remain archived; their AGY cost estimates are recalculated without double billing
+thinking tokens.
 
 ## Verdict
 
 **Codex**, **Claude**, **Cursor**, and **Antigravity** now drive live overlays on their
 plans' Quota windows — Codex from the `rate_limits` in its local logs (real-time, no
 network), Claude by shelling out to `claude -p /usage`, Cursor from `/api/usage-summary`
-(both throttled ~15 min), and Antigravity via the opt-in statusLine mirror hook
-(`src/main/agyQuota.js`, refreshed on `agy` CLI use). **Gemini** is deprecated and stays
+(both throttled ~15 min), and Antigravity via its built-in `/usage` JSON command
+(`src/main/core/agyLimits.js`, refreshed every 20s while enabled). **Gemini** is deprecated and stays
 on the manual estimate (badged **manual**). Any future clean source plugs into
 `mergeLiveLimits()` as another `liveByCli` entry — the UI already handles it.

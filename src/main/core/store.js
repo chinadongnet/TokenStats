@@ -69,7 +69,7 @@ export class Store extends EventEmitter {
   seedHistory(cli, rows) {
     // AGY can prune old conversation databases. Preserve older hourly totals
     // from the installed client while current on-disk usage stays authoritative.
-    this.history.set(cli, rows.map((r) => ({ ...r, ts: r.hour, sessionId: 'archived', project: cli,
+    this.history.set(cli, rows.map((r) => ({ ...r, ...(cli === 'agy' ? { cost: undefined, reasoningIncludedInOutput: true } : {}), ts: r.hour, sessionId: 'archived', project: cli,
       dedupKey: `history:${cli}:${r.hour}:${r.model}` })))
   }
 
