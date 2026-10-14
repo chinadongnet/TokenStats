@@ -376,20 +376,23 @@ export class Store extends EventEmitter {
       if (r.ts >= weekStart && weekPerCli[r.cli]) add(weekPerCli[r.cli], r, cost)
       if (r.ts >= monthStart && monthPerCli[r.cli]) add(monthPerCli[r.cli], r, cost)
 
-      if (!perModel.has(r.model)) perModel.set(r.model, { model: r.model, cli: r.cli, ...blank() })
-      add(perModel.get(r.model), r, cost)
+      // Model IDs are shared across CLIs/providers. Keep source identity so
+      // Cursor bootstrap rows cannot absorb AGY's use of the same Opus model.
+      const modelKey = JSON.stringify([r.cli, r.model])
+      if (!perModel.has(modelKey)) perModel.set(modelKey, { model: r.model, cli: r.cli, ...blank() })
+      add(perModel.get(modelKey), r, cost)
 
       if (dk === todayKey) {
-        if (!todayPerModel.has(r.model)) todayPerModel.set(r.model, { model: r.model, cli: r.cli, ...blank() })
-        add(todayPerModel.get(r.model), r, cost)
+        if (!todayPerModel.has(modelKey)) todayPerModel.set(modelKey, { model: r.model, cli: r.cli, ...blank() })
+        add(todayPerModel.get(modelKey), r, cost)
       }
       if (r.ts >= weekStart) {
-        if (!weekPerModel.has(r.model)) weekPerModel.set(r.model, { model: r.model, cli: r.cli, ...blank() })
-        add(weekPerModel.get(r.model), r, cost)
+        if (!weekPerModel.has(modelKey)) weekPerModel.set(modelKey, { model: r.model, cli: r.cli, ...blank() })
+        add(weekPerModel.get(modelKey), r, cost)
       }
       if (r.ts >= monthStart) {
-        if (!monthPerModel.has(r.model)) monthPerModel.set(r.model, { model: r.model, cli: r.cli, ...blank() })
-        add(monthPerModel.get(r.model), r, cost)
+        if (!monthPerModel.has(modelKey)) monthPerModel.set(modelKey, { model: r.model, cli: r.cli, ...blank() })
+        add(monthPerModel.get(modelKey), r, cost)
       }
 
       if (!perDay.has(dk)) perDay.set(dk, { day: dk, total: 0, ...Object.fromEntries(allCliIds.map((c) => [c, 0])) })
