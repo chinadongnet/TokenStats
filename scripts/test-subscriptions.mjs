@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict'
-import { computeSubscriptionStats, computeAllSubscriptionStats, computePlanBreakdown, computePlanTimeline } from '../src/main/core/subscriptions.js'
+import { computeCycleDashboard, computeSubscriptionStats, computeAllSubscriptionStats, computePlanBreakdown, computePlanTimeline } from '../src/main/core/subscriptions.js'
 import { UsageDb } from '../src/main/core/db.js'
 import fsp from 'node:fs/promises'
 import os from 'node:os'
@@ -106,3 +106,39 @@ try {
   await fsp.rm(folder, { recursive: true, force: true })
 }
 console.log('OK: manual merging, separate purchases, gaps, overlap, prices, timeline and persistence')
+
+const dashboard = computeCycleDashboard(overlapping, history, now)
+assert.equal(dashboard.plans[0].totalTokens, 300)
+assert.equal(dashboard.summary.totalPaid, 65)
+assert.equal(dashboard.summary.currentCount, 0)
+assert.equal(dashboard.summary.peakCount, 1, 'overlapping purchases of one group count as one concurrent subscription')
+assert.equal(dashboard.plans[0].cycles.find((c) => c.periodId === 'overlap').tokens, 100)
+assert.equal(dashboard.plans[0].models[0].total, 300)
+assert.equal(dashboard.summary.bestValueId, 'same-plan')
+const boundaryPlan = { ...plan, startDate: '2026-01-15', active: false, endDate: '2026-02-10' }
+const boundary = computeCycleDashboard([boundaryPlan], [
+  record(at(2026, 1, 15, 0) - 1, 1000, 10), record(at(2026, 1, 15, 0), 10, 1),
+  record(at(2026, 2, 11, 0) - 1, 20, 2), record(at(2026, 2, 11, 0), 2000, 20),
+], now)
+assert.equal(boundary.summary.totalTokens, 30, 'start midnight and entire end day count; outside timestamps do not')
+assert.equal(boundary.plans[0].cycles[0].end, at(2026, 2, 11, 0))
+const longHistory = computeCycleDashboard([{ ...plan, startDate: '2024-01-31' }], [
+  record(at(2024, 2, 29, 0), 17, 3), record(now + 1, 9999, 100),
+], now)
+assert.equal(longHistory.plans[0].cycles.length, 28, 'complete history must exceed the old 24-cycle cap')
+assert.equal(longHistory.summary.totalTokens, 17, 'future usage is excluded even inside an open cycle')
+assert.equal(longHistory.plans[0].cycles.find((c) => c.start === at(2024, 2, 29, 0)).tokens, 17)
+const concurrent = computeCycleDashboard([
+  ...purchases,
+  { ...plan, id: 'second', groupId: 'second', startDate: '2026-01-10', active: false, endDate: '2026-03-10', bindings: [{ cli: 'codex' }] },
+  { ...plan, id: 'future', startDate: '2027-01-01' },
+  { ...plan, id: 'free', monthlyUsd: 0, startDate: '2026-04-01', bindings: [{ cli: 'gemini' }] },
+], history, now)
+assert.equal(concurrent.summary.currentCount, 1, 'scheduled future purchases do not count as current')
+assert.equal(concurrent.summary.peakCount, 2)
+assert.equal(concurrent.summary.peakAt, at(2026, 1, 10, 0))
+assert.ok(!concurrent.ranking.includes('free'), 'free plans have an undefined ratio, not infinite value')
+assert.equal(concurrent.summary.totalTokens, concurrent.models.reduce((n, m) => n + m.total, 0))
+assert.equal(concurrent.summary.totalTokens, concurrent.plans.reduce((n, p) => n + p.cycles.reduce((sum, c) => sum + c.tokens, 0), 0))
+assert.equal(computeCycleDashboard([], [], now).summary.peakCount, 0)
+console.log('OK: full cycle dashboard, exact boundaries, model totals, historical concurrency, future exclusion and zero-fee ranking')

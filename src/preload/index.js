@@ -72,6 +72,7 @@ contextBridge.exposeInMainWorld('api', {
   subsSave: (sub) => ipcRenderer.invoke('subs:save', sub),
   subsDelete: (id) => ipcRenderer.invoke('subs:delete', id),
   subsStats: () => ipcRenderer.invoke('subs:stats'),
+  subsCycles: () => ipcRenderer.invoke('subs:cycles'),
   // rolling quota-reset windows (popup countdown); live CLI quota (Codex) is
   // already overlaid into these entries by the main process
   subsResets: () => ipcRenderer.invoke('subs:resets'),

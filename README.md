@@ -403,6 +403,19 @@ tray tooltip and the popup/report footers.
 
 ## Notes
 
+The tray's **Subscription cycles** window opens a purchase-scoped overview:
+current and peak concurrent subscriptions, all-cycle tokens, paid fees, estimated
+usage value, value ranking and model shares. Click a subscription for its complete
+cycle history, then select a bar, period dropdown or table row for that cycle's
+tokens, fee, value ratio and every model. There is no 24-cycle history limit here.
+Each purchase keeps its own monthly billing anchor and inclusive end date; gaps
+are excluded, and overlapping usage belongs to the latest-starting matching
+purchase only. Manually merged purchases count as one concurrent subscription.
+Value ratio is estimated usage cost divided by billed fees (1× = equal value);
+free plans are excluded from that ranking. Statistics refresh on data updates
+and every 30 seconds. Only collected usage at or before the displayed update
+time contributes to the totals.
+
 - Cost numbers are **estimates** — they depend on your plan and current list prices.
   Edit `src/main/core/pricing.js` to match your rates. LiteLLM is exempt: it reports
   real spend.

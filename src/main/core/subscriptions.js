@@ -93,8 +93,10 @@ function billedCycles(sub, nowMs) {
   if (!sub.active) {
     const endMs = parseDateLocal(sub.endDate)
     if (Number.isFinite(endMs)) {
-      billedThrough = Math.min(nowMs, endMs + 86400000 - 1)
-      coverageCutoff = endMs + 86400000 // start of the day AFTER the end date
+      const nextDay = new Date(endMs)
+      nextDay.setDate(nextDay.getDate() + 1)
+      coverageCutoff = nextDay.getTime() // local midnight, including DST changes
+      billedThrough = Math.min(nowMs, coverageCutoff - 1)
     }
   }
   const sd = new Date(startMs)
@@ -110,7 +112,7 @@ function billedCycles(sub, nowMs) {
 }
 
 // Stats for one subscription against the full deduped record set.
-export function computeSubscriptionStats(sub, records, nowMs = Date.now()) {
+export function computeSubscriptionStats(sub, records, nowMs = Date.now(), { fullHistory = false, includeModels = false } = {}) {
   const startMs = parseDateLocal(sub.startDate)
   const base = {
     id: sub.id,
@@ -127,6 +129,7 @@ export function computeSubscriptionStats(sub, records, nowMs = Date.now()) {
   }
 
   const cycles = billedCycles(sub, nowMs)
+  if (includeModels) for (const c of cycles) c.models = new Map()
 
   // Calendar-month buckets alongside the billing cycles — the report's
   // fee-vs-worth chart wants months that align across plans, which billing
@@ -150,7 +153,7 @@ export function computeSubscriptionStats(sub, records, nowMs = Date.now()) {
     const firstStart = cycles[0].start
     const lastEnd = cycles[cycles.length - 1].end
     for (const r of records) {
-      if (r.ts < firstStart || r.ts >= lastEnd) continue
+      if (r.ts < firstStart || r.ts >= lastEnd || r.ts > nowMs) continue
       if (!match(r)) continue
       // binary search: greatest cycle whose start <= r.ts
       let lo = 0, hi = cycles.length - 1
@@ -163,6 +166,14 @@ export function computeSubscriptionStats(sub, records, nowMs = Date.now()) {
       c.cost += costFor(r)
       c.tokens += r.total
       c.turns += r.turns || 1
+      if (includeModels) {
+        const key = JSON.stringify([r.cli, r.model])
+        const m = c.models.get(key) || { cli: r.cli, model: r.model, total: 0, cost: 0, turns: 0 }
+        m.total += r.total
+        m.cost += costFor(r)
+        m.turns += r.turns || 1
+        c.models.set(key, m)
+      }
       const mb = monthBucket(r.ts)
       mb.cost += costFor(r)
       mb.tokens += r.total
@@ -171,6 +182,7 @@ export function computeSubscriptionStats(sub, records, nowMs = Date.now()) {
 
   let totalCost = 0, totalTokens = 0, totalTurns = 0, peakCycle = null
   for (const c of cycles) {
+    if (includeModels) c.models = [...c.models.values()].sort((a, b) => b.total - a.total)
     totalCost += c.cost
     totalTokens += c.tokens
     totalTurns += c.turns
@@ -191,7 +203,7 @@ export function computeSubscriptionStats(sub, records, nowMs = Date.now()) {
     // True all-history maximum, computed before the UI history is capped to 24.
     peakCycle,
     // newest-first, capped — the UI shows recent cycles; totals above cover all
-    cycles: cycles.slice(-24).reverse(),
+    cycles: (fullHistory ? cycles : cycles.slice(-24)).reverse(),
     // chronological calendar months (capped), for the fee-vs-worth chart
     months: [...months.values()].sort((a, b) => a.month.localeCompare(b.month)).slice(-24),
   }
@@ -256,6 +268,68 @@ export function computeAllSubscriptionStats(subs, records, nowMs = Date.now()) {
 function bindingKey(binding) {
   return JSON.stringify([binding.cli, binding.keyAlias?.trim() || null,
     binding.models?.length ? [...new Set(binding.models)].sort() : null])
+}
+
+// All-history cycle dashboard. Every purchase retains its own anchor, fee and
+// clipped coverage; grouping never fills gaps or duplicates overlapping usage.
+export function computeCycleDashboard(subs, records, nowMs = Date.now()) {
+  const { entries, pick } = planAssigner(subs, nowMs)
+  const owned = new Map(entries.map((e) => [e.sub.id, []]))
+  for (const r of records || []) {
+    if (r.ts > nowMs) continue
+    const e = pick(r)
+    if (e) owned.get(e.sub.id).push(r)
+  }
+  const stats = entries.map((e) => computeSubscriptionStats(e.sub, owned.get(e.sub.id), nowMs,
+    { fullHistory: true, includeModels: true }))
+  const combineModels = (cycles) => {
+    const models = new Map()
+    for (const c of cycles) for (const m of c.models || []) {
+      const key = JSON.stringify([m.cli, m.model])
+      const sum = models.get(key) || { ...m, total: 0, cost: 0, turns: 0 }
+      for (const k of ['total', 'cost', 'turns']) sum[k] += m[k]
+      models.set(key, sum)
+    }
+    return [...models.values()].sort((a, b) => b.total - a.total)
+  }
+  const plans = groupSubscriptionStats(stats).map((p) => {
+    const cycles = p.periods.flatMap((s) => s.cycles.map((c) => ({ ...c, periodId: s.id })))
+      .sort((a, b) => b.start - a.start || a.periodId.localeCompare(b.periodId))
+    const current = cycles.filter((c) => c.start <= nowMs && c.end > nowMs)
+    return { ...p, cycles, current, isCurrent: current.length > 0,
+      models: combineModels(cycles), ratio: p.totalPaid > 0 ? p.totalCost / p.totalPaid : null,
+      tokenPerDollar: p.totalPaid > 0 ? p.totalTokens / p.totalPaid : null }
+  }).sort((a, b) => Number(b.isCurrent) - Number(a.isCurrent) || b.totalTokens - a.totalTokens)
+
+  // Union coverage within each group before counting concurrent subscriptions.
+  // Process simultaneous starts/ends together; adjacent periods aren't a spike.
+  const events = new Map()
+  for (const p of plans) {
+    const spans = p.cycles.map((c) => [c.start, Math.min(c.end, nowMs + 1)]).sort((a, b) => a[0] - b[0])
+    const merged = []
+    for (const span of spans) {
+      const last = merged.at(-1)
+      if (last && span[0] <= last[1]) last[1] = Math.max(last[1], span[1])
+      else merged.push([...span])
+    }
+    for (const [start, end] of merged) {
+      events.set(start, (events.get(start) || 0) + 1)
+      events.set(end, (events.get(end) || 0) - 1)
+    }
+  }
+  let count = 0, peakCount = 0, peakAt = null
+  for (const [at, change] of [...events].sort((a, b) => a[0] - b[0])) {
+    count += change
+    if (count > peakCount) { peakCount = count; peakAt = at }
+  }
+  const ranking = plans.filter((p) => p.ratio != null).sort((a, b) => b.ratio - a.ratio || b.totalTokens - a.totalTokens)
+  const mostCycles = [...plans].filter((p) => p.monthsBilled > 0).sort((a, b) => b.monthsBilled - a.monthsBilled)[0] || null
+  const models = combineModels(plans.flatMap((p) => p.cycles))
+  const summary = Object.fromEntries(['totalTokens', 'totalPaid', 'totalCost', 'totalTurns', 'monthsBilled'].map((k) =>
+    [k, plans.reduce((n, p) => n + p[k], 0)]))
+  return { asOf: nowMs, plans, ranking: ranking.map((p) => p.id), models,
+    summary: { ...summary, currentCount: plans.filter((p) => p.isCurrent).length,
+      peakCount, peakAt, bestValueId: ranking[0]?.id || null, mostCyclesId: mostCycles?.id || null } }
 }
 
 // Purchases keep their own billing anchors, prices and ownership. Only the

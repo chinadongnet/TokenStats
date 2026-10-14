@@ -10,7 +10,7 @@ import { codexResetWindows } from './core/parsers/codex.js'
 import { cursor, cursorResetWindows, configureCursorArchive } from './core/parsers/cursor.js'
 import { claudeResetWindows, primeClaudeLimits } from './core/claudeLimits.js'
 import { primeAgyLimits } from './core/agyLimits.js'
-import { computeAllSubscriptionStats, computePlanBreakdown, computePlanTimeline, computeResetWindows, mergeLiveLimits, planRecordIndex } from './core/subscriptions.js'
+import { computeCycleDashboard, computeAllSubscriptionStats, computePlanBreakdown, computePlanTimeline, computeResetWindows, mergeLiveLimits, planRecordIndex } from './core/subscriptions.js'
 import { migrateLegacyLitellmConfig } from './core/migrateLitellm.js'
 import { isAutoLaunch, setAutoLaunch, migrateLegacyRunKeys } from './autoLaunch.js'
 import { agyResetWindows, getAgyQuotaState, enableAgyQuota, disableAgyQuota, ensureAgyHook, AGY_MIRROR_PATH } from './agyQuota.js'
@@ -312,6 +312,7 @@ async function init() {
   ipcMain.handle('subs:stats', () =>
     db && store ? computeAllSubscriptionStats(db.listSubscriptions(), store.dedupedRecords(), Date.now()) : []
   )
+  ipcMain.handle('subs:cycles', () => computeCycleDashboard(db?.listSubscriptions() || [], store?.dedupedRecords() || []))
   // Quota-reset windows for the tray popup. Recomputed per call (cheap) so the
   // popup's countdown always reflects the newest records. Where a plan is bound
   // to a CLI that reports its OWN quota (Codex, via the rate_limits snapshot in
@@ -408,6 +409,7 @@ async function init() {
   refreshAgyLimits()
   setInterval(() => refreshAgyLimits(), 20000)
   if (process.env.AIMON_AUTO_REPORT) openReport() // dev/test convenience
+  if (process.env.AIMON_AUTO_CYCLES) openCycles()
   if ('AIMON_SET_AUTOLAUNCH' in process.env) setAutoLaunch(process.env.AIMON_SET_AUTOLAUNCH === '1') // headless toggle
 }
 
@@ -677,8 +679,8 @@ function openCycles() {
     return
   }
   cyclesWin = new BrowserWindow({
-    width: 880,
-    height: 720,
+    width: 1180,
+    height: 820,
     minWidth: 640,
     minHeight: 480,
     show: false,
