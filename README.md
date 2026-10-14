@@ -1,5 +1,19 @@
 # TokenStats
 
+## Multiple purchases of one subscription
+
+In Settings → Token Plans, select the subscriptions to combine, choose the name
+to retain, and click **Merge selected**. Names are never merged automatically.
+Use **Add purchase period** to record another purchase under that subscription;
+expand **Manage purchase periods** to edit dates, prices and sources, stop an
+ongoing period, or separate a purchase again.
+
+Reports and the subscription timeline show one combined subscription, with each
+purchase's original billing cycles retained. Fees add up per purchase; tokens and
+estimated usage cost count only within purchased periods. Unsubscribed gaps stay
+unplanned, and overlapping usage is attributed once. Different purchase prices
+and billing start dates remain independent.
+
 A Windows **system-tray** app that tracks token usage across your local AI coding
 tools — **Claude Code**, **Codex**, **Gemini**, **Antigravity**, and **Cursor** — plus
 any number of self-hosted **LiteLLM** proxies, and shows it at a glance.
@@ -388,6 +402,23 @@ copy Windows autostarts. The running version and its **build time** are shown in
 tray tooltip and the popup/report footers.
 
 ## Notes
+
+The tray's **Subscription cycles** window opens a purchase-scoped overview:
+current and peak concurrent subscriptions, all-cycle tokens, paid fees, estimated
+usage value, value ranking and model shares. Click a subscription for its complete
+cycle history, then select a bar, period dropdown or table row for that cycle's
+tokens, fee, value ratio and every model. There is no 24-cycle history limit here.
+Each purchase keeps its own monthly billing anchor and inclusive end date; gaps
+are excluded, and overlapping usage belongs to the latest-starting matching
+purchase only. Manually merged purchases count as one concurrent subscription.
+Value ratio is estimated usage cost divided by billed fees (1× = equal value);
+free plans are excluded from that ranking. Statistics refresh on data updates
+and every 30 seconds. Only collected usage at or before the displayed update
+time contributes to the totals.
+The usage report's **Subscription plans** tab shares the same overview and
+cycle drilldown, including the same data endpoint and refresh behavior. Expand
+the analysis section below its subscription cards for the existing zoomable
+timeline, fee comparison and monthly trend charts.
 
 - Cost numbers are **estimates** — they depend on your plan and current list prices.
   Edit `src/main/core/pricing.js` to match your rates. LiteLLM is exempt: it reports

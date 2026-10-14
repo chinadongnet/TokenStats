@@ -58,6 +58,7 @@ const defaultAnchor = (period, startDate) =>
 
 const emptySubDraft = () => ({
   id: null,
+  groupId: null,
   name: '',
   monthlyUsd: '',
   startDate: todayIso(),
@@ -136,6 +137,10 @@ export default function Settings() {
   const [subs, setSubs] = useState(null) // null = loading
   const [subStats, setSubStats] = useState({}) // id -> stats
   const [subEditing, setSubEditing] = useState(null) // null | 'new' | subId
+  const [subGroups, setSubGroups] = useState([])
+  const [mergeSelected, setMergeSelected] = useState([])
+  const [mergeTarget, setMergeTarget] = useState('')
+  const [subError, setSubError] = useState('')
   const [subDraft, setSubDraft] = useState(emptySubDraft())
   const [subSaving, setSubSaving] = useState(false)
 
@@ -148,7 +153,8 @@ export default function Settings() {
   async function loadSubs() {
     const [rows, stats] = await Promise.all([window.api.subsList(), window.api.subsStats()])
     setSubs(rows)
-    setSubStats(Object.fromEntries((stats || []).map((s) => [s.id, s])))
+    setSubGroups(stats || [])
+    setSubStats(Object.fromEntries((stats || []).flatMap((s) => s.periods || [s]).map((s) => [s.id, s])))
   }
   useEffect(() => { loadSubs() }, [])
   useEffect(() => window.api.onReportUpdated(() => loadSubs()), [])
@@ -310,12 +316,15 @@ export default function Settings() {
   // ---- subscription plan actions ----
 
   function startAddSub() {
+    setSubError('')
     setSubDraft(emptySubDraft())
     setSubEditing('new')
   }
   function startEditSub(s) {
+    setSubError('')
     setSubDraft({
       id: s.id,
+      groupId: s.groupId,
       name: s.name,
       monthlyUsd: String(s.monthlyUsd ?? ''),
       startDate: s.startDate,
@@ -327,6 +336,30 @@ export default function Settings() {
     })
     setSubEditing(s.id)
   }
+  function addPurchase(group) {
+    const previous = (subs || []).filter((s) => s.groupId === group.id).sort((a, b) => b.startDate.localeCompare(a.startDate))[0]
+    setSubDraft({ ...emptySubDraft(), ...previous, id: null, groupId: group.id,
+      name: group.name, monthlyUsd: String(previous.monthlyUsd), startDate: todayIso(), endDate: '', active: true })
+    setSubError('')
+    setSubEditing('new')
+    requestAnimationFrame(() => document.querySelector('.purchase-new')?.scrollIntoView({ block: 'center' }))
+  }
+  async function mergePurchases() {
+    setSubError('')
+    try {
+      await window.api.subsMerge(mergeSelected, mergeTarget || mergeSelected[0])
+      setMergeSelected([])
+      setMergeTarget('')
+      await loadSubs()
+    } catch (err) { setSubError(err.message || String(err)) }
+  }
+  async function separatePurchase(id) {
+    setSubError('')
+    try {
+      await window.api.subsSeparate(id)
+      await loadSubs()
+    } catch (err) { setSubError(err.message || String(err)) }
+  }
   function cancelEditSub() {
     setSubEditing(null)
   }
@@ -337,6 +370,7 @@ export default function Settings() {
     try {
       await window.api.subsSave({
         id: subDraft.id || undefined,
+        groupId: subDraft.groupId || undefined,
         name: subDraft.name.trim(),
         monthlyUsd: Number(subDraft.monthlyUsd) || 0,
         startDate: subDraft.startDate,
@@ -360,6 +394,8 @@ export default function Settings() {
       })
       await loadSubs()
       setSubEditing(null)
+    } catch (err) {
+      setSubError(err.message || String(err))
     } finally {
       setSubSaving(false)
     }
@@ -374,6 +410,7 @@ export default function Settings() {
 
   // Deactivate = stop billing after today; reactivate resumes monthly billing.
   async function toggleSubActive(s) {
+    if (!s.active) return addPurchase({ id: s.groupId, name: s.name })
     await window.api.subsSave({ ...s, active: !s.active, endDate: s.active ? todayIso() : null })
     await loadSubs()
   }
@@ -396,7 +433,7 @@ export default function Settings() {
     if (!agy.enabled) return t('set.agyQuotaHint')
     if (agy.mirrorAgeMs == null) return t('set.agyEnabledWaiting')
     const mins = Math.max(0, Math.round(agy.mirrorAgeMs / 60000))
-    return t(mins > 60 ? 'set.agyEnabledStale' : 'set.agyEnabledFresh', { mins })
+    return t(agy.mirrorAgeMs > 60000 ? 'set.agyEnabledStale' : 'set.agyEnabledFresh', { mins })
   })()
   const agyDisabled = agyBusy || !agy || !agy.agyFound || (agy.foreign && !agy.enabled)
 
@@ -459,7 +496,7 @@ export default function Settings() {
       </div>
 
       {subEditing === 'new' && (
-        <section className="card">
+        <section className="card purchase-new">
           <SubForm
             draft={subDraft} setDraft={setSubDraft} providers={providers || []}
             onSave={saveSubDraft} onCancel={cancelEditSub} saving={subSaving}
@@ -472,54 +509,76 @@ export default function Settings() {
         <div className="empty">{t('set.noPlans')}</div>
       )}
 
-      {(subs || []).map((s) => (
-        <section className="card" key={s.id}>
-          {subEditing === s.id ? (
-            <SubForm
-              draft={subDraft} setDraft={setSubDraft} providers={providers || []}
-              onSave={saveSubDraft} onCancel={cancelEditSub} saving={subSaving}
-            />
-          ) : (
-            <>
-              <div className="card-head">
-                <div className="provider-title">
-                  {s.name}
-                  <span className="muted small">${usd(s.monthlyUsd)}{t('set.perMo')}</span>
-                  {!s.active && <span className="muted small">{t('set.ended', { date: s.endDate || '—' })}</span>}
-                </div>
-                <div className="rep-actions">
-                  <button className="btn" onClick={() => toggleSubActive(s)}>{s.active ? t('set.deactivate') : t('set.reactivate')}</button>
-                  <button className="btn" onClick={() => startEditSub(s)}>{t('common.edit')}</button>
-                  <button className="btn danger" onClick={() => deleteSub(s)}>{t('common.delete')}</button>
-                </div>
-              </div>
-              <div className="provider-meta">
-                {t('set.since', { date: s.startDate })}
-                {' · '}
-                {(s.bindings || []).length === 0
-                  ? t('set.noSources')
-                  : (s.bindings || []).map((b) => sourceLabel(b.cli) + (b.keyAlias ? ` (${b.keyAlias})` : '')).join(', ')}
-                {s.active && (s.resetPeriods || []).length > 0 && (
-                  <>{' · '}{t('set.quotaResets', { list: s.resetPeriods.map(resetLabel).join(' + ') })}</>
-                )}
-              </div>
-              {subStats[s.id] && (
-                <div className="provider-meta">
-                  {t('set.billed', { n: subStats[s.id].monthsBilled, unit: subStats[s.id].monthsBilled === 1 ? t('common.month') : t('common.months') })}
-                  {' · '}{t('set.paid', { usd: usd(subStats[s.id].totalPaid) })}
-                  {' · '}{t('set.usageWorth', { usd: usd(subStats[s.id].totalCost) })}
-                  {subStats[s.id].totalPaid > 0 && (
-                    <> ({Math.round((100 * subStats[s.id].totalCost) / subStats[s.id].totalPaid)}%)</>
+      {subError && <div className="form-error" role="alert">{subError}</div>}
+      {mergeSelected.length > 0 && (
+        <section className="card merge-plans">
+          <span>{t('set.mergeSelected', { n: mergeSelected.length })}</span>
+          <label>{t('set.mergeInto')}
+            <select value={mergeTarget || mergeSelected[0]} onChange={(e) => setMergeTarget(e.target.value)}>
+              {subGroups.filter((g) => mergeSelected.includes(g.id)).map((g) => <option key={g.id} value={g.id}>{g.name}</option>)}
+            </select>
+          </label>
+          <button className="btn primary" disabled={mergeSelected.length < 2} onClick={mergePurchases}>{t('set.mergePlans')}</button>
+          <button className="btn" onClick={() => { setMergeSelected([]); setMergeTarget('') }}>{t('common.cancel')}</button>
+          <div className="muted small">{t('set.mergeHint')}</div>
+        </section>
+      )}
+      {subGroups.map((g) => {
+        const periods = (subs || []).filter((s) => s.groupId === g.id)
+        return (
+          <section className="card subscription-group" key={g.id}>
+            <div className="card-head">
+              <label className="provider-title">
+                <input type="checkbox" aria-label={t('set.selectMerge', { name: g.name })}
+                  checked={mergeSelected.includes(g.id)} disabled={subEditing !== null}
+                  onChange={(e) => {
+                    setMergeSelected((selected) => e.target.checked ? [...selected, g.id] : selected.filter((id) => id !== g.id))
+                    setMergeTarget('')
+                  }} />
+                {g.name}
+                {g.active && <span className="muted small">${usd(g.monthlyUsd)}{t('set.perMo')}</span>}
+              </label>
+              <button className="btn" onClick={() => addPurchase(g)} disabled={subEditing !== null}>{t('set.addPurchase')}</button>
+            </div>
+            <div className="provider-meta">
+              {t('set.purchaseCount', { n: periods.length })}
+              {' · '}{t('set.paid', { usd: usd(g.totalPaid) })}
+              {' · '}{t('set.usageWorth', { usd: usd(g.totalCost) })}
+              {' · '}{compact(g.totalTokens)} tokens
+            </div>
+            {g.currentCycle && <CurrentCycleCompare cycle={g.currentCycle} />}
+            <details className="purchase-periods" open={periods.some((p) => p.id === subEditing) || undefined}>
+              <summary>{t('set.managePurchases')}</summary>
+              {periods.map((s) => (
+                <div className="purchase-period" key={s.id}>
+                  {subEditing === s.id ? (
+                    <SubForm draft={subDraft} setDraft={setSubDraft} providers={providers || []}
+                      onSave={saveSubDraft} onCancel={cancelEditSub} saving={subSaving} />
+                  ) : (
+                    <>
+                      <div className="card-head">
+                        <span>{s.startDate} — {s.active ? t('set.ongoing') : s.endDate}</span>
+                        <span className="muted small">${usd(s.monthlyUsd)}{t('set.perMo')}</span>
+                        <div className="rep-actions">
+                          <button className="btn" onClick={() => toggleSubActive(s)}>{s.active ? t('set.deactivate') : t('set.buyAgain')}</button>
+                          <button className="btn" onClick={() => startEditSub(s)}>{t('common.edit')}</button>
+                          {periods.length > 1 && <button className="btn" onClick={() => separatePurchase(s.id)}>{t('set.separatePurchase')}</button>}
+                          <button className="btn danger" onClick={() => deleteSub(s)}>{t('common.delete')}</button>
+                        </div>
+                      </div>
+                      <div className="provider-meta">
+                        {(s.bindings || []).map((b) => sourceLabel(b.cli) + (b.keyAlias ? ` (${b.keyAlias})` : '')).join(', ') || t('set.noSources')}
+                        {' · '}{t('set.usageWorth', { usd: usd(subStats[s.id]?.totalCost) })}
+                        {' · '}{compact(subStats[s.id]?.totalTokens)} tokens
+                      </div>
+                    </>
                   )}
                 </div>
-              )}
-              {s.active && subStats[s.id]?.currentCycle && (
-                <CurrentCycleCompare cycle={subStats[s.id].currentCycle} />
-              )}
-            </>
-          )}
-        </section>
-      ))}
+              ))}
+            </details>
+          </section>
+        )
+      })}
 
       {/* ---------------- LiteLLM providers ---------------- */}
       <div className="group-head">

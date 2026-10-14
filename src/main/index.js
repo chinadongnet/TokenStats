@@ -7,9 +7,10 @@ import { UsageDb } from './core/db.js'
 import { CLI_META, ensureConfigFile, CONFIG_FILE, loadLanguage, saveLanguage } from './core/paths.js'
 import { createLitellmPoller, listModels } from './core/parsers/litellm.js'
 import { codexResetWindows } from './core/parsers/codex.js'
-import { cursorResetWindows } from './core/parsers/cursor.js'
+import { cursor, cursorResetWindows, configureCursorArchive } from './core/parsers/cursor.js'
 import { claudeResetWindows, primeClaudeLimits } from './core/claudeLimits.js'
-import { computeAllSubscriptionStats, computePlanBreakdown, computePlanTimeline, computeResetWindows, mergeLiveLimits, planRecordIndex } from './core/subscriptions.js'
+import { primeAgyLimits } from './core/agyLimits.js'
+import { computeCycleDashboard, computeAllSubscriptionStats, computePlanBreakdown, computePlanTimeline, computeResetWindows, mergeLiveLimits, planRecordIndex } from './core/subscriptions.js'
 import { migrateLegacyLitellmConfig } from './core/migrateLitellm.js'
 import { isAutoLaunch, setAutoLaunch, migrateLegacyRunKeys } from './autoLaunch.js'
 import { agyResetWindows, getAgyQuotaState, enableAgyQuota, disableAgyQuota, ensureAgyHook, AGY_MIRROR_PATH } from './agyQuota.js'
@@ -126,13 +127,23 @@ async function init() {
 
   // Open the hourly-usage SQLite database (best-effort; app still works without).
   try {
-    db = await new UsageDb().open()
+    db = await new UsageDb({ dbPath: process.env.AIMON_DB_PATH }).open()
     migrateLegacyLitellmConfig(db) // one-time config.json -> DB import, no-op after the first run
   } catch (e) {
     console.error('usage db failed to open:', e)
   }
 
   store = new Store()
+  if (db) {
+    store.seedHistory('agy', db.hourlySince(0).filter((r) => r.cli === 'agy'))
+    const legacyRows = db.hourlySince(0).filter((r) => r.cli === 'cursor')
+    const records = legacyRows.map((r) => ({ ...r, ts: r.hour, sessionId: 'cloud', project: 'cursor', dedupKey: `cursor-legacy:${r.hour}:${r.model}` }))
+    store.files.set('bootstrap:cursor', { parser: cursor, records })
+    configureCursorArchive({
+      load: (userId) => db.listCursorUsage(userId, legacyRows),
+      save: (userId, rows) => db.saveCursorUsage(userId, rows),
+    })
+  }
   store.on('update', (snap) => {
     lastSnapshot = snap
     if (win && !win.isDestroyed()) win.webContents.send('snapshot', snap)
@@ -164,6 +175,7 @@ async function init() {
   ipcMain.handle('agy:set-enabled', (_e, on) => {
     const res = on ? enableAgyQuota() : disableAgyQuota()
     broadcastSnapshot()
+    if (on) refreshAgyLimits(true)
     return res
   })
 
@@ -283,9 +295,27 @@ async function init() {
     notifyReportUpdated()
     broadcastSnapshot()
   })
+  ipcMain.handle('subs:merge', (_e, { groupIds, targetId }) => {
+    if (!db) return []
+    const result = db.mergeSubscriptions(groupIds, targetId)
+    notifyReportUpdated()
+    broadcastSnapshot()
+    return result
+  })
+  ipcMain.handle('subs:separate', (_e, id) => {
+    if (!db) return null
+    const result = db.separateSubscription(id)
+    notifyReportUpdated()
+    broadcastSnapshot()
+    return result
+  })
   ipcMain.handle('subs:stats', () =>
     db && store ? computeAllSubscriptionStats(db.listSubscriptions(), store.dedupedRecords(), Date.now()) : []
   )
+  ipcMain.handle('subs:cycles', () => ({
+    ...computeCycleDashboard(db?.listSubscriptions() || [], store?.dedupedRecords() || []),
+    cliLabels: Object.fromEntries(Object.entries({ ...CLI_META, ...dynamicCliMeta }).map(([id, meta]) => [id, meta.label])),
+  }))
   // Quota-reset windows for the tray popup. Recomputed per call (cheap) so the
   // popup's countdown always reflects the newest records. Where a plan is bound
   // to a CLI that reports its OWN quota (Codex, via the rate_limits snapshot in
@@ -367,16 +397,28 @@ async function init() {
   refreshLitellmPollers() // populate store.pollers before the initial scan/poll
   await store.start()
   ingestNow() // first full ingest after the initial scan
+  if (db?.markMigration('agy-output-cost-and-response-id-v1')) {
+    // Corrected historical AGY costs lie outside the normal 7-day sync window.
+    db.updateCloudSyncState({ fullResync: true })
+  }
   startCloudSyncTimer() // pushes to tokenstat-web when enabled (Settings → 云同步)
   // First push shortly after startup so the cloud reflects a reboot-gap quickly;
-  // waits 30s so the initial scan/ingest has settled and doesn't race it.
-  setTimeout(() => runCloudSync(), 30000)
+  // waits 5s so the initial local scan/ingest has settled.
+  setTimeout(() => runCloudSync(), 5000)
   // Prime Claude's live plan-quota (spawns `claude -p /usage` once) so the
   // popup's Quota-windows section can show it without waiting for the first
   // 15-min refresh. Fire-and-forget; a snapshot after it lands shows the data.
   primeClaudeLimits().then(() => broadcastSnapshot()).catch(() => {})
+  refreshAgyLimits()
+  setInterval(() => refreshAgyLimits(), 20000)
   if (process.env.AIMON_AUTO_REPORT) openReport() // dev/test convenience
+  if (process.env.AIMON_AUTO_CYCLES) openCycles()
   if ('AIMON_SET_AUTOLAUNCH' in process.env) setAutoLaunch(process.env.AIMON_SET_AUTOLAUNCH === '1') // headless toggle
+}
+
+function refreshAgyLimits(force = false) {
+  if (!getAgyQuotaState().enabled) return
+  primeAgyLimits({ force }).then(() => broadcastSnapshot()).catch(() => {})
 }
 
 // Live per-CLI quota windows, shared by the popup's subs:resets handler and
@@ -393,6 +435,20 @@ let cloudSyncInFlight = null
 let cloudSyncQueued = null
 let cloudSyncQueuedFull = false
 let cloudSyncLastAttempt = 0
+let cloudSyncRetryAt = 0
+let cloudSyncTimer = null
+
+function scheduleCloudSync() {
+  const cfg = db?.getCloudSync()
+  if (!cfg?.enabled || !cfg.apiKey || !cfg.endpoint || cloudSyncTimer) return
+  // Run after the DB ingest, coalescing bursts while keeping new CLI usage
+  // within the 30s target under normal network conditions.
+  const delay = Math.max(1000, cloudSyncLastAttempt + 5000 - Date.now(), cloudSyncRetryAt - Date.now())
+  cloudSyncTimer = setTimeout(() => {
+    cloudSyncTimer = null
+    runCloudSync()
+  }, delay)
+}
 function runCloudSync(opts = {}) {
   if (!db || !store) return Promise.resolve({ ok: false, skipped: true })
   if (cloudSyncInFlight) {
@@ -421,6 +477,10 @@ function runCloudSync(opts = {}) {
     fullOverride: !!opts.fullOverride,
   })
     .catch((e) => ({ ok: false, error: String(e) }))
+    .then((result) => {
+      cloudSyncRetryAt = result.error ? Date.now() + 30000 : 0
+      return result
+    })
     .finally(() => { cloudSyncInFlight = null })
   return cloudSyncInFlight
 }
@@ -451,6 +511,7 @@ function ingestNow() {
   try {
     db.ingest(store.dedupedRecords())
     notifyReportUpdated()
+    scheduleCloudSync()
   } catch (e) {
     console.error('ingest failed:', e)
   }
@@ -621,8 +682,8 @@ function openCycles() {
     return
   }
   cyclesWin = new BrowserWindow({
-    width: 880,
-    height: 720,
+    width: 1180,
+    height: 820,
     minWidth: 640,
     minHeight: 480,
     show: false,

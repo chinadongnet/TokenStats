@@ -48,7 +48,7 @@ export function costFor(rec) {
       rec.output * outP +
       rec.cacheRead * cacheReadP +
       rec.cacheCreate * cacheWriteP +
-      rec.reasoning * outP) /
+      (rec.reasoningIncludedInOutput ? 0 : rec.reasoning) * outP) /
     1_000_000
   )
 }

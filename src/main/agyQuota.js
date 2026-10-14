@@ -1,17 +1,10 @@
 // Antigravity (agy) live-quota integration.
 //
-// agy has no local file or public API that carries its remaining quota — the
-// numbers only exist in the CLI's memory and are rendered by the interactive
-// `/usage` command. BUT agy (like Claude Code) has a **statusLine hook**: it
-// pipes the live session-state JSON — including a `quota` map of
-// per-model-pool `{remaining_fraction, reset_time, reset_in_seconds}` — to a
-// user-configured command's stdin on every render.
-//
-// So, opt-in, we register a tiny hook as agy's statusLine command that mirrors
-// that JSON to `~/.tokenstats/agy_status.json`. Whenever the user actually runs
-// agy, the mirror refreshes for free (no OAuth, no spawning agy, no quota
-// spent — it piggybacks on real usage). `agyResetWindows()` reads the mirror
-// and hands the numbers to the same live-window pipeline Codex/Cursor use.
+// Current agy exposes quota through its built-in `/usage` JSON command; the
+// main process refreshes it every 20s while this integration is enabled.
+// The opt-in statusLine mirror remains a fallback, accepted only when fresh.
+// Headless AGY sessions don't render statusLine, so mirror-only reads can freeze
+// indefinitely. Never label an expired mirror or quota window as live.
 //
 // This is the ONE place that edits another tool's config, always user-initiated
 // via the Settings toggle, reversible, and it never clobbers a statusLine the
@@ -20,6 +13,7 @@
 import os from 'node:os'
 import path from 'node:path'
 import fs from 'node:fs'
+import { agyLiveWindows, agyQuotaAgeMs, parseAgyQuota } from './core/agyLimits.js'
 
 const home = os.homedir()
 
@@ -131,6 +125,8 @@ export function getAgyQuotaState() {
   } catch {
     // mirror not written yet
   }
+  const liveAge = agyQuotaAgeMs()
+  if (liveAge != null) mirrorAgeMs = mirrorAgeMs == null ? liveAge : Math.min(mirrorAgeMs, liveAge)
   return { agyFound: true, enabled, foreign: !!cmd && !enabled, mirrorAgeMs }
 }
 
@@ -199,10 +195,8 @@ export function ensureAgyHook() {
 }
 
 // Live quota windows for agy, in the shape mergeLiveLimits/toLiveWindow expect
-// (same as codexResetWindows). We surface the **Gemini** pools (the user's
-// Gemini subscription) as a single weekly window driven by the most-consumed
-// pool — the binding number that actually matters. Returns [] if the mirror is
-// missing or carries no gemini quota.
+// (same as codexResetWindows). Gemini has independent 5h and weekly buckets.
+// Prefer direct fresh /usage data, then a fresh statusLine mirror.
 export function agyResetWindows() {
   // The integration being off is the user saying "don't show this" — a mirror
   // left behind by an earlier session must not keep the card alive.
@@ -213,32 +207,12 @@ export function agyResetWindows() {
   }
   let d
   try {
+    const live = agyLiveWindows()
+    if (live.length) return live
+    if (Date.now() - fs.statSync(AGY_MIRROR_PATH).mtimeMs > 60000) return []
     d = JSON.parse(fs.readFileSync(AGY_MIRROR_PATH, 'utf8'))
   } catch {
     return []
   }
-  const q = d && d.quota
-  if (!q) return []
-  let worst = null
-  for (const [k, v] of Object.entries(q)) {
-    if (!/^gemini/i.test(k)) continue
-    if (!v || typeof v.remaining_fraction !== 'number') continue
-    if (!worst || v.remaining_fraction < worst.remaining_fraction) worst = v
-  }
-  if (!worst) return []
-  const used = Math.max(0, Math.min(100, (1 - worst.remaining_fraction) * 100))
-  const resetsAt = worst.reset_time
-    ? Date.parse(worst.reset_time)
-    : typeof worst.reset_in_seconds === 'number'
-      ? Date.now() + worst.reset_in_seconds * 1000
-      : null
-  return [
-    {
-      label: 'weekly', // agy's gemini quota is a ~7-day window
-      windowMinutes: 7 * 24 * 60,
-      usedPercent: used,
-      remainingPercent: Math.max(0, 100 - used),
-      resetsAt: Number.isFinite(resetsAt) ? resetsAt : null,
-    },
-  ]
+  return parseAgyQuota(d, fs.statSync(AGY_MIRROR_PATH).mtimeMs)
 }

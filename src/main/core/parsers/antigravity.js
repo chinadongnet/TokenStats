@@ -2,6 +2,7 @@ import fs from 'node:fs'
 import path from 'node:path'
 import { createRequire } from 'node:module'
 import { CLI_ROOTS } from '../paths.js'
+import { readSqliteSnapshot, sqliteSignature } from '../sqliteSnapshot.js'
 
 const require = createRequire(import.meta.url)
 
@@ -92,6 +93,31 @@ const sub = (msg, field) => {
   return Buffer.isBuffer(v) ? decodeProto(v) : null
 }
 
+function timestamp(msg) {
+  const seconds = first(msg, 1)
+  if (typeof seconds !== 'number' || seconds < 1e9 || seconds > 1e10) return null
+  return seconds * 1000 + Math.floor((first(msg, 2) || 0) / 1e6)
+}
+
+function modelStepTimes(db) {
+  try {
+    // Join generation usage to step completion by response ID. Positional
+    // fallback is only for old rows without IDs; retries can shift step order.
+    const byResponse = new Map()
+    const byIndex = []
+    for (const [type, blob] of db.exec('SELECT step_type, metadata FROM steps ORDER BY idx')[0]?.values || []) {
+      const meta = decodeProto(Buffer.from(blob))
+      const ts = timestamp(sub(meta, 8)) || timestamp(sub(meta, 7)) || timestamp(sub(meta, 6)) || timestamp(sub(meta, 1))
+      const responseId = first(sub(meta, 9), 11)
+      if (Buffer.isBuffer(responseId) && ts) byResponse.set(responseId.toString('utf8'), ts)
+      if (type === 15) byIndex.push(ts)
+    }
+    return { byResponse, byIndex }
+  } catch {
+    return { byResponse: new Map(), byIndex: [] }
+  }
+}
+
 function workspaceOf(db) {
   try {
     const res = db.exec('SELECT data FROM trajectory_metadata_blob LIMIT 1')
@@ -108,22 +134,23 @@ function workspaceOf(db) {
 export const antigravity = {
   cli: 'agy',
   roots: CLI_ROOTS.agy,
-  kind: 'binary',
+  kind: 'path',
+  sidecars: ['-wal', '-journal'],
+  signature: sqliteSignature,
   match: (file) => file.endsWith('.db'),
-  async parseFile(buf, file) {
+  async parseFile(file) {
+    const buf = await readSqliteSnapshot(file)
+    const fallbackTs = (await fs.promises.stat(file)).mtimeMs
     const SQL = await getSql()
     let db
-    try {
-      db = new SQL.Database(buf)
-    } catch {
-      return []
-    }
+    db = new SQL.Database(buf)
     const sessionId = path.basename(file, '.db')
     const records = []
     try {
       const project = workspaceOf(db) || 'antigravity'
-      const res = db.exec('SELECT data FROM gen_metadata ORDER BY idx')
-      for (const [blob] of res[0]?.values || []) {
+      const stepTimes = modelStepTimes(db)
+      const res = db.exec('SELECT idx, data FROM gen_metadata ORDER BY idx')
+      for (const [idx, blob] of res[0]?.values || []) {
         const top = decodeProto(Buffer.from(blob))
         const gen = top && sub(top, 1)
         const usage = gen && sub(gen, 4)
@@ -132,12 +159,12 @@ export const antigravity = {
         const output = first(usage, 3) || 0
         const cacheRead = first(usage, 5) || 0
         const reasoning = first(usage, 9) || 0
+        const responseId = first(usage, 11)?.toString('utf8')
         const tsMsg = sub(sub(gen, 9) || [], 4)
-        const sec = tsMsg && first(tsMsg, 1)
         const modelRaw = first(gen, 21) || first(gen, 19)
         records.push({
           cli: 'agy',
-          ts: sec ? sec * 1000 : Date.now(),
+          ts: timestamp(tsMsg) || stepTimes.byResponse.get(responseId) || (!responseId && stepTimes.byIndex[idx]) || fallbackTs,
           model: modelRaw ? modelRaw.toString('utf8') : 'antigravity',
           sessionId,
           project,
@@ -146,11 +173,11 @@ export const antigravity = {
           cacheRead,
           cacheCreate: 0,
           reasoning,
+          reasoningIncludedInOutput: true,
           total: input + output + cacheRead,
+          dedupKey: responseId ? `agy-response:${responseId}` : `agy:${sessionId}:${idx}`,
         })
       }
-    } catch {
-      // table missing or schema changed; treat as no usage
     } finally {
       db.close()
     }

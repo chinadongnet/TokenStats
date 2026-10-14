@@ -10,6 +10,29 @@ data the way each tool's own `/usage` (or `/status`) command does.
 Code lives in `src/main/core/parsers/*.js`; the store/watch/poll plumbing is in
 `src/main/core/store.js`.
 
+## Live collection and cloud sync
+
+Local sources have filesystem watchers plus an independent 5-second sweep.
+JSONL tails retain incomplete lines and UTF-8 bytes until the newline arrives;
+per-file ingestion is serialized. AGY checks SQLite header counters and WAL
+sidecars, overlays only checksum-valid committed frames, and retries changing
+snapshots without clearing previously parsed usage. Source files are read only.
+New AGY timestamps are read from model-response step metadata when the legacy
+generation timestamp is absent; the file's modification time is the stable last
+fallback. Existing AGY hourly totals before the oldest retained conversation are
+preserved on startup, so pruned logs do not erase older history.
+
+New usage triggers cloud sync after the DB ingest (at most a 4-second ingest
+delay), with a 1-second debounce and a 5-second minimum request interval. The
+configured minute interval applies to idle refreshes. The target is under 30
+seconds after the CLI commits a usage event, assuming a healthy network; tokens
+the upstream CLI has not written yet cannot be observed. Network sources run
+separately so a slow Cursor export cannot stall Codex or AGY.
+
+`npm run test:live` (Node 22.13+ for the fixture writer) verifies split JSONL,
+concurrent ingestion, real SQLite WAL commits, a timed fallback with watchers
+disabled, API-model CSV rows, archive preservation, and rate-limit backoff.
+
 ## Summary table
 
 | Source      | Transport   | Where the data comes from                                   | Token counts | Quota / limits |
@@ -67,9 +90,14 @@ Returns CSV, one row per request. Columns consumed:
 | `Output Tokens`            | `output` |
 | `Total Tokens`             | `total` |
 
-- Rows with a blank/absent `Total Tokens` (errored / "no charge" requests) are
-  skipped.
-- `startDate=0` pulls **full history** every call. The response carries no
+- A blank/absent `Total Tokens` falls back to the sum of the four component
+  columns. Only rows with no positive token usage are skipped. Model names are
+  preserved verbatim, including API-key requests and `claude-opus-5-5-medium`.
+- `startDate=0` bootstraps full history on a new account. Subsequent calls replace
+  the latest 48 hours, aligned to complete hourly buckets. Older usage remains in
+  the account-specific `cursor_usage_archive` SQLite table. Existing installs
+  seed the archive from hourly totals; those old buckets remain aggregates.
+  The response carries no
   conversationId/project, so all Cursor records are attributed to one synthetic
   `project=cursor` / `session=cloud` bucket.
 - A sibling JSON endpoint (`get-filtered-usage-events`) also returns
@@ -78,21 +106,21 @@ Returns CSV, one row per request. Columns consumed:
   what's used.
 
 ### Caching and throttle
-Results are cached per account (keyed by `userId`, since usage is identical
-regardless of which device's token fetched it). The actual HTTP call is throttled
-to **at most once every 15 minutes** to stay clear of the rate limit that produced
-the 403s above. On any error (rate-limit / expired session / network) the previous
-cache is kept rather than cleared.
+Results are cached and archived per account. Overlapping calls share one request.
+Successful fetches have a 20-second minimum interval; HTTP 403/429 backs off for
+15 minutes, other failures for 20 seconds. Recent exports time out after 20
+seconds, initial full-history exports after 60 seconds, and quota requests after
+10 seconds. Errors retain history and log a diagnostic without credentials.
 
 ### When a refresh actually happens
-The Cursor parser is a **file-watched** parser (`kind: 'binary'`, matches
+The Cursor parser is a file-backed parser (`kind: 'path'`, matches
 `state.vscdb`) but its data is network-backed, so it is also marked `network: true`
 and re-run on a timer. It refreshes on:
 
-1. **App startup** — the initial `store.scanAll()`.
-2. A **5-minute timer** — `store.refreshNetworkParsers()`, which force-reingests
+1. **App startup** — an independent background network refresh.
+2. A **10-second timer** — `store.refreshNetworkParsers()`, which force-reingests
    `network: true` parsers by clearing the cached mtime/size so `ingestFile` doesn't
-   short-circuit. (The parser's own 15-min HTTP throttle still bounds real calls.)
+   short-circuit. The parser's own throttle/backoff bounds actual HTTP calls.
 3. The tray's **"Refresh now"** menu item.
 
 > History note: before the 5-minute timer existed, Cursor usage refreshed **only**
@@ -219,50 +247,41 @@ runs in the background (the IPC handler stays synchronous). Per-model weekly lin
 individuals — migrate to the Antigravity suite`. So the old Gemini CLI is a dead end;
 its successor is Antigravity (below).
 
-### Antigravity (`agy`) — done, via a statusLine mirror hook ✅
-`agy` **is** a real CLI (`%LOCALAPPDATA%\agy\bin\agy.exe`), the successor to the Gemini
-CLI. It has no local quota file and no usable public API — the numbers live only in the
-running CLI's memory, rendered by its interactive `/usage` view. Two dead ends first:
+### Antigravity (`agy`) — live built-in JSON quota
 
-- `agy -p "/usage"` (print mode) does **not** run the built-in — it treats the slash
-  command as an *agent prompt* (given `/status` it went and ran `git status`). So unlike
-  Claude, print mode can't surface the usage view.
-- Driving the **interactive TUI** over a pty needs a fresh ~30 s sign-in plus
-  alternate-screen scraping across dozens of model lines — too fragile to poll.
+On agy 1.3.5, `agy --print /usage --output-format json` executes the built-in
+usage command without requesting model generation (verified: zero token usage).
+`command.data.groups[].buckets[]` provides Gemini weekly and 5-hour windows with
+`remaining_fraction` and `reset_time`. `core/agyLimits.js` refreshes every 20s
+while the Settings integration is enabled, coalesces concurrent queries, and
+bounds each child process to 15s. Results older than 60s or past their reset are
+not displayed as live.
 
-The clean route is agy's **statusLine hook**. Like Claude Code, agy pipes its live
-session-state JSON to a user-configured command's stdin on every render — including a
-`quota` map of per-model-pool `{remaining_fraction, reset_time, reset_in_seconds}`
-(inspired by [Ranteck/agy-statusline](https://github.com/Ranteck/agy-statusline)).
-`src/main/agyQuota.js` registers (opt-in, from **Settings → App → Track agy quota**) a
-tiny hook as agy's `statusLine.command` that mirrors that JSON to
-`~/.tokenstats/agy_status.json`, then prints a compact status line back so the user still
-gets a useful agy status bar. `agyResetWindows()` reads the mirror and surfaces the
-**Gemini** pools (driven by the most-consumed one) as a weekly live window through
-`mergeLiveLimits()` under `liveByCli.agy`, so the popup shows an **Antigravity**
-live-quota card. It refreshes for free whenever the user runs the `agy` CLI — no OAuth,
-no spawning agy, no quota spent — and never overwrites a statusLine the user set
-themselves (the toggle cleanly removes it).
+The existing opt-in statusLine mirror remains a fallback only when updated in
+the last 60s. Headless sessions don't render statusLine, so a mirror-only reader
+can show weeks-old quota. `agyQuota.js` preserves the reversible hook toggle
+and custom statusLine protection; it now returns both independent quota windows.
 
-Gotchas worth recording:
-- agy executes `statusLine.command` by **naive space-splitting with no shell and no quote
-  handling** (verified on Windows), so the installed command must be **unquoted**
-  (`node C:/Users/…/.tokenstats/agyStatusHook.cjs`); a quoted path is passed to node
-  literally and never runs. A hook path containing a space is therefore unsupported.
-- The mirror only refreshes on `agy` **CLI** use — the Antigravity **IDE** doesn't
-  trigger it. And this agy version (1.1.4) exposed only ~7-day (weekly) per-pool windows,
-  no separate 5-hour bucket.
-- There's an alternate, OAuth-based source — `POST daily-cloudcode-pa.googleapis.com/
-  v1internal:retrieveUserQuotaSummary`, which agy's `quota_manager` polls — but it needs
-  the account token and a `v1internal` request shape, so the token-free statusLine mirror
-  is preferred.
+Per-generation usage comes from `ModelUsageStats` in SQLite protobuf blobs.
+AGY 1.3.5's embedded descriptor confirms field 2=input, 3=total output,
+5=cache read, 9=thinking output, 10=visible response output, 11=response ID.
+Thinking is a subset of field 3 and must not be charged twice. Totals include
+cached input consistently with the other sources; AGY's headless `total_tokens`
+excludes cache reads, so it is a different accounting measure.
+
+Step metadata's usage response ID joins each generation to its completion time;
+this avoids assigning timestamps by row position when steps are retried or
+missing. Response IDs deduplicate copied/resumed generations across source roots.
+Older pruned-session aggregates cannot be reconstructed from missing files and
+remain archived; their AGY cost estimates are recalculated without double billing
+thinking tokens.
 
 ## Verdict
 
 **Codex**, **Claude**, **Cursor**, and **Antigravity** now drive live overlays on their
 plans' Quota windows — Codex from the `rate_limits` in its local logs (real-time, no
 network), Claude by shelling out to `claude -p /usage`, Cursor from `/api/usage-summary`
-(both throttled ~15 min), and Antigravity via the opt-in statusLine mirror hook
-(`src/main/agyQuota.js`, refreshed on `agy` CLI use). **Gemini** is deprecated and stays
+(both throttled ~15 min), and Antigravity via its built-in `/usage` JSON command
+(`src/main/core/agyLimits.js`, refreshed every 20s while enabled). **Gemini** is deprecated and stays
 on the manual estimate (badged **manual**). Any future clean source plugs into
 `mergeLiveLimits()` as another `liveByCli` entry — the UI already handles it.

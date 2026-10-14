@@ -12,12 +12,12 @@ import { CLIS } from './paths.js'
 
 const PARSERS = [claude, codex, geminiJsonl, geminiJson, antigravity, cursor]
 
-// How often the stat sweep re-checks every known file (see start()). Codex
+// How often the local sweep re-checks every known file (see start()). Codex
 // appends to its open rollout file without the mtime ever moving, so chokidar
 // stats the file on the OS event, sees no movement and drops it — measured on
 // a real machine, 98% of a day's Codex usage never reached the UI. A warm
 // sweep over ~2.6k files costs ~550ms and is almost entirely fs.stat.
-const SWEEP_MS = 15 * 1000
+export const SWEEP_MS = 5 * 1000
 
 // In-memory index of every parsed file:
 //   path -> { parser, size, mtimeMs, state, records[] }
@@ -27,9 +27,11 @@ export class Store extends EventEmitter {
   constructor() {
     super()
     this.files = new Map()
+    this.history = new Map()
     this.watchers = []
     this._scanTimer = null
     this._pollTimers = []
+    this._ingesting = new Map()
     // Pollers are usage sources with no local files to watch — currently just
     // LiteLLM providers, whose usage lives entirely on the proxy server(s).
     // Unlike PARSERS this is NOT a static list: each LiteLLM provider row in
@@ -51,6 +53,12 @@ export class Store extends EventEmitter {
       if (key.startsWith('poller:') && !keep.has(key)) this.files.delete(key)
     }
     this.pollers = pollers
+    for (const p of pollers) {
+      const key = `poller:${p.cli}`
+      if (!this.files.has(key) && p.reapplySettings) {
+        this.files.set(key, { parser: p, records: p.reapplySettings(), size: 0, mtimeMs: 0, state: {} })
+      }
+    }
   }
 
   parserFor(file) {
@@ -58,15 +66,34 @@ export class Store extends EventEmitter {
     return PARSERS.find((p) => p.roots.some((r) => f.startsWith(norm(r))) && p.match(file))
   }
 
+  seedHistory(cli, rows) {
+    // AGY can prune old conversation databases. Preserve older hourly totals
+    // from the installed client while current on-disk usage stays authoritative.
+    this.history.set(cli, rows.map((r) => ({ ...r, ...(cli === 'agy' ? { cost: undefined, reasoningIncludedInOutput: true } : {}), ts: r.hour, sessionId: 'archived', project: cli,
+      dedupKey: `history:${cli}:${r.hour}:${r.model}` })))
+  }
+
   async ingestFile(file) {
+    // Watch events, sweeps and manual refresh can target the same file. Never
+    // tail one byte range twice or replace a newer parse with an older result.
+    const previous = this._ingesting.get(file) || Promise.resolve()
+    const next = previous.catch(() => {}).then(() => this._ingestFile(file))
+    this._ingesting.set(file, next)
+    try {
+      return await next
+    } finally {
+      if (this._ingesting.get(file) === next) this._ingesting.delete(file)
+    }
+  }
+
+  async _ingestFile(file) {
     const parser = this.parserFor(file)
     if (!parser) return false
     let stat
     try {
       stat = await fsp.stat(file)
     } catch {
-      this.files.delete(file)
-      return false
+      return this.files.delete(file)
     }
     if (!stat.isFile()) return false
 
@@ -75,35 +102,67 @@ export class Store extends EventEmitter {
       entry = { parser, size: 0, mtimeMs: 0, state: {}, records: [] }
       this.files.set(file, entry)
     }
-    if (stat.mtimeMs === entry.mtimeMs && stat.size === entry.size) return false
-
-    if (parser.kind === 'json') {
-      const text = await fsp.readFile(file, 'utf8')
-      entry.records = parser.parseFile(text, file)
-    } else if (parser.kind === 'binary') {
-      // whole-file binary formats (Antigravity SQLite): re-parse on change
-      const buf = await fsp.readFile(file)
-      entry.records = await parser.parseFile(buf, file)
-    } else {
-      // jsonl: if the file shrank/rotated, restart from scratch
-      let start = entry.size
-      if (stat.size < entry.size) {
-        entry.records = []
-        entry.state = {}
-        start = 0
+    const sidecars = await Promise.all((parser.sidecars || []).map(async (suffix) => {
+      try {
+        const s = await fsp.stat(file + suffix)
+        return `${suffix}:${s.size}:${s.mtimeMs}:${s.ctimeMs}`
+      } catch (err) {
+        if (err.code !== 'ENOENT') throw err
+        return `${suffix}:missing`
       }
-      if (stat.size > start) {
-        const chunk = await readRange(file, start, stat.size)
-        const lines = chunk.split('\n')
-        for (const line of lines) {
-          if (!line.trim()) continue
-          const rec = parser.parseLine(line, entry.state, file)
-          if (rec) entry.records.push(rec)
+    }))
+    const signature = sidecars.join('|') + (parser.signature ? await parser.signature(file) : '')
+    if (stat.mtimeMs === entry.mtimeMs && stat.size === entry.size && signature === entry.signature) return false
+
+    try {
+      if (parser.kind === 'json') {
+        const text = await fsp.readFile(file, 'utf8')
+        entry.records = parser.parseFile(text, file)
+      } else if (parser.kind === 'binary') {
+        // whole-file binary formats (Antigravity SQLite): re-parse on change
+        const buf = await fsp.readFile(file)
+        entry.records = await parser.parseFile(buf, file)
+      } else if (parser.kind === 'path') {
+        // File-backed parsers that need random/streamed access rather than a
+        // whole-file Buffer. Cursor's state.vscdb can grow well past 2 GiB.
+        entry.records = await parser.parseFile(file)
+      } else {
+        // jsonl: if the file shrank/rotated, restart from scratch
+        let start = entry.size
+        if (stat.size < entry.size) {
+          entry.records = []
+          entry.state = {}
+          entry.tail = null
+          start = 0
+        }
+        if (stat.size > start) {
+          const chunk = await readRange(file, start, stat.size)
+          const bytes = Buffer.concat([entry.tail || Buffer.alloc(0), chunk])
+          const end = bytes.lastIndexOf(10)
+          // Keep incomplete JSON AND split UTF-8 bytes until the writer appends
+          // the newline. Advancing the offset used to silently lose that turn.
+          entry.tail = Buffer.from(bytes.subarray(end + 1))
+          const lines = end < 0 ? [] : bytes.subarray(0, end).toString('utf8').split('\n')
+          for (const line of lines) {
+            if (!line.trim()) continue
+            const rec = parser.parseLine(line, entry.state, file)
+            if (rec) entry.records.push(rec)
+          }
         }
       }
+      entry.lastError = null
+      if (parser.network) this.files.delete(`bootstrap:${parser.cli}`)
+    } catch (err) {
+      // A broken/oversized source must not abort scanAll(): that used to stop
+      // the shared sweep before it could emit updates for every other CLI.
+      const message = err?.message || String(err)
+      if (entry.lastError !== message) console.warn(`${parser.cli} parser failed for ${file}:`, message)
+      entry.lastError = message
+      return false
     }
     entry.size = stat.size
     entry.mtimeMs = stat.mtimeMs
+    entry.signature = signature
     return true
   }
 
@@ -148,9 +207,10 @@ export class Store extends EventEmitter {
   // Walks every root and re-ingests anything whose size or mtime moved.
   // Returns true if any file's records changed, so callers (the sweep timer in
   // start(), the tray's "refresh") can decide whether to emit an update.
-  async scanAll() {
+  async scanAll({ localOnly = false } = {}) {
     let changed = false
     for (const parser of PARSERS) {
+      if (localOnly && parser.network) continue
       for (const root of parser.roots) {
         for (const file of await walk(root, parser.match)) {
           if (await this.ingestFile(file)) changed = true
@@ -160,13 +220,17 @@ export class Store extends EventEmitter {
     return changed
   }
 
+  scanAllLocal() {
+    return this.scanAll({ localOnly: true })
+  }
+
   // Force-refresh the network-backed file parsers (currently just Cursor, whose
   // "file" is only a token store — the real usage is fetched from cursor.com).
   // ingestFile normally short-circuits when a file's mtime/size is unchanged,
   // which is correct for genuine on-disk formats but wrong here: Cursor's cloud
   // usage keeps growing while state.vscdb sits untouched, so we clear the cached
   // stat to force a re-parse (and thus a re-fetch). The parser self-throttles
-  // the actual HTTP call to every 15 min, so calling this on a timer or from
+  // actual HTTP calls and backs off on rate limits, so timer calls are cheap.
   // "Refresh now" is cheap. Returns true if any record set actually changed.
   async refreshNetworkParsers() {
     let changed = false
@@ -175,14 +239,15 @@ export class Store extends EventEmitter {
       for (const root of parser.roots) {
         for (const file of await walk(root, parser.match)) {
           const entry = this.files.get(file)
-          const before = entry ? entry.records.length : -1
+          const before = JSON.stringify(entry?.records)
+          const beforeRevision = parser.revision
           if (entry) {
             entry.mtimeMs = 0
             entry.size = 0
           }
           await this.ingestFile(file)
-          const after = this.files.get(file)?.records.length ?? -1
-          if (after !== before) changed = true
+          const after = JSON.stringify(this.files.get(file)?.records)
+          if (after !== before || parser.revision !== beforeRevision) changed = true
         }
       }
     }
@@ -195,6 +260,14 @@ export class Store extends EventEmitter {
   allRecords() {
     const out = []
     for (const entry of this.files.values()) out.push(...entry.records)
+    for (const [cli, rows] of this.history) {
+      let earliest = Infinity
+      for (const r of out) if (r.cli === cli && r.ts < earliest) earliest = r.ts
+      const start = new Date(earliest)
+      start.setMinutes(0, 0, 0)
+      const cutoff = Number.isFinite(earliest) ? start.getTime() : Infinity
+      out.push(...rows.filter((r) => r.ts < cutoff))
+    }
     return out
   }
 
@@ -373,8 +446,14 @@ export class Store extends EventEmitter {
   // ---- live watching -------------------------------------------------------
 
   async start() {
-    await this.scanAll()
-    await this.pollAll()
+    // Local usage must never wait behind Cursor's HTTP export.
+    await this.scanAllLocal()
+    this.refreshNetworkParsers().then((changed) => {
+      if (changed) this.emit('update', this.snapshot())
+    }).catch((err) => console.warn('network refresh failed:', err.message))
+    this.pollAll().then((changed) => {
+      if (changed) this.emit('update', this.snapshot())
+    }).catch((err) => console.warn('provider refresh failed:', err.message))
     // Always run the poll-check timer, even if there are zero pollers right
     // now — LiteLLM providers can be added later via the Settings UI (via
     // setPollers()), and this timer must already be running for a newly
@@ -385,16 +464,26 @@ export class Store extends EventEmitter {
     // fire more often than the shortest configured interval so a fresh fetch
     // is picked up promptly once it's due.
     const timer = setInterval(async () => {
-      if (await this.pollAll()) this.emit('update', this.snapshot())
+      try {
+        if (await this.pollAll()) this.emit('update', this.snapshot())
+      } catch (err) {
+        console.warn('provider refresh failed:', err.message)
+      }
     }, 60 * 1000)
     this._pollTimers.push(timer)
-    // Separate, slower timer for network-backed file parsers (Cursor). Kept
-    // apart from the poll timer above because each tick re-reads the whole
-    // state.vscdb to pull the token, so 5 min (well under the parser's own
-    // 15-min HTTP throttle) is a better cadence than the 60 s poll loop.
+    // Network requests have their own throttle/backoff and never block local
+    // scans. Token extraction uses bounded reads rather than loading the DB.
     const netTimer = setInterval(async () => {
-      if (await this.refreshNetworkParsers()) this.emit('update', this.snapshot())
-    }, 5 * 60 * 1000)
+      if (this._refreshingNetwork) return
+      this._refreshingNetwork = true
+      try {
+        if (await this.refreshNetworkParsers()) this.emit('update', this.snapshot())
+      } catch (err) {
+        console.warn('network refresh failed:', err.message)
+      } finally {
+        this._refreshingNetwork = false
+      }
+    }, 10000)
     this._pollTimers.push(netTimer)
     // Stat-sweep fallback for writers the fs-event path goes deaf on. Codex
     // holds its rollout file open for the whole session and appends without
@@ -408,7 +497,9 @@ export class Store extends EventEmitter {
       if (this._sweeping) return // a cold-ish sweep must not stack up
       this._sweeping = true
       try {
-        if (await this.scanAll()) this.emit('update', this.snapshot())
+        if (await this.scanAllLocal()) this.emit('update', this.snapshot())
+      } catch (err) {
+        console.warn('local sweep failed:', err.message)
       } finally {
         this._sweeping = false
       }
@@ -423,9 +514,11 @@ export class Store extends EventEmitter {
         awaitWriteFinish: { stabilityThreshold: 250, pollInterval: 50 },
       })
       const onChange = (file) => {
-        if (this.parserFor(file)) this._queueRescan(file)
+        const base = file.replace(/-(wal|journal)$/, '')
+        const parser = this.parserFor(base)
+        if (parser && !parser.network) this._queueRescan(base)
       }
-      watcher.on('add', onChange).on('change', onChange)
+      watcher.on('add', onChange).on('change', onChange).on('unlink', onChange)
       this.watchers.push(watcher)
     }
     this.emit('update', this.snapshot())
@@ -447,6 +540,7 @@ export class Store extends EventEmitter {
   }
 
   async stop() {
+    clearTimeout(this._scanTimer)
     for (const w of this.watchers) await w.close()
     this.watchers = []
     for (const t of this._pollTimers) clearInterval(t)
@@ -549,9 +643,9 @@ function norm(p) {
 function readRange(file, start, end) {
   return new Promise((resolve, reject) => {
     const chunks = []
-    fs.createReadStream(file, { start, end: end - 1, encoding: 'utf8' })
+    fs.createReadStream(file, { start, end: end - 1 })
       .on('data', (c) => chunks.push(c))
-      .on('end', () => resolve(chunks.join('')))
+      .on('end', () => resolve(Buffer.concat(chunks)))
       .on('error', reject)
   })
 }
