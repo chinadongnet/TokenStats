@@ -125,6 +125,7 @@ function migrateSchema(db) {
     return new Set(res[0] ? res[0].values.map((v) => v[1]) : [])
   }
   const subs = columns('subscriptions')
+  if (!subs.has('group_id')) db.run('ALTER TABLE subscriptions ADD COLUMN group_id TEXT')
   if (!subs.has('reset_periods')) {
     db.run('ALTER TABLE subscriptions ADD COLUMN reset_periods TEXT')
     // Quota windows were briefly a single-select `reset_period` column before
@@ -462,9 +463,17 @@ export class UsageDb {
   }
 
   // id absent -> insert (uuid generated here); id present -> update in place.
-  upsertSubscription({ id, name, monthlyUsd, startDate, active, endDate, bindings, resetPeriods, resetAnchors }) {
+  upsertSubscription({ id, groupId, name, monthlyUsd, startDate, active, endDate, bindings, resetPeriods, resetAnchors }) {
     const now = Date.now()
     const existing = id ? this.getSubscription(id) : null
+    const group = groupId || existing?.groupId || null
+    if (group && !this.listSubscriptions().some((s) => s.groupId === group)) throw new Error('Subscription group no longer exists')
+    const validDate = (value) => {
+      if (typeof value !== 'string' || !/^\d{4}-\d{2}-\d{2}$/.test(value)) return false
+      const date = new Date(value + 'T12:00:00Z')
+      return Number.isFinite(date.getTime()) && date.toISOString().slice(0, 10) === value
+    }
+    if (!validDate(startDate) || (active === false && (!validDate(endDate) || endDate < startDate))) throw new Error('Invalid purchase period dates')
     // Filtered through RESET_PERIODS and de-duped, in canonical order, so the
     // stored set can't carry junk a hand-edited row (or an older build) put there.
     const periods = RESET_PERIODS.filter((p) => (Array.isArray(resetPeriods) ? resetPeriods : []).includes(p))
@@ -499,6 +508,9 @@ export class UsageDb {
         [row.id, row.name, row.monthlyUsd, row.startDate, row.active, row.endDate, row.bindings, row.resetPeriods, row.resetAnchors, now, now]
       )
     }
+    this.db.run('UPDATE subscriptions SET group_id=? WHERE id=?', [group || row.id, row.id])
+    // A group is one subscription name with independently editable purchases.
+    this.db.run('UPDATE subscriptions SET name=? WHERE group_id=?', [row.name, group || row.id])
     this.persist()
     return this.getSubscription(row.id)
   }
@@ -506,6 +518,35 @@ export class UsageDb {
   deleteSubscription(id) {
     this.db.run('DELETE FROM subscriptions WHERE id = ?', [id])
     this.persist()
+  }
+
+  mergeSubscriptions(groupIds, targetId) {
+    const ids = new Set(groupIds || [])
+    if (ids.size < 2 || !ids.has(targetId)) throw new Error('Select at least two subscriptions and a target')
+    const rows = this.listSubscriptions()
+    const target = rows.find((s) => s.groupId === targetId)
+    if (!target || [...ids].some((id) => !rows.some((s) => s.groupId === id))) throw new Error('Subscription no longer exists')
+    this.db.run('BEGIN')
+    try {
+      for (const row of rows) if (ids.has(row.groupId)) {
+        this.db.run('UPDATE subscriptions SET group_id=?, name=?, updated_at=? WHERE id=?', [targetId, target.name, Date.now(), row.id])
+      }
+      this.db.run('COMMIT')
+    } catch (err) {
+      this.db.run('ROLLBACK')
+      throw err
+    }
+    this.persist()
+    return this.listSubscriptions()
+  }
+
+  separateSubscription(id) {
+    const row = this.getSubscription(id)
+    if (!row) throw new Error('Purchase period no longer exists')
+    // Independent identity even when this is the former group's first row.
+    this.db.run('UPDATE subscriptions SET group_id=?, updated_at=? WHERE id=?', [crypto.randomUUID(), Date.now(), id])
+    this.persist()
+    return this.getSubscription(id)
   }
 
   // ---- queries for the report ---------------------------------------------
@@ -633,6 +674,7 @@ function mapSubscriptionRow(r) {
     id: r.id,
     name: r.name,
     monthlyUsd: r.monthly_usd,
+    groupId: r.group_id || r.id,
     startDate: r.start_date,
     active: !!r.active,
     endDate: r.end_date || null,

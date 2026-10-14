@@ -14,6 +14,19 @@ export const LANGS = [
 ]
 
 const en = {
+  'set.mergeSelected': '{n} subscriptions selected',
+  'set.mergeInto': 'Keep subscription name',
+  'set.mergePlans': 'Merge selected',
+  'set.managePlanGroups': 'Manage subscriptions / merge purchases',
+  'set.mergeHint': 'Each purchase keeps its dates, price and sources. Gaps stay unsubscribed; overlapping usage is counted once.',
+  'set.selectMerge': 'Select {name} to merge',
+  'set.addPurchase': 'Add purchase period',
+  'set.buyAgain': 'Buy again',
+  'set.purchaseCount': '{n} purchase periods',
+  'set.purchasesSince': '{n} purchase periods · since {date}',
+  'set.managePurchases': 'Manage purchase periods',
+  'set.ongoing': 'Ongoing',
+  'set.separatePurchase': 'Separate',
   // shared
   'common.today': 'Today',
   'common.7d': '7d',
@@ -353,6 +366,19 @@ const en = {
 }
 
 const zh = {
+  'set.mergeSelected': '已选择 {n} 个订阅',
+  'set.mergeInto': '保留订阅名称',
+  'set.mergePlans': '合并所选订阅',
+  'set.managePlanGroups': '管理订阅 / 合并购买时段',
+  'set.mergeHint': '保留每个购买时段的日期、价格和数据源；停订间隔不计入，重叠用量只计一次。',
+  'set.selectMerge': '选择合并 {name}',
+  'set.addPurchase': '添加购买时段',
+  'set.buyAgain': '再次购买',
+  'set.purchaseCount': '{n} 个购买时段',
+  'set.purchasesSince': '{n} 个购买时段 · 起始 {date}',
+  'set.managePurchases': '管理购买时段',
+  'set.ongoing': '持续订阅中',
+  'set.separatePurchase': '拆分',
   // shared
   'common.today': '今天',
   'common.7d': '7天',

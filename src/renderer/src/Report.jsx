@@ -534,6 +534,10 @@ function SubsView({ CLI }) {
 
       <PlanTimeline CLI={CLI} />
 
+      <div className="rep-actions" style={{ margin: '12px 0' }}>
+        <button className="btn" onClick={() => window.api.openSettings()}>{t('set.managePlanGroups')}</button>
+      </div>
+
       <PlanCompare stats={stats} />
 
       {monthly.length > 0 && (
@@ -558,7 +562,7 @@ function SubsView({ CLI }) {
                 {s.name}
                 <span className={'sub-status' + (s.active ? ' on' : '')}>{s.active ? t('rep.active') : t('rep.endedOn', { date: s.endDate || '' })}</span>
               </h3>
-              <span className="card-sub">{t('rep.moSince', { usd: usd(s.monthlyUsd), date: s.startDate })}</span>
+              <span className="card-sub">{s.purchaseCount > 1 ? t('set.purchasesSince', { n: s.purchaseCount, date: s.startDate }) : t('rep.moSince', { usd: usd(s.monthlyUsd), date: s.startDate })}</span>
             </div>
             <div className="chips">
               {(s.bindings || []).map((b, i) => (
@@ -596,7 +600,7 @@ function SubsView({ CLI }) {
                     {s.cycles.map((c, i) => {
                       const cr = pct(c.cost, c.fee)
                       return (
-                        <tr key={c.start}>
+                        <tr key={(c.periodId || s.id) + ':' + c.start}>
                           <td className="mono">
                             {dayLabel(c.start)} – {dayLabel(c.end - DAY)}
                             {i === 0 && s.active && <span className="muted"> {t('rep.current')}</span>}
@@ -832,7 +836,7 @@ function PlanTimeline({ CLI }) {
                   if (w <= 0) return null
                   const val = c.fee > 0 ? Math.round((100 * c.cost) / c.fee) : null
                   return (
-                    <g key={c.start}>
+                    <g key={(c.periodId || p.id) + ':' + c.start}>
                       <rect x={sx} y={laneY + 4} width={w} height={laneH - 9} rx="2.5" fill={color} opacity={ci % 2 ? 0.5 : 0.85}>
                         <title>
                           {p.name + '\n' + dayLabel(c.start) + ' – ' + dayLabel(c.end - 1) + '\n' + t('rep.feeWord') + ' $' + usd(c.fee) +
@@ -960,7 +964,7 @@ function PlanCompare({ stats }) {
         const unit = s.totalTokens > 0 && s.totalPaid > 0 ? s.totalPaid / (s.totalTokens / 1e6) : null
         return (
           <div className="cmp-row" key={s.id}>
-            <span className="cmp-name" title={s.name + ' · $' + usd(s.monthlyUsd) + '/mo · ' + s.startDate}>
+            <span className="cmp-name" title={s.name + ' · ' + (s.purchaseCount > 1 ? t('set.purchaseCount', { n: s.purchaseCount }) : '$' + usd(s.monthlyUsd) + '/mo') + ' · ' + s.startDate}>
               {s.name}
               {!s.active && <span className="muted small"> {t('rep.endedTag')}</span>}
             </span>

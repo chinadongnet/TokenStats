@@ -127,7 +127,7 @@ async function init() {
 
   // Open the hourly-usage SQLite database (best-effort; app still works without).
   try {
-    db = await new UsageDb().open()
+    db = await new UsageDb({ dbPath: process.env.AIMON_DB_PATH }).open()
     migrateLegacyLitellmConfig(db) // one-time config.json -> DB import, no-op after the first run
   } catch (e) {
     console.error('usage db failed to open:', e)
@@ -294,6 +294,20 @@ async function init() {
     db.deleteSubscription(id)
     notifyReportUpdated()
     broadcastSnapshot()
+  })
+  ipcMain.handle('subs:merge', (_e, { groupIds, targetId }) => {
+    if (!db) return []
+    const result = db.mergeSubscriptions(groupIds, targetId)
+    notifyReportUpdated()
+    broadcastSnapshot()
+    return result
+  })
+  ipcMain.handle('subs:separate', (_e, id) => {
+    if (!db) return null
+    const result = db.separateSubscription(id)
+    notifyReportUpdated()
+    broadcastSnapshot()
+    return result
   })
   ipcMain.handle('subs:stats', () =>
     db && store ? computeAllSubscriptionStats(db.listSubscriptions(), store.dedupedRecords(), Date.now()) : []

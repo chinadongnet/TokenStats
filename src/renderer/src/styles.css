@@ -160,6 +160,14 @@ em.bad { color: #b3564f; }
 
 /* per-plan model breakdown — segmented bar (shaded in the plan color) + legend */
 .models { margin-top: 9px; }
+.merge-plans { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
+.merge-plans label { display: flex; align-items: center; gap: 8px; }
+.merge-plans .muted { flex-basis: 100%; }
+.purchase-periods { margin-top: 12px; }
+.purchase-periods summary { cursor: pointer; color: var(--muted); }
+.purchase-period { border-top: 1px solid var(--line); margin-top: 10px; padding-top: 10px; }
+.purchase-period .card-head { flex-wrap: wrap; gap: 8px; }
+.form-error { padding: 10px; color: var(--crit); }
 .segbar { height: 8px; border-radius: 4px; overflow: hidden; display: flex; background: var(--panel2); }
 .segbar > span { height: 100%; }
 .pleg { display: flex; flex-wrap: wrap; gap: 4px 12px; margin-top: 6px; }

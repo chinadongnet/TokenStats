@@ -67,6 +67,8 @@ contextBridge.exposeInMainWorld('api', {
 
   // subscription plans — monthly flat fees vs actual usage cost
   subsList: () => ipcRenderer.invoke('subs:list'),
+  subsMerge: (groupIds, targetId) => ipcRenderer.invoke('subs:merge', { groupIds, targetId }),
+  subsSeparate: (id) => ipcRenderer.invoke('subs:separate', id),
   subsSave: (sub) => ipcRenderer.invoke('subs:save', sub),
   subsDelete: (id) => ipcRenderer.invoke('subs:delete', id),
   subsStats: () => ipcRenderer.invoke('subs:stats'),

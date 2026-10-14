@@ -1,5 +1,19 @@
 # TokenStats
 
+## Multiple purchases of one subscription
+
+In Settings → Token Plans, select the subscriptions to combine, choose the name
+to retain, and click **Merge selected**. Names are never merged automatically.
+Use **Add purchase period** to record another purchase under that subscription;
+expand **Manage purchase periods** to edit dates, prices and sources, stop an
+ongoing period, or separate a purchase again.
+
+Reports and the subscription timeline show one combined subscription, with each
+purchase's original billing cycles retained. Fees add up per purchase; tokens and
+estimated usage cost count only within purchased periods. Unsubscribed gaps stay
+unplanned, and overlapping usage is attributed once. Different purchase prices
+and billing start dates remain independent.
+
 A Windows **system-tray** app that tracks token usage across your local AI coding
 tools — **Claude Code**, **Codex**, **Gemini**, **Antigravity**, and **Cursor** — plus
 any number of self-hosted **LiteLLM** proxies, and shows it at a glance.
