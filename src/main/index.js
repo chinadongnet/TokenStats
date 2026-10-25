@@ -135,9 +135,7 @@ async function init() {
 
   store = new Store()
   if (db) {
-    store.seedHistory('agy', db.hourlySince(0).filter((r) => r.cli === 'agy'), {
-      subtractLive: db.hasMigration('agy-desktop-conversations-v1'),
-    })
+    store.seedHistory('agy', db.agyHistory())
     const legacyRows = db.hourlySince(0).filter((r) => r.cli === 'cursor')
     const records = legacyRows.map((r) => ({ ...r, ts: r.hour, sessionId: 'cloud', project: 'cursor', dedupKey: `cursor-legacy:${r.hour}:${r.model}` }))
     store.files.set('bootstrap:cursor', { parser: cursor, records })

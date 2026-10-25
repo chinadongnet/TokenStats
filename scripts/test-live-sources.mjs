@@ -119,7 +119,7 @@ try {
     { hour: 1791680400000, cli: 'agy', model: 'Gemini live test', total: 300, input: 300, output: 0, cacheRead: 0, cacheCreate: 0, reasoning: 0 },
     { hour: 1791766800000, cli: 'agy', model: 'archived-cli-between-roots', total: 700, input: 700, output: 0, cacheRead: 0, cacheCreate: 0, reasoning: 0 },
     { hour: 1791856800000, cli: 'agy', model: 'overlap', total: 999 },
-  ], { subtractLive: false })
+  ])
   const desktopAgyFile = path.join(process.env.AIMON_AGY_DESKTOP_ROOT, 'desktop-session.db')
   const desktopDb = new DatabaseSync(desktopAgyFile)
   desktopDb.exec('CREATE TABLE gen_metadata (idx INTEGER PRIMARY KEY, data BLOB); CREATE TABLE steps (idx INTEGER PRIMARY KEY, step_type INTEGER, metadata BLOB);')
@@ -133,8 +133,11 @@ try {
   const agyTotalBeforeReingest = store.dedupedRecords().filter((r) => r.cli === 'agy').reduce((n, r) => n + r.total, 0)
   const reingestDb = await new UsageDb({ dbPath: path.join(root, 'agy-reingest.sqlite') }).open()
   reingestDb.ingest(store.dedupedRecords())
-  store.seedHistory('agy', reingestDb.hourlySince(0).filter((r) => r.cli === 'agy'))
-  assert.equal(store.dedupedRecords().filter((r) => r.cli === 'agy').reduce((n, r) => n + r.total, 0), agyTotalBeforeReingest, 're-seeding from usage_hourly must not double-count live desktop hours before the CLI cutoff')
+  store.seedHistory('agy', reingestDb.agyHistory())
+  assert.equal(store.dedupedRecords().filter((r) => r.cli === 'agy').reduce((n, r) => n + r.total, 0), agyTotalBeforeReingest, 're-seeding from per-root history must not double-count live desktop hours before the CLI cutoff')
+  await fsp.rm(desktopAgyFile, { force: true })
+  await store.ingestFile(desktopAgyFile)
+  assert.equal(store.dedupedRecords().filter((r) => r.cli === 'agy').reduce((n, r) => n + r.total, 0), agyTotalBeforeReingest, 'pruning all desktop conversations must preserve archived desktop usage')
   console.log(`Codex + AGY live fallback: ${Date.now() - started}ms (notifications disabled)`)
   await store.stop()
 
