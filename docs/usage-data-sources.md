@@ -40,7 +40,7 @@ disabled, API-model CSV rows, archive preservation, and rate-limit backoff.
 | Claude Code | local files | `~/.claude/projects/**/*.jsonl` per-message `usage`         | ✅ accurate  | ✅ live via `claude -p /usage` |
 | Codex       | local files | `~/.codex/sessions/**/rollout-*.jsonl` `token_count` events | ✅ accurate  | ✅ live from the logs (`rate_limits`) |
 | Gemini      | local files | `~/.gemini/tmp/**/chats/session-*.jsonl`                    | ✅ accurate  | ❌ CLI deprecated for individuals |
-| Antigravity | local files | `~/.gemini/antigravity-cli/conversations/<uuid>.db`         | ✅ accurate  | ✅ live via statusLine mirror hook (opt-in) |
+| Antigravity | local files | `~/.gemini/antigravity{-cli,}/conversations/<uuid>.db`      | ✅ accurate  | ✅ live via statusLine mirror hook (opt-in) |
 | Cursor      | **network** | cursor.com dashboard CSV export (real usage is server-only) | ✅ accurate  | ✅ live via `/api/usage-summary` |
 | LiteLLM     | **network** | your proxy's admin API                                      | ✅ actual $  | n/a |
 

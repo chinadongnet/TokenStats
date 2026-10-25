@@ -31,6 +31,24 @@ CREATE TABLE IF NOT EXISTS usage_hourly (
 );
 CREATE INDEX IF NOT EXISTS idx_usage_hour ON usage_hourly(hour);
 
+CREATE TABLE IF NOT EXISTS usage_root_hourly (
+  hour         INTEGER NOT NULL,
+  cli          TEXT    NOT NULL,
+  root         TEXT    NOT NULL,
+  model        TEXT    NOT NULL,
+  input        INTEGER NOT NULL DEFAULT 0,
+  output       INTEGER NOT NULL DEFAULT 0,
+  cache_read   INTEGER NOT NULL DEFAULT 0,
+  cache_create INTEGER NOT NULL DEFAULT 0,
+  reasoning    INTEGER NOT NULL DEFAULT 0,
+  total        INTEGER NOT NULL DEFAULT 0,
+  cost         REAL    NOT NULL DEFAULT 0,
+  turns        INTEGER NOT NULL DEFAULT 0,
+  parts_json   TEXT,
+  PRIMARY KEY (hour, cli, root, model)
+);
+CREATE INDEX IF NOT EXISTS idx_usage_root_cli ON usage_root_hourly(cli, hour);
+
 CREATE TABLE IF NOT EXISTS litellm_providers (
   id           TEXT    PRIMARY KEY,
   name         TEXT    NOT NULL,
@@ -126,6 +144,8 @@ function migrateSchema(db) {
   }
   const subs = columns('subscriptions')
   if (!subs.has('group_id')) db.run('ALTER TABLE subscriptions ADD COLUMN group_id TEXT')
+  const rootHourly = columns('usage_root_hourly')
+  if (!rootHourly.has('parts_json')) db.run('ALTER TABLE usage_root_hourly ADD COLUMN parts_json TEXT')
   if (!subs.has('reset_periods')) {
     db.run('ALTER TABLE subscriptions ADD COLUMN reset_periods TEXT')
     // Quota windows were briefly a single-select `reset_period` column before
@@ -181,8 +201,11 @@ export class UsageDb {
   // Rebuild the hourly table from the full record set, then persist to disk.
   ingest(records) {
     const buckets = new Map() // key: hour|cli|model
+    const rootBuckets = new Map() // key: hour|cli|root|model
     for (const r of records) {
       const hour = floorHourLocal(r.ts)
+      const cost = r.cost != null ? r.cost : costFor(r)
+      const turns = r.turns || 1
       const key = hour + '|' + r.cli + '|' + r.model
       let b = buckets.get(key)
       if (!b) {
@@ -195,8 +218,39 @@ export class UsageDb {
       b.cacheCreate += r.cacheCreate
       b.reasoning += r.reasoning
       b.total += r.total
-      b.cost += r.cost != null ? r.cost : costFor(r)
-      b.turns += r.turns || 1
+      b.cost += cost
+      b.turns += turns
+
+      if (r.root) {
+        const rKey = hour + '|' + r.cli + '|' + r.root + '|' + r.model
+        let rb = rootBuckets.get(rKey)
+        if (!rb) {
+          rb = { hour, cli: r.cli, root: r.root, model: r.model, input: 0, output: 0, cacheRead: 0, cacheCreate: 0, reasoning: 0, total: 0, cost: 0, turns: 0, parts: [] }
+          rootBuckets.set(rKey, rb)
+        }
+        rb.input += r.input
+        rb.output += r.output
+        rb.cacheRead += r.cacheRead
+        rb.cacheCreate += r.cacheCreate
+        rb.reasoning += r.reasoning
+        rb.total += r.total
+        rb.cost += cost
+        rb.turns += turns
+        if (Array.isArray(r.parts) && r.parts.length) {
+          rb.parts.push(...r.parts)
+        } else if (r.dedupKey) {
+          rb.parts.push({
+            dedupKey: r.dedupKey,
+            input: r.input,
+            output: r.output,
+            cacheRead: r.cacheRead,
+            cacheCreate: r.cacheCreate,
+            reasoning: r.reasoning,
+            total: r.total,
+            turns,
+          })
+        }
+      }
     }
 
     this.db.run('BEGIN')
@@ -208,6 +262,14 @@ export class UsageDb {
       stmt.run([b.hour, b.cli, b.model, b.input, b.output, b.cacheRead, b.cacheCreate, b.reasoning, b.total, b.cost, b.turns])
     }
     stmt.free()
+    this.db.run('DELETE FROM usage_root_hourly')
+    const rootStmt = this.db.prepare(
+      'INSERT INTO usage_root_hourly (hour,cli,root,model,input,output,cache_read,cache_create,reasoning,total,cost,turns,parts_json) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)'
+    )
+    for (const rb of rootBuckets.values()) {
+      rootStmt.run([rb.hour, rb.cli, rb.root, rb.model, rb.input, rb.output, rb.cacheRead, rb.cacheCreate, rb.reasoning, rb.total, rb.cost, rb.turns, rb.parts.length ? JSON.stringify(rb.parts) : null])
+    }
+    rootStmt.free()
     this.db.run('COMMIT')
     this.persist()
     return buckets.size
@@ -426,6 +488,44 @@ export class UsageDb {
     }))
   }
 
+  // Per-root hourly history for multi-root sources that prune old conversations
+  // independently (AGY CLI + AGY desktop). Falls back to unrooted usage_hourly
+  // rows on first upgrade before usage_root_hourly has been populated.
+  agyHistory() {
+    const rooted = this.rows(
+      `SELECT hour, cli, root, model, input, output, cache_read, cache_create, reasoning, total, cost, turns, parts_json
+       FROM usage_root_hourly
+       WHERE cli = 'agy'
+       ORDER BY hour ASC`
+    ).map((r) => {
+      let parts = null
+      if (r.parts_json) {
+        try {
+          parts = JSON.parse(r.parts_json)
+        } catch {
+          parts = null
+        }
+      }
+      return {
+        hour: r.hour,
+        cli: r.cli,
+        root: r.root,
+        model: r.model,
+        input: r.input,
+        output: r.output,
+        cacheRead: r.cache_read,
+        cacheCreate: r.cache_create,
+        reasoning: r.reasoning,
+        total: r.total,
+        cost: r.cost,
+        turns: r.turns,
+        ...(Array.isArray(parts) ? { parts } : {}),
+      }
+    })
+    if (rooted.length) return rooted
+    return this.hourlySince(0).filter((r) => r.cli === 'agy')
+  }
+
   listCursorUsage(userId, legacyRows = null) {
     const row = this.rows('SELECT records_json FROM cursor_usage_archive WHERE user_id = ?', [userId])[0]
     if (row) return JSON.parse(row.records_json)
@@ -444,8 +544,12 @@ export class UsageDb {
     this.persist()
   }
 
+  hasMigration(name) {
+    return this.rows('SELECT name FROM applied_migrations WHERE name = ?', [name]).length > 0
+  }
+
   markMigration(name) {
-    if (this.rows('SELECT name FROM applied_migrations WHERE name = ?', [name]).length) return false
+    if (this.hasMigration(name)) return false
     this.db.run('INSERT INTO applied_migrations (name) VALUES (?)', [name])
     this.persist()
     return true

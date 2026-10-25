@@ -39,11 +39,21 @@ const CURSOR_STORAGE_DIR =
       : path.join(home, '.config', 'Cursor', 'User', 'globalStorage')
 
 // Primary (local) data dirs for each CLI; overridable via env for testing.
+const AGY_CLI_ROOT = process.env.AIMON_AGY_ROOT || path.join(home, '.gemini', 'antigravity-cli', 'conversations')
+export const AGY_DESKTOP_ROOT =
+  process.env.AIMON_AGY_DESKTOP_ROOT || path.join(home, '.gemini', 'antigravity', 'conversations')
+const AGY_LOCAL_ROOTS =
+  process.env.AIMON_AGY_ROOT && !process.env.AIMON_AGY_DESKTOP_ROOT
+    ? [AGY_CLI_ROOT]
+    : process.env.AIMON_AGY_DESKTOP_ROOT && !process.env.AIMON_AGY_ROOT
+      ? [AGY_DESKTOP_ROOT]
+      : [AGY_CLI_ROOT, AGY_DESKTOP_ROOT]
+
 const PRIMARY = {
   claude: process.env.AIMON_CLAUDE_ROOT || path.join(home, '.claude', 'projects'),
   codex: process.env.AIMON_CODEX_ROOT || path.join(home, '.codex', 'sessions'),
   gemini: process.env.AIMON_GEMINI_ROOT || path.join(home, '.gemini', 'tmp'),
-  agy: process.env.AIMON_AGY_ROOT || path.join(home, '.gemini', 'antigravity-cli', 'conversations'),
+  agy: process.env.AIMON_AGY_ROOT || (fs.existsSync(AGY_CLI_ROOT) ? AGY_CLI_ROOT : AGY_DESKTOP_ROOT),
   cursor: process.env.AIMON_CURSOR_ROOT || CURSOR_STORAGE_DIR,
 }
 
@@ -130,7 +140,7 @@ export const CLI_ROOTS = {
   claude: [PRIMARY.claude, ...extra.claude],
   codex: [PRIMARY.codex, ...extra.codex],
   gemini: [PRIMARY.gemini, ...extra.gemini],
-  agy: [PRIMARY.agy, ...extra.agy],
+  agy: [...AGY_LOCAL_ROOTS, ...extra.agy],
   cursor: [PRIMARY.cursor, ...extra.cursor],
 }
 

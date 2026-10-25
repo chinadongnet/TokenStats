@@ -1,13 +1,14 @@
 import fs from 'node:fs'
 import path from 'node:path'
 import { createRequire } from 'node:module'
-import { CLI_ROOTS } from '../paths.js'
+import { AGY_DESKTOP_ROOT, CLI_ROOTS } from '../paths.js'
 import { readSqliteSnapshot, sqliteSignature } from '../sqliteSnapshot.js'
 
 const require = createRequire(import.meta.url)
 
-// Antigravity CLI (agy) stores each conversation as a SQLite database:
+// Antigravity CLI and desktop app store each conversation as a SQLite database:
 //   ~/.gemini/antigravity-cli/conversations/<uuid>.db
+//   ~/.gemini/antigravity/conversations/<uuid>.db
 // Inside, the `gen_metadata` table has one protobuf blob per model turn. The
 // blob layout (reverse-engineered, no published schema) that we rely on:
 //   field 1 (message) = generation info
@@ -134,6 +135,7 @@ function workspaceOf(db) {
 export const antigravity = {
   cli: 'agy',
   roots: CLI_ROOTS.agy,
+  desktopRoot: AGY_DESKTOP_ROOT,
   kind: 'path',
   sidecars: ['-wal', '-journal'],
   signature: sqliteSignature,

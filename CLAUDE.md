@@ -132,8 +132,8 @@ testable via `npm run test:parsers`.
   - Gemini ships **two** chat formats: current `chats/session-*.jsonl` (append-only,
     tailed like the others) and older `chats/session-*.json` (whole-file, re-parsed on
     change). Both are registered as separate parsers sharing the Gemini root.
-  - Antigravity (`agy`, Google's newer agentic CLI) logs conversations as **SQLite
-    databases** at `~/.gemini/antigravity-cli/conversations/<uuid>.db`. The parser
+  - Antigravity (`agy`, Google's newer agentic CLI and desktop app) logs conversations as **SQLite
+    databases** at `~/.gemini/antigravity-cli/conversations/<uuid>.db` and `~/.gemini/antigravity/conversations/<uuid>.db`. The parser
     opens each db with sql.js and decodes per-turn token usage from protobuf blobs
     in the `gen_metadata` table (field map documented in `parsers/antigravity.js` —
     reverse-engineered, so re-validate after Antigravity updates). Whole-file
