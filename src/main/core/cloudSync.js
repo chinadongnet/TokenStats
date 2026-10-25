@@ -2,13 +2,16 @@ import { CLI_META } from './paths.js'
 import { computeResetWindows, mergeLiveLimits, planRecordIndex } from './subscriptions.js'
 
 // Cloud sync: pushes the local hourly usage table plus a trimmed "popup state"
-// snapshot to a tokenstat-web instance (token.chinadong.net by default). Pure
-// Node — no electron imports — wired up by index.js, which supplies the db,
-// store and the same liveByCli object the popup's subs:resets handler uses.
+// snapshot and full subscription history to a tokenstat-web instance
+// (token.chinadong.net by default). Pure Node — no electron imports — wired up
+// by index.js, which supplies the db, store and the same liveByCli object the
+// popup's subs:resets handler uses.
 //
 // What leaves the machine (privacy contract, keep it this way):
 // - usage_hourly rows: (hour, cli, model, token component sums, cost, turns).
 //   NO project paths, NO session ids, NO prompt/response content, NO key aliases.
+// - subscriptions: all active & historical subscription plans (id, groupId, name,
+//   monthlyUsd, startDate, active, endDate, cli/model bindings without keyAlias).
 // - a status snapshot: CLI display names/colors, live quota windows (period
 //   label + remaining % + reset time), plan names/fees/renewal — i.e. exactly
 //   what the tray popup renders, nothing more.
@@ -64,6 +67,31 @@ export async function testCloudSync({ endpoint, apiKey }) {
   } catch (e) {
     return { ok: false, error: e.name === 'AbortError' ? 'timeout' : String(e.message || e) }
   }
+}
+
+// Sanitize all subscriptions (active & historical) for cloud sync — keyAlias is
+// stripped so local LiteLLM token key aliases never leave the machine.
+export function serializeSubscriptionsForCloud(subs) {
+  return (subs || []).map((s) => ({
+    id: s.id,
+    groupId: s.groupId || s.id,
+    name: s.name,
+    monthlyUsd: Number(s.monthlyUsd) || 0,
+    startDate: s.startDate,
+    active: s.active !== false,
+    endDate: s.active === false ? s.endDate || null : null,
+    bindings: (s.bindings || [])
+      .filter((b) => b && b.cli)
+      .map((b) => ({
+        cli: b.cli,
+        models: Array.isArray(b.models) && b.models.length ? b.models : null,
+      })),
+    clis: [...new Set((s.bindings || []).map((b) => b?.cli).filter(Boolean))],
+    resetPeriods: Array.isArray(s.resetPeriods) ? s.resetPeriods : [],
+    resetAnchors: s.resetAnchors && typeof s.resetAnchors === 'object' ? s.resetAnchors : {},
+    createdAt: s.createdAt || null,
+    updatedAt: s.updatedAt || null,
+  }))
 }
 
 // The trimmed popup-state snapshot. Mirrors what App.jsx actually draws:
@@ -127,7 +155,9 @@ export function buildStatusSnapshot({ db, store, liveByCli, appVersion }) {
     .filter((s) => s.active && Number(s.monthlyUsd) > 0)
     .map((s) => ({ name: s.name, monthlyUsd: Number(s.monthlyUsd) }))
 
-  return { generatedAt: now, appVersion, cliMeta, resets, plans }
+  const subscriptions = serializeSubscriptionsForCloud(subs)
+
+  return { generatedAt: now, appVersion, cliMeta, resets, plans, subscriptions }
 }
 
 function round2(n) {
@@ -136,7 +166,14 @@ function round2(n) {
 
 // One sync pass. Serialized by the caller (index.js keeps a single in-flight
 // promise); safe to call often — it no-ops unless enabled and configured.
-export async function performSync({ db, store, liveByCli, appVersion, fullOverride = false }) {
+export async function performSync({
+  db,
+  store,
+  liveByCli,
+  appVersion,
+  fullOverride = false,
+  resolveSubscriptionsStrategy = null,
+}) {
   const cfg = db.getCloudSync()
   if (!cfg.enabled || !cfg.apiKey || !cfg.endpoint) return { ok: false, skipped: true }
 
@@ -156,12 +193,14 @@ export async function performSync({ db, store, liveByCli, appVersion, fullOverri
     appVersion,
   }
   const status = buildStatusSnapshot({ db, store, liveByCli, appVersion })
+  const subscriptions = status.subscriptions
 
   try {
     // Batched: the first batch carries replaceFrom (clearing the window server-
-    // side), later ones are pure upserts. Status rides on the last batch so the
-    // web's "synced at" only flips once everything landed.
+    // side), later ones are pure upserts. Status & subscriptions ride on the
+    // last batch so the web's "synced at" only flips once everything landed.
     let sent = 0
+    let subscriptionSync = null
     for (let i = 0; i < Math.max(1, Math.ceil(rows.length / ROWS_PER_BATCH)); i++) {
       const batch = rows.slice(i * ROWS_PER_BATCH, (i + 1) * ROWS_PER_BATCH)
       const last = (i + 1) * ROWS_PER_BATCH >= rows.length
@@ -173,13 +212,43 @@ export async function performSync({ db, store, liveByCli, appVersion, fullOverri
           replaceFrom: i === 0 ? fromMs : null,
           hours: batch,
           status: last ? status : null,
+          ...(last
+            ? {
+                subscriptions,
+                baseSubscriptionsHash: cfg.subsBaseHash || null,
+                resolveSubscriptionsStrategy: resolveSubscriptionsStrategy || null,
+              }
+            : {}),
         },
       })
       sent += data.accepted || 0
+      if (last && data.subscriptionSync) subscriptionSync = data.subscriptionSync
+    }
+
+    let pulledSubscriptions = false
+    const syncPatch = {
+      lastSyncAt: now,
+      lastError: null,
     }
     const clearFull = cfg.fullResync && (db.fullResyncGen || 0) === genAtStart
-    db.updateCloudSyncState({ lastSyncAt: now, lastError: null, ...(clearFull ? { fullResync: false } : {}) })
-    return { ok: true, sent, full }
+    if (clearFull) syncPatch.fullResync = false
+
+    if (subscriptionSync) {
+      if (subscriptionSync.status === 'synced') {
+        syncPatch.subsBaseHash = subscriptionSync.cloudHash || null
+        syncPatch.subsConflict = null
+      } else if (subscriptionSync.status === 'pull' && Array.isArray(subscriptionSync.cloudSubs)) {
+        db.replaceAllSubscriptions(subscriptionSync.cloudSubs)
+        syncPatch.subsBaseHash = subscriptionSync.cloudHash || null
+        syncPatch.subsConflict = null
+        pulledSubscriptions = true
+      } else if (subscriptionSync.status === 'conflict') {
+        syncPatch.subsConflict = subscriptionSync
+      }
+    }
+
+    db.updateCloudSyncState(syncPatch)
+    return { ok: true, sent, full, subscriptionSync, pulledSubscriptions }
   } catch (e) {
     const msg = e.name === 'AbortError' ? 'timeout' : String(e.message || e)
     db.updateCloudSyncState({ lastError: msg }) // flag untouched — a failed full pass retries full

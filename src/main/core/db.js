@@ -114,7 +114,9 @@ CREATE TABLE IF NOT EXISTS cloud_sync (
   sync_minutes INTEGER NOT NULL DEFAULT 10,
   full_resync  INTEGER NOT NULL DEFAULT 1,  -- next sync pushes ALL hours (set on config change)
   last_sync_at INTEGER,
-  last_error   TEXT
+  last_error   TEXT,
+  subs_base_hash TEXT,
+  subs_conflict_json TEXT
 );
 
 CREATE TABLE IF NOT EXISTS subscriptions (
@@ -144,6 +146,9 @@ function migrateSchema(db) {
   }
   const subs = columns('subscriptions')
   if (!subs.has('group_id')) db.run('ALTER TABLE subscriptions ADD COLUMN group_id TEXT')
+  const cloudCols = columns('cloud_sync')
+  if (!cloudCols.has('subs_base_hash')) db.run('ALTER TABLE cloud_sync ADD COLUMN subs_base_hash TEXT')
+  if (!cloudCols.has('subs_conflict_json')) db.run('ALTER TABLE cloud_sync ADD COLUMN subs_conflict_json TEXT')
   const rootHourly = columns('usage_root_hourly')
   if (!rootHourly.has('parts_json')) db.run('ALTER TABLE usage_root_hourly ADD COLUMN parts_json TEXT')
   if (!subs.has('reset_periods')) {
@@ -420,6 +425,14 @@ export class UsageDb {
       this.db.run('INSERT INTO cloud_sync (id) VALUES (1)')
       r = this.rows('SELECT * FROM cloud_sync WHERE id = 1')[0]
     }
+    let subsConflict = null
+    if (r.subs_conflict_json) {
+      try {
+        subsConflict = JSON.parse(r.subs_conflict_json)
+      } catch {
+        subsConflict = null
+      }
+    }
     return {
       endpoint: r.endpoint || '',
       apiKey: r.api_key || '',
@@ -428,6 +441,8 @@ export class UsageDb {
       fullResync: !!r.full_resync,
       lastSyncAt: r.last_sync_at ?? null,
       lastError: r.last_error || null,
+      subsBaseHash: r.subs_base_hash || null,
+      subsConflict,
     }
   }
 
@@ -453,13 +468,15 @@ export class UsageDb {
   // The flag itself stays SET on disk for the whole pass, so a crash between
   // batches (the first of which already wiped the server with replaceFrom: 0)
   // resumes as a full push on restart.
-  updateCloudSyncState({ lastSyncAt, lastError, fullResync } = {}) {
+  updateCloudSyncState({ lastSyncAt, lastError, fullResync, subsBaseHash, subsConflict } = {}) {
     this.getCloudSync() // ensure row
     const sets = []
     const args = []
     if (lastSyncAt !== undefined) { sets.push('last_sync_at=?'); args.push(lastSyncAt) }
     if (lastError !== undefined) { sets.push('last_error=?'); args.push(lastError) }
     if (fullResync !== undefined) { sets.push('full_resync=?'); args.push(fullResync ? 1 : 0) }
+    if (subsBaseHash !== undefined) { sets.push('subs_base_hash=?'); args.push(subsBaseHash || null) }
+    if (subsConflict !== undefined) { sets.push('subs_conflict_json=?'); args.push(subsConflict ? JSON.stringify(subsConflict) : null) }
     if (fullResync) this.fullResyncGen = (this.fullResyncGen || 0) + 1
     if (!sets.length) return
     this.db.run(`UPDATE cloud_sync SET ${sets.join(', ')} WHERE id=1`, args)
@@ -622,6 +639,82 @@ export class UsageDb {
   deleteSubscription(id) {
     this.db.run('DELETE FROM subscriptions WHERE id = ?', [id])
     this.persist()
+  }
+
+  // Replace local subscriptions with a canonical list pulled from cloud sync
+  // (e.g. on 'use_cloud' or 'merge' conflict resolution), preserving any
+  // local-only keyAlias on matching CLI bindings so local LiteLLM key filters
+  // aren't lost across round-trips.
+  replaceAllSubscriptions(cloudSubs) {
+    if (!Array.isArray(cloudSubs)) return this.listSubscriptions()
+    const existing = this.listSubscriptions()
+    const prevById = new Map(existing.map((s) => [s.id, s]))
+    const prevByKey = new Map(existing.map((s) => [`${String(s.name || '').toLowerCase()}|${s.startDate}`, s]))
+    const now = Date.now()
+
+    this.db.run('BEGIN')
+    try {
+      this.db.run('DELETE FROM subscriptions')
+      for (const cs of cloudSubs) {
+        if (!cs || !cs.name || !cs.startDate) continue
+        const prev = prevById.get(cs.id) || prevByKey.get(`${String(cs.name || '').toLowerCase()}|${cs.startDate}`) || null
+        const prevAliasByCli = new Map(
+          (prev?.bindings || [])
+            .filter((b) => b && b.cli && b.keyAlias)
+            .map((b) => [b.cli, b.keyAlias])
+        )
+        const rawBindings = Array.isArray(cs.bindings) && cs.bindings.length
+          ? cs.bindings
+          : Array.isArray(cs.clis)
+            ? cs.clis.map((cli) => ({ cli }))
+            : []
+        const bindings = rawBindings
+          .filter((b) => b && b.cli)
+          .map((b) => ({
+            cli: b.cli,
+            keyAlias: b.keyAlias || prevAliasByCli.get(b.cli) || null,
+            models: Array.isArray(b.models) && b.models.length ? b.models : null,
+          }))
+        const periods = RESET_PERIODS.filter((p) =>
+          (Array.isArray(cs.resetPeriods) ? cs.resetPeriods : prev?.resetPeriods || []).includes(p)
+        )
+        const srcAnchors = cs.resetAnchors && Object.keys(cs.resetAnchors).length ? cs.resetAnchors : prev?.resetAnchors || {}
+        const anchors = {}
+        for (const p of periods) {
+          const v = srcAnchors && srcAnchors[p]
+          if (ANCHORED_PERIODS.includes(p) && typeof v === 'string' && v) anchors[p] = v
+        }
+        const id = cs.id || prev?.id || crypto.randomUUID()
+        const groupId = cs.groupId || prev?.groupId || id
+        const active = cs.active !== false ? 1 : 0
+        const endDate = active ? null : cs.endDate || prev?.endDate || new Date().toISOString().slice(0, 10)
+        const createdAt = Number(cs.createdAt) || prev?.createdAt || now
+        const updatedAt = Number(cs.updatedAt) || now
+        this.db.run(
+          'INSERT INTO subscriptions (id,group_id,name,monthly_usd,start_date,active,end_date,bindings,reset_periods,reset_anchors,created_at,updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)',
+          [
+            id,
+            groupId,
+            String(cs.name).trim(),
+            Number(cs.monthlyUsd) || 0,
+            cs.startDate,
+            active,
+            endDate,
+            JSON.stringify(bindings),
+            periods.length ? JSON.stringify(periods) : null,
+            Object.keys(anchors).length ? JSON.stringify(anchors) : null,
+            createdAt,
+            updatedAt,
+          ]
+        )
+      }
+      this.db.run('COMMIT')
+    } catch (err) {
+      this.db.run('ROLLBACK')
+      throw err
+    }
+    this.persist()
+    return this.listSubscriptions()
   }
 
   mergeSubscriptions(groupIds, targetId) {

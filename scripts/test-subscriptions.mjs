@@ -102,6 +102,29 @@ try {
   const reopened = await new UsageDb({ dbPath: file }).open()
   assert.equal(reopened.getSubscription(c.id).groupId, a.groupId)
   assert.equal(reopened.getSubscription(a.id).groupId, db.getSubscription(a.id).groupId)
+
+  const { serializeSubscriptionsForCloud } = await import('../src/main/core/cloudSync.js')
+  const withAlias = reopened.upsertSubscription({
+    name: 'Mimo Plan',
+    monthlyUsd: 30,
+    startDate: '2026-03-01',
+    active: true,
+    bindings: [{ cli: 'litellm:p1', keyAlias: 'secret-key-alias', models: ['gpt-4o'] }],
+    resetPeriods: ['monthly'],
+    resetAnchors: { monthly: '2026-03-01' },
+  })
+  const cloudPayload = serializeSubscriptionsForCloud(reopened.listSubscriptions())
+  const mimoCloud = cloudPayload.find((s) => s.id === withAlias.id)
+  assert.equal(mimoCloud.bindings[0].keyAlias, undefined, 'keyAlias must never leave the device')
+  reopened.replaceAllSubscriptions(cloudPayload.map((s) => (s.id === withAlias.id ? { ...s, monthlyUsd: 45 } : s)))
+  const afterPull = reopened.getSubscription(withAlias.id)
+  assert.equal(afterPull.monthlyUsd, 45)
+  assert.equal(afterPull.bindings[0].keyAlias, 'secret-key-alias', 'replaceAllSubscriptions preserves local keyAlias')
+  reopened.updateCloudSyncState({ subsBaseHash: 'abc12345', subsConflict: { status: 'conflict', cloudHash: 'abc' } })
+  assert.equal(reopened.getCloudSync().subsBaseHash, 'abc12345')
+  assert.equal(reopened.getCloudSync().subsConflict.status, 'conflict')
+  reopened.updateCloudSyncState({ subsConflict: null })
+  assert.equal(reopened.getCloudSync().subsConflict, null)
 } finally {
   await fsp.rm(folder, { recursive: true, force: true })
 }

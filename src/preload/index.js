@@ -84,4 +84,5 @@ contextBridge.exposeInMainWorld('api', {
   cloudSyncSave: (cfg) => ipcRenderer.invoke('cloudsync:save', cfg),
   cloudSyncTest: (conn) => ipcRenderer.invoke('cloudsync:test', conn),
   cloudSyncNow: (opts) => ipcRenderer.invoke('cloudsync:sync-now', opts),
+  cloudSyncResolveConflict: (strategy) => ipcRenderer.invoke('cloudsync:resolve-conflict', strategy),
 })

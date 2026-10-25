@@ -287,6 +287,7 @@ async function init() {
     const saved = db.upsertSubscription(payload)
     notifyReportUpdated()
     broadcastSnapshot()
+    scheduleCloudSync()
     return saved
   })
   ipcMain.handle('subs:delete', (_e, id) => {
@@ -294,12 +295,14 @@ async function init() {
     db.deleteSubscription(id)
     notifyReportUpdated()
     broadcastSnapshot()
+    scheduleCloudSync()
   })
   ipcMain.handle('subs:merge', (_e, { groupIds, targetId }) => {
     if (!db) return []
     const result = db.mergeSubscriptions(groupIds, targetId)
     notifyReportUpdated()
     broadcastSnapshot()
+    scheduleCloudSync()
     return result
   })
   ipcMain.handle('subs:separate', (_e, id) => {
@@ -307,6 +310,7 @@ async function init() {
     const result = db.separateSubscription(id)
     notifyReportUpdated()
     broadcastSnapshot()
+    scheduleCloudSync()
     return result
   })
   ipcMain.handle('subs:stats', () =>
@@ -351,6 +355,10 @@ async function init() {
   )
   ipcMain.handle('cloudsync:sync-now', async (_e, opts) => {
     const res = await runCloudSync({ fullOverride: !!opts?.full })
+    return { ...res, state: db ? db.getCloudSync() : null }
+  })
+  ipcMain.handle('cloudsync:resolve-conflict', async (_e, strategy) => {
+    const res = await runCloudSync({ resolveSubscriptionsStrategy: strategy })
     return { ...res, state: db ? db.getCloudSync() : null }
   })
   ipcMain.handle('subs:timeline', (_e, fromMs, toMs) =>
@@ -439,6 +447,7 @@ function buildLiveByCli() {
 let cloudSyncInFlight = null
 let cloudSyncQueued = null
 let cloudSyncQueuedFull = false
+let cloudSyncQueuedResolve = null
 let cloudSyncLastAttempt = 0
 let cloudSyncRetryAt = 0
 let cloudSyncTimer = null
@@ -461,14 +470,17 @@ function runCloudSync(opts = {}) {
     // { fullOverride: true } must upgrade it, not silently ride an
     // incremental one.
     cloudSyncQueuedFull = cloudSyncQueuedFull || !!opts.fullOverride
+    if (opts.resolveSubscriptionsStrategy) cloudSyncQueuedResolve = opts.resolveSubscriptionsStrategy
     if (!cloudSyncQueued) {
       cloudSyncQueued = cloudSyncInFlight
         .catch(() => {})
         .then(() => {
           const full = cloudSyncQueuedFull
+          const resolveStrategy = cloudSyncQueuedResolve
           cloudSyncQueued = null
           cloudSyncQueuedFull = false
-          return runCloudSync({ fullOverride: full })
+          cloudSyncQueuedResolve = null
+          return runCloudSync({ fullOverride: full, resolveSubscriptionsStrategy: resolveStrategy })
         })
     }
     return cloudSyncQueued
@@ -480,10 +492,15 @@ function runCloudSync(opts = {}) {
     liveByCli: buildLiveByCli(),
     appVersion: __APP_VERSION__,
     fullOverride: !!opts.fullOverride,
+    resolveSubscriptionsStrategy: opts.resolveSubscriptionsStrategy || null,
   })
     .catch((e) => ({ ok: false, error: String(e) }))
     .then((result) => {
       cloudSyncRetryAt = result.error ? Date.now() + 30000 : 0
+      notifyReportUpdated()
+      if (result.pulledSubscriptions || result.subscriptionSync) {
+        broadcastSnapshot()
+      }
       return result
     })
     .finally(() => { cloudSyncInFlight = null })

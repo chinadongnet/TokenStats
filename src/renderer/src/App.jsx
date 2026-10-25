@@ -289,6 +289,8 @@ export default function App() {
   const [copied, setCopied] = useState(false)
   const [resets, setResets] = useState([])
   const [subs, setSubs] = useState([]) // for the monthly subscription total
+  const [cloudConflict, setCloudConflict] = useState(null)
+  const [resolvingConflict, setResolvingConflict] = useState(false)
   const [now, setNow] = useState(() => Date.now())
 
   useEffect(() => {
@@ -298,15 +300,32 @@ export default function App() {
     // hidden.
     const loadResets = () => window.api.subsResets().then(setResets)
     const loadSubs = () => window.api.subsList().then((r) => setSubs(r || []))
+    const loadCloud = () => window.api.cloudSyncGet().then((c) => setCloudConflict(c?.subsConflict || null))
     window.api.getSnapshot().then(setSnap)
     loadResets()
     loadSubs()
+    loadCloud()
     return window.api.onSnapshot((s) => {
       setSnap(s)
       loadResets()
       loadSubs()
+      loadCloud()
     })
   }, [])
+
+  async function resolveConflictQuick(strategy) {
+    setResolvingConflict(true)
+    try {
+      const res = await window.api.cloudSyncResolveConflict(strategy)
+      setCloudConflict(res?.state?.subsConflict || null)
+      const nextSubs = await window.api.subsList()
+      setSubs(nextSubs || [])
+      const nextResets = await window.api.subsResets()
+      setResets(nextResets || [])
+    } finally {
+      setResolvingConflict(false)
+    }
+  }
 
   // Keeps the countdown moving between snapshots. Remaining time is derived
   // locally from each window's `end`, so a window expiring while idle flips to
@@ -399,6 +418,61 @@ export default function App() {
       </header>
 
       <div className="scroll">
+        {cloudConflict && (
+          <div
+            style={{
+              margin: '6px 10px 2px',
+              padding: '7px 9px',
+              borderRadius: 7,
+              border: '1px solid rgba(245, 158, 11, 0.55)',
+              background: 'rgba(245, 158, 11, 0.1)',
+              fontSize: 11.5,
+              display: 'flex',
+              alignItems: 'center',
+              justifyContent: 'space-between',
+              gap: 6,
+              flexWrap: 'wrap',
+            }}
+          >
+            <span
+              style={{ color: '#fbbf24', fontWeight: 600, cursor: 'pointer' }}
+              onClick={() => window.api.openSettings()}
+            >
+              ⚠️ {t('app.conflictBanner', {
+                n:
+                  (cloudConflict.diff?.onlyInCloud?.length || 0) +
+                  (cloudConflict.diff?.onlyInLocal?.length || 0) +
+                  (cloudConflict.diff?.modified?.length || 0),
+              })}
+            </span>
+            <span style={{ display: 'inline-flex', gap: 4 }}>
+              <button
+                className="ghost"
+                style={{ padding: '2px 6px', fontSize: 11, border: '1px solid rgba(251,191,36,0.5)', borderRadius: 4 }}
+                disabled={resolvingConflict}
+                onClick={() => resolveConflictQuick('merge')}
+              >
+                {t('app.conflictMerge')}
+              </button>
+              <button
+                className="ghost"
+                style={{ padding: '2px 6px', fontSize: 11, border: '1px solid rgba(255,255,255,0.2)', borderRadius: 4 }}
+                disabled={resolvingConflict}
+                onClick={() => resolveConflictQuick('use_local')}
+              >
+                {t('app.conflictLocal')}
+              </button>
+              <button
+                className="ghost"
+                style={{ padding: '2px 6px', fontSize: 11, border: '1px solid rgba(255,255,255,0.2)', borderRadius: 4 }}
+                disabled={resolvingConflict}
+                onClick={() => resolveConflictQuick('use_cloud')}
+              >
+                {t('app.conflictCloud')}
+              </button>
+            </span>
+          </div>
+        )}
         <div className="sum">
           <b>{compact(totalTok)}</b>
           <span className="u">{t('common.tokens')}</span>
