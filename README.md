@@ -53,7 +53,7 @@ System tray:  [▮ AI] ◄ click
   / since Monday / since the 1st) so they line up with the cycles a subscription's
   quota actually resets on. The icon recolors to the most recently active CLI.
 - ⚡ **Live** — watches `~/.claude`, `~/.codex`, `~/.gemini`,
-  `~/.gemini/antigravity-cli` and updates within a second of each turn (file watching,
+  `~/.gemini/antigravity`, `~/.gemini/antigravity-cli` and updates within a second of each turn (file watching,
   debounced); network-backed sources are polled on their own schedules.
 - 💳 **Live quota windows** — remaining quota + reset countdown per window
   (5h / weekly / monthly). See [Live quota windows](#live-quota-windows).
@@ -82,7 +82,7 @@ System tray:  [▮ AI] ◄ click
 | Claude Code | `~/.claude/projects/<cwd>/<session>.jsonl`            | per-message `usage` (input/output/cache) | watched |
 | Codex       | `~/.codex/sessions/YYYY/MM/DD/rollout-*.jsonl`        | per-turn delta of the cumulative `total_token_usage` | watched |
 | Gemini      | `~/.gemini/tmp/<project>/chats/session-*.jsonl` (and older `.json`) | per-message `tokens` | watched |
-| Antigravity | `~/.gemini/antigravity-cli/conversations/<uuid>.db` (SQLite) | per-turn usage decoded from a protobuf blob | watched |
+| Antigravity | `~/.gemini/antigravity/conversations/<uuid>.db` and `~/.gemini/antigravity-cli/conversations/<uuid>.db` (SQLite) | per-turn usage decoded from a protobuf blob | watched |
 | Cursor      | `%APPDATA%/Cursor/User/globalStorage/state.vscdb` for the **session token**, then cursor.com's usage export for the numbers | per-request token counts (the local db's own `tokenCount` fields are all zeros) | local read + fetch, ≤ 1× / 15 min |
 | LiteLLM     | your proxy's admin API — **not** local files          | real spend + per-model tokens and request counts | polled, per-provider interval |
 

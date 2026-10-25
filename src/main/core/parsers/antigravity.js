@@ -6,8 +6,9 @@ import { readSqliteSnapshot, sqliteSignature } from '../sqliteSnapshot.js'
 
 const require = createRequire(import.meta.url)
 
-// Antigravity CLI (agy) stores each conversation as a SQLite database:
+// Antigravity CLI and desktop app store each conversation as a SQLite database:
 //   ~/.gemini/antigravity-cli/conversations/<uuid>.db
+//   ~/.gemini/antigravity/conversations/<uuid>.db
 // Inside, the `gen_metadata` table has one protobuf blob per model turn. The
 // blob layout (reverse-engineered, no published schema) that we rely on:
 //   field 1 (message) = generation info

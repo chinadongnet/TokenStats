@@ -6,6 +6,7 @@ import { DatabaseSync } from 'node:sqlite'
 
 const root = await fsp.mkdtemp(path.join(os.tmpdir(), 'tokenstats-live-'))
 for (const cli of ['CLAUDE', 'CODEX', 'GEMINI', 'AGY', 'CURSOR']) process.env[`AIMON_${cli}_ROOT`] = path.join(root, cli)
+process.env.AIMON_AGY_DESKTOP_ROOT = path.join(root, 'AGY_DESKTOP')
 process.env.AIMON_CONFIG = path.join(root, 'config.json')
 await fsp.writeFile(process.env.AIMON_CONFIG, '{}')
 const { Store, SWEEP_MS } = await import('../src/main/core/store.js')
@@ -35,6 +36,7 @@ const usage = (tokens, legacyTimestamp = true) => field(1, Buffer.concat([
 try {
   await fsp.mkdir(process.env.AIMON_CODEX_ROOT)
   await fsp.mkdir(process.env.AIMON_AGY_ROOT)
+  await fsp.mkdir(process.env.AIMON_AGY_DESKTOP_ROOT)
   const file = path.join(process.env.AIMON_CODEX_ROOT, 'rollout-test.jsonl')
   const event = (total) => JSON.stringify({ timestamp: new Date().toISOString(), type: 'event_msg', payload: {
     type: 'token_count', info: { total_token_usage: { input_tokens: total - 10, output_tokens: 10, total_tokens: total } },
@@ -112,6 +114,13 @@ try {
   await fsp.writeFile(duplicate, await readSqliteSnapshot(agyFile))
   await store.ingestFile(duplicate)
   assert.equal(store.dedupedRecords().filter((r) => r.cli === 'agy' && r.sessionId !== 'archived').length, 3, 'copied/resumed generations must be deduplicated by response ID')
+  const desktopAgyFile = path.join(process.env.AIMON_AGY_DESKTOP_ROOT, 'desktop-session.db')
+  const desktopDb = new DatabaseSync(desktopAgyFile)
+  desktopDb.exec('CREATE TABLE gen_metadata (idx INTEGER PRIMARY KEY, data BLOB); CREATE TABLE steps (idx INTEGER PRIMARY KEY, step_type INTEGER, metadata BLOB);')
+  desktopDb.prepare('INSERT INTO gen_metadata VALUES (?, ?)').run(0, usage(400))
+  desktopDb.close()
+  await store.scanAllLocal()
+  assert.equal(store.dedupedRecords().filter((r) => r.cli === 'agy' && r.sessionId !== 'archived').length, 4, 'desktop AGY conversations root must be scanned alongside CLI root')
   console.log(`Codex + AGY live fallback: ${Date.now() - started}ms (notifications disabled)`)
   await store.stop()
 

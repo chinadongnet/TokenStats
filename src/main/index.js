@@ -397,8 +397,13 @@ async function init() {
   refreshLitellmPollers() // populate store.pollers before the initial scan/poll
   await store.start()
   ingestNow() // first full ingest after the initial scan
-  if (db?.markMigration('agy-output-cost-and-response-id-v1')) {
-    // Corrected historical AGY costs lie outside the normal 7-day sync window.
+  const migratedAgy = [
+    db?.markMigration('agy-output-cost-and-response-id-v1'),
+    db?.markMigration('agy-desktop-conversations-v1'),
+  ].some(Boolean)
+  if (migratedAgy) {
+    // Corrected historical AGY costs or newly indexed desktop AGY conversations
+    // can lie outside the normal 7-day sync window.
     db.updateCloudSyncState({ fullResync: true })
   }
   startCloudSyncTimer() // pushes to tokenstat-web when enabled (Settings → 云同步)
