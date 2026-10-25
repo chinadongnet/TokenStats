@@ -444,8 +444,12 @@ export class UsageDb {
     this.persist()
   }
 
+  hasMigration(name) {
+    return this.rows('SELECT name FROM applied_migrations WHERE name = ?', [name]).length > 0
+  }
+
   markMigration(name) {
-    if (this.rows('SELECT name FROM applied_migrations WHERE name = ?', [name]).length) return false
+    if (this.hasMigration(name)) return false
     this.db.run('INSERT INTO applied_migrations (name) VALUES (?)', [name])
     this.persist()
     return true

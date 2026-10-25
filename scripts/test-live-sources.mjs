@@ -114,13 +114,27 @@ try {
   await fsp.writeFile(duplicate, await readSqliteSnapshot(agyFile))
   await store.ingestFile(duplicate)
   assert.equal(store.dedupedRecords().filter((r) => r.cli === 'agy' && r.sessionId !== 'archived').length, 3, 'copied/resumed generations must be deduplicated by response ID')
+  store.seedHistory('agy', [
+    { hour: 1700000000000, cli: 'agy', model: 'archived', total: 500, input: 500, output: 0, cacheRead: 0, cacheCreate: 0, reasoning: 0 },
+    { hour: 1791680400000, cli: 'agy', model: 'Gemini live test', total: 300, input: 300, output: 0, cacheRead: 0, cacheCreate: 0, reasoning: 0 },
+    { hour: 1791766800000, cli: 'agy', model: 'archived-cli-between-roots', total: 700, input: 700, output: 0, cacheRead: 0, cacheCreate: 0, reasoning: 0 },
+    { hour: 1791856800000, cli: 'agy', model: 'overlap', total: 999 },
+  ], { subtractLive: false })
   const desktopAgyFile = path.join(process.env.AIMON_AGY_DESKTOP_ROOT, 'desktop-session.db')
   const desktopDb = new DatabaseSync(desktopAgyFile)
   desktopDb.exec('CREATE TABLE gen_metadata (idx INTEGER PRIMARY KEY, data BLOB); CREATE TABLE steps (idx INTEGER PRIMARY KEY, step_type INTEGER, metadata BLOB);')
-  desktopDb.prepare('INSERT INTO gen_metadata VALUES (?, ?)').run(0, usage(400))
+  desktopDb.prepare('INSERT INTO steps VALUES (?, 15, ?)').run(0, Buffer.concat([field(8, field(1, 1791680400)), field(9, field(11, Buffer.from('response-400')))]))
+  desktopDb.prepare('INSERT INTO gen_metadata VALUES (?, ?)').run(0, usage(400, false))
   desktopDb.close()
   await store.scanAllLocal()
   assert.equal(store.dedupedRecords().filter((r) => r.cli === 'agy' && r.sessionId !== 'archived').length, 4, 'desktop AGY conversations root must be scanned alongside CLI root')
+  assert.equal(store.dedupedRecords().filter((r) => r.model === 'archived-cli-between-roots').length, 1, 'older desktop records must not erase archived CLI hours before the CLI root cutoff')
+  assert.equal(store.dedupedRecords().filter((r) => r.model === 'overlap').length, 0, 'hours after all active AGY roots have on-disk history remain authoritative')
+  const agyTotalBeforeReingest = store.dedupedRecords().filter((r) => r.cli === 'agy').reduce((n, r) => n + r.total, 0)
+  const reingestDb = await new UsageDb({ dbPath: path.join(root, 'agy-reingest.sqlite') }).open()
+  reingestDb.ingest(store.dedupedRecords())
+  store.seedHistory('agy', reingestDb.hourlySince(0).filter((r) => r.cli === 'agy'))
+  assert.equal(store.dedupedRecords().filter((r) => r.cli === 'agy').reduce((n, r) => n + r.total, 0), agyTotalBeforeReingest, 're-seeding from usage_hourly must not double-count live desktop hours before the CLI cutoff')
   console.log(`Codex + AGY live fallback: ${Date.now() - started}ms (notifications disabled)`)
   await store.stop()
 
