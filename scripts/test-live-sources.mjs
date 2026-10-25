@@ -135,6 +135,16 @@ try {
   reingestDb.ingest(store.dedupedRecords())
   store.seedHistory('agy', reingestDb.agyHistory())
   assert.equal(store.dedupedRecords().filter((r) => r.cli === 'agy').reduce((n, r) => n + r.total, 0), agyTotalBeforeReingest, 're-seeding from per-root history must not double-count live desktop hours before the CLI cutoff')
+  const sharedDesktopCopy = path.join(process.env.AIMON_AGY_DESKTOP_ROOT, 'shared-session.db')
+  await fsp.writeFile(sharedDesktopCopy, await readSqliteSnapshot(agyFile))
+  await store.ingestFile(sharedDesktopCopy)
+  store.seedHistory('agy', [
+    { hour: 1791853200000, cli: 'agy', root: process.env.AIMON_AGY_DESKTOP_ROOT, model: 'Gemini live test', total: 230, input: 200, output: 10, cacheRead: 20, cacheCreate: 0, reasoning: 8 },
+  ])
+  assert.equal(store.dedupedRecords().filter((r) => r.cli === 'agy' && r.sessionId === 'archived').length, 0, 'root cutoffs must be computed before response-ID deduplication hides a root')
+  store.seedHistory('agy', reingestDb.agyHistory())
+  await fsp.rm(sharedDesktopCopy, { force: true })
+  await store.ingestFile(sharedDesktopCopy)
   await fsp.rm(desktopAgyFile, { force: true })
   await store.ingestFile(desktopAgyFile)
   assert.equal(store.dedupedRecords().filter((r) => r.cli === 'agy').reduce((n, r) => n + r.total, 0), agyTotalBeforeReingest, 'pruning all desktop conversations must preserve archived desktop usage')

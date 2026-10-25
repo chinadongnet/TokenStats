@@ -40,7 +40,7 @@ const CURSOR_STORAGE_DIR =
 
 // Primary (local) data dirs for each CLI; overridable via env for testing.
 const AGY_CLI_ROOT = process.env.AIMON_AGY_ROOT || path.join(home, '.gemini', 'antigravity-cli', 'conversations')
-const AGY_DESKTOP_ROOT =
+export const AGY_DESKTOP_ROOT =
   process.env.AIMON_AGY_DESKTOP_ROOT || path.join(home, '.gemini', 'antigravity', 'conversations')
 const AGY_LOCAL_ROOTS =
   process.env.AIMON_AGY_ROOT && !process.env.AIMON_AGY_DESKTOP_ROOT

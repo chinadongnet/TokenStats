@@ -269,20 +269,19 @@ export class Store extends EventEmitter {
   // dedupedRecords() for anything that aggregates token counts.
   allRecords() {
     const out = []
+    const rootEarliest = new Map()
     for (const [file, entry] of this.files.entries()) {
       const root = findRoot(file, entry.parser?.roots)
       const normRoot = root ? norm(root) : null
       for (const r of entry.records) {
-        out.push(normRoot && !r.root ? { ...r, root: normRoot } : r)
+        const rec = normRoot && !r.root ? { ...r, root: normRoot } : r
+        out.push(rec)
+        const rk = rec.root ? norm(rec.root) : null
+        if (!rk) continue
+        const key = `${rec.cli}|${rk}`
+        const prev = rootEarliest.get(key)
+        if (prev === undefined || rec.ts < prev) rootEarliest.set(key, rec.ts)
       }
-    }
-    const rootEarliest = new Map()
-    for (const rec of dedupe(out)) {
-      const rk = rec.root ? norm(rec.root) : null
-      if (!rk) continue
-      const key = `${rec.cli}|${rk}`
-      const prev = rootEarliest.get(key)
-      if (prev === undefined || rec.ts < prev) rootEarliest.set(key, rec.ts)
     }
     for (const [cli, rows] of this.history) {
       let parser = null
@@ -292,30 +291,58 @@ export class Store extends EventEmitter {
           break
         }
       }
-      const primaryRoot = (parser || PARSERS.find((p) => p.cli === cli))?.roots?.[0]
+      parser = parser || PARSERS.find((p) => p.cli === cli)
+      const primaryRoot = parser?.roots?.[0]
       const defaultRoot = primaryRoot ? norm(primaryRoot) : null
+      const desktopRoot = parser?.desktopRoot ? norm(parser.desktopRoot) : null
       let hasAnyRootCutoff = false
-      for (const key of rootEarliest.keys()) {
-        if (key.startsWith(cli + '|')) {
-          hasAnyRootCutoff = true
-          break
+      let legacyMaxCutoff = -Infinity
+      for (const [key, earliest] of rootEarliest) {
+        if (!key.startsWith(cli + '|')) continue
+        hasAnyRootCutoff = true
+        const rk = key.slice(cli.length + 1)
+        if (rk !== desktopRoot) {
+          const c = hourStartLocal(earliest)
+          if (c > legacyMaxCutoff) legacyMaxCutoff = c
         }
       }
-      let fallbackCutoff = Infinity
+      if (defaultRoot && !rootEarliest.has(`${cli}|${defaultRoot}`)) {
+        legacyMaxCutoff = Infinity
+      }
       if (!hasAnyRootCutoff) {
         let earliest = Infinity
         for (const r of out) if (r.cli === cli && r.ts < earliest) earliest = r.ts
-        fallbackCutoff = Number.isFinite(earliest) ? hourStartLocal(earliest) : Infinity
+        legacyMaxCutoff = Number.isFinite(earliest) ? hourStartLocal(earliest) : Infinity
+      }
+      const legacyLiveBuckets = new Map()
+      for (const r of dedupe(out.filter((x) => x.cli === cli && (!desktopRoot || x.root !== desktopRoot)))) {
+        const bKey = `${hourStartLocal(r.ts)}|${r.model}`
+        let b = legacyLiveBuckets.get(bKey)
+        if (!b) {
+          b = { input: 0, output: 0, cacheRead: 0, cacheCreate: 0, reasoning: 0, total: 0, turns: 0 }
+          legacyLiveBuckets.set(bKey, b)
+        }
+        b.input += r.input
+        b.output += r.output
+        b.cacheRead += r.cacheRead
+        b.cacheCreate += r.cacheCreate
+        b.reasoning += r.reasoning
+        b.total += r.total
+        b.turns += r.turns || 1
       }
       for (const r of rows) {
-        const rk = r.root || defaultRoot
-        let cutoff = fallbackCutoff
-        if (hasAnyRootCutoff && rk) {
-          const earliest = rootEarliest.get(`${cli}|${rk}`)
-          cutoff = earliest !== undefined ? hourStartLocal(earliest) : Infinity
+        if (r.root) {
+          const earliest = rootEarliest.get(`${cli}|${r.root}`)
+          const cutoff = earliest !== undefined ? hourStartLocal(earliest) : Infinity
+          if (r.ts < cutoff) out.push(r)
+          continue
         }
-        const tagged = rk && !r.root ? { ...r, root: rk } : r
-        if (tagged.ts < cutoff) out.push(tagged)
+        if (r.ts >= legacyMaxCutoff) continue
+        const rem = subtractLive(
+          defaultRoot ? { ...r, root: defaultRoot } : r,
+          legacyLiveBuckets.get(`${hourStartLocal(r.ts)}|${r.model}`)
+        )
+        if (rem) out.push(rem)
       }
     }
     return out
@@ -688,6 +715,22 @@ function hourStartLocal(ms) {
   const d = new Date(ms)
   d.setMinutes(0, 0, 0)
   return d.getTime()
+}
+
+function subtractLive(r, live) {
+  if (!live) return r
+  const total = r.total - live.total
+  if (total <= 0) return null
+  return {
+    ...r,
+    input: Math.max(0, r.input - live.input),
+    output: Math.max(0, r.output - live.output),
+    cacheRead: Math.max(0, r.cacheRead - live.cacheRead),
+    cacheCreate: Math.max(0, r.cacheCreate - live.cacheCreate),
+    reasoning: Math.max(0, r.reasoning - live.reasoning),
+    total,
+    turns: Math.max(1, (r.turns || 1) - (live.turns || 1)),
+  }
 }
 
 // Canonical path form for slash/case-insensitive prefix matching on Windows,

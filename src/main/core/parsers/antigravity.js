@@ -1,7 +1,7 @@
 import fs from 'node:fs'
 import path from 'node:path'
 import { createRequire } from 'node:module'
-import { CLI_ROOTS } from '../paths.js'
+import { AGY_DESKTOP_ROOT, CLI_ROOTS } from '../paths.js'
 import { readSqliteSnapshot, sqliteSignature } from '../sqliteSnapshot.js'
 
 const require = createRequire(import.meta.url)
@@ -135,6 +135,7 @@ function workspaceOf(db) {
 export const antigravity = {
   cli: 'agy',
   roots: CLI_ROOTS.agy,
+  desktopRoot: AGY_DESKTOP_ROOT,
   kind: 'path',
   sidecars: ['-wal', '-journal'],
   signature: sqliteSignature,
