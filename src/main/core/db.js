@@ -44,6 +44,7 @@ CREATE TABLE IF NOT EXISTS usage_root_hourly (
   total        INTEGER NOT NULL DEFAULT 0,
   cost         REAL    NOT NULL DEFAULT 0,
   turns        INTEGER NOT NULL DEFAULT 0,
+  parts_json   TEXT,
   PRIMARY KEY (hour, cli, root, model)
 );
 CREATE INDEX IF NOT EXISTS idx_usage_root_cli ON usage_root_hourly(cli, hour);
@@ -143,6 +144,8 @@ function migrateSchema(db) {
   }
   const subs = columns('subscriptions')
   if (!subs.has('group_id')) db.run('ALTER TABLE subscriptions ADD COLUMN group_id TEXT')
+  const rootHourly = columns('usage_root_hourly')
+  if (!rootHourly.has('parts_json')) db.run('ALTER TABLE usage_root_hourly ADD COLUMN parts_json TEXT')
   if (!subs.has('reset_periods')) {
     db.run('ALTER TABLE subscriptions ADD COLUMN reset_periods TEXT')
     // Quota windows were briefly a single-select `reset_period` column before
@@ -222,7 +225,7 @@ export class UsageDb {
         const rKey = hour + '|' + r.cli + '|' + r.root + '|' + r.model
         let rb = rootBuckets.get(rKey)
         if (!rb) {
-          rb = { hour, cli: r.cli, root: r.root, model: r.model, input: 0, output: 0, cacheRead: 0, cacheCreate: 0, reasoning: 0, total: 0, cost: 0, turns: 0 }
+          rb = { hour, cli: r.cli, root: r.root, model: r.model, input: 0, output: 0, cacheRead: 0, cacheCreate: 0, reasoning: 0, total: 0, cost: 0, turns: 0, parts: [] }
           rootBuckets.set(rKey, rb)
         }
         rb.input += r.input
@@ -233,6 +236,20 @@ export class UsageDb {
         rb.total += r.total
         rb.cost += cost
         rb.turns += turns
+        if (Array.isArray(r.parts) && r.parts.length) {
+          rb.parts.push(...r.parts)
+        } else if (r.dedupKey) {
+          rb.parts.push({
+            dedupKey: r.dedupKey,
+            input: r.input,
+            output: r.output,
+            cacheRead: r.cacheRead,
+            cacheCreate: r.cacheCreate,
+            reasoning: r.reasoning,
+            total: r.total,
+            turns,
+          })
+        }
       }
     }
 
@@ -247,10 +264,10 @@ export class UsageDb {
     stmt.free()
     this.db.run('DELETE FROM usage_root_hourly')
     const rootStmt = this.db.prepare(
-      'INSERT INTO usage_root_hourly (hour,cli,root,model,input,output,cache_read,cache_create,reasoning,total,cost,turns) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)'
+      'INSERT INTO usage_root_hourly (hour,cli,root,model,input,output,cache_read,cache_create,reasoning,total,cost,turns,parts_json) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)'
     )
     for (const rb of rootBuckets.values()) {
-      rootStmt.run([rb.hour, rb.cli, rb.root, rb.model, rb.input, rb.output, rb.cacheRead, rb.cacheCreate, rb.reasoning, rb.total, rb.cost, rb.turns])
+      rootStmt.run([rb.hour, rb.cli, rb.root, rb.model, rb.input, rb.output, rb.cacheRead, rb.cacheCreate, rb.reasoning, rb.total, rb.cost, rb.turns, rb.parts.length ? JSON.stringify(rb.parts) : null])
     }
     rootStmt.free()
     this.db.run('COMMIT')
@@ -476,24 +493,35 @@ export class UsageDb {
   // rows on first upgrade before usage_root_hourly has been populated.
   agyHistory() {
     const rooted = this.rows(
-      `SELECT hour, cli, root, model, input, output, cache_read, cache_create, reasoning, total, cost, turns
+      `SELECT hour, cli, root, model, input, output, cache_read, cache_create, reasoning, total, cost, turns, parts_json
        FROM usage_root_hourly
        WHERE cli = 'agy'
        ORDER BY hour ASC`
-    ).map((r) => ({
-      hour: r.hour,
-      cli: r.cli,
-      root: r.root,
-      model: r.model,
-      input: r.input,
-      output: r.output,
-      cacheRead: r.cache_read,
-      cacheCreate: r.cache_create,
-      reasoning: r.reasoning,
-      total: r.total,
-      cost: r.cost,
-      turns: r.turns,
-    }))
+    ).map((r) => {
+      let parts = null
+      if (r.parts_json) {
+        try {
+          parts = JSON.parse(r.parts_json)
+        } catch {
+          parts = null
+        }
+      }
+      return {
+        hour: r.hour,
+        cli: r.cli,
+        root: r.root,
+        model: r.model,
+        input: r.input,
+        output: r.output,
+        cacheRead: r.cache_read,
+        cacheCreate: r.cache_create,
+        reasoning: r.reasoning,
+        total: r.total,
+        cost: r.cost,
+        turns: r.turns,
+        ...(Array.isArray(parts) ? { parts } : {}),
+      }
+    })
     if (rooted.length) return rooted
     return this.hourlySince(0).filter((r) => r.cli === 'agy')
   }

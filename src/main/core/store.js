@@ -330,11 +330,29 @@ export class Store extends EventEmitter {
         b.total += r.total
         b.turns += r.turns || 1
       }
+      const liveDedupKeys = new Set()
+      for (const r of out) {
+        if (r.cli === cli && r.dedupKey) liveDedupKeys.add(r.dedupKey)
+      }
+      const seenPartKeys = new Set(liveDedupKeys)
       for (const r of rows) {
         if (r.root) {
           const earliest = rootEarliest.get(`${cli}|${r.root}`)
           const cutoff = earliest !== undefined ? hourStartLocal(earliest) : Infinity
-          if (r.ts < cutoff) out.push(r)
+          if (Array.isArray(r.parts) && r.parts.length) {
+            const kept = r.parts.filter((p) => {
+              const key = p.dedupKey
+              if (!key || key.startsWith('history:')) return r.ts < cutoff
+              if (seenPartKeys.has(key)) return false
+              seenPartKeys.add(key)
+              return true
+            })
+            const summed = sumParts(r, kept)
+            if (summed) out.push(summed)
+            continue
+          }
+          if (r.ts >= cutoff) continue
+          out.push(r)
           continue
         }
         if (r.ts >= legacyMaxCutoff) continue
@@ -731,6 +749,28 @@ function subtractLive(r, live) {
     total,
     turns: Math.max(1, (r.turns || 1) - (live.turns || 1)),
   }
+}
+
+function sumParts(r, parts) {
+  if (!parts.length) return null
+  let input = 0
+  let output = 0
+  let cacheRead = 0
+  let cacheCreate = 0
+  let reasoning = 0
+  let total = 0
+  let turns = 0
+  for (const p of parts) {
+    input += p.input || 0
+    output += p.output || 0
+    cacheRead += p.cacheRead || 0
+    cacheCreate += p.cacheCreate || 0
+    reasoning += p.reasoning || 0
+    total += p.total || 0
+    turns += p.turns || 1
+  }
+  if (total <= 0) return null
+  return { ...r, input, output, cacheRead, cacheCreate, reasoning, total, turns, parts }
 }
 
 // Canonical path form for slash/case-insensitive prefix matching on Windows,

@@ -138,11 +138,13 @@ try {
   const sharedDesktopCopy = path.join(process.env.AIMON_AGY_DESKTOP_ROOT, 'shared-session.db')
   await fsp.writeFile(sharedDesktopCopy, await readSqliteSnapshot(agyFile))
   await store.ingestFile(sharedDesktopCopy)
-  store.seedHistory('agy', [
-    { hour: 1791853200000, cli: 'agy', root: process.env.AIMON_AGY_DESKTOP_ROOT, model: 'Gemini live test', total: 230, input: 200, output: 10, cacheRead: 20, cacheCreate: 0, reasoning: 8 },
-  ])
-  assert.equal(store.dedupedRecords().filter((r) => r.cli === 'agy' && r.sessionId === 'archived').length, 0, 'root cutoffs must be computed before response-ID deduplication hides a root')
+  reingestDb.ingest(store.dedupedRecords())
   store.seedHistory('agy', reingestDb.agyHistory())
+  await fsp.rm(agyFile, { force: true })
+  await store.ingestFile(agyFile)
+  await fsp.rm(duplicate, { force: true })
+  await store.ingestFile(duplicate)
+  assert.equal(store.dedupedRecords().filter((r) => r.cli === 'agy').reduce((n, r) => n + r.total, 0), agyTotalBeforeReingest, 'removing the winning CLI copy of a shared conversation must not double-count the surviving desktop copy')
   await fsp.rm(sharedDesktopCopy, { force: true })
   await store.ingestFile(sharedDesktopCopy)
   await fsp.rm(desktopAgyFile, { force: true })
