@@ -42,18 +42,28 @@ contextBridge.exposeInMainWorld('api', {
   agySetEnabled: (on) => ipcRenderer.invoke('agy:set-enabled', on),
 
   // report window
-  reportHourly: (dayStartMs) => ipcRenderer.invoke('report:hourly', dayStartMs),
-  reportDaily: (fromMs, toMs) => ipcRenderer.invoke('report:daily', fromMs, toMs),
-  reportModels: (fromMs, toMs) => ipcRenderer.invoke('report:models', fromMs, toMs),
+  reportHourly: (dayStartMs, deviceId) => ipcRenderer.invoke('report:hourly', dayStartMs, deviceId),
+  reportDaily: (fromMs, toMs, deviceId) => ipcRenderer.invoke('report:daily', fromMs, toMs, deviceId),
+  reportModels: (fromMs, toMs, deviceId) => ipcRenderer.invoke('report:models', fromMs, toMs, deviceId),
   reportRequests: (opts) => ipcRenderer.invoke('report:requests', opts),
   reportProjects: (fromMs, toMs) => ipcRenderer.invoke('report:projects', fromMs, toMs),
-  reportSpan: () => ipcRenderer.invoke('report:span'),
+  reportSpan: (deviceId) => ipcRenderer.invoke('report:span', deviceId),
   // opts: { which: 'report' | 'popup', mode: 'save' | 'copy' }
   exportPng: (opts) => ipcRenderer.invoke('export-png', opts),
   onReportUpdated: (cb) => {
     const handler = () => cb()
     ipcRenderer.on('report-updated', handler)
     return () => ipcRenderer.removeListener('report-updated', handler)
+  },
+
+  // multi-device & account-wide view switching
+  devicesGet: () => ipcRenderer.invoke('devices:get'),
+  devicesSelect: (deviceId) => ipcRenderer.invoke('devices:select', deviceId),
+  devicesRefresh: () => ipcRenderer.invoke('devices:refresh'),
+  onDeviceView: (cb) => {
+    const handler = (_e, state) => cb(state)
+    ipcRenderer.on('device-view', handler)
+    return () => ipcRenderer.removeListener('device-view', handler)
   },
 
   // settings window — multi-provider LiteLLM configuration
@@ -71,13 +81,13 @@ contextBridge.exposeInMainWorld('api', {
   subsSeparate: (id) => ipcRenderer.invoke('subs:separate', id),
   subsSave: (sub) => ipcRenderer.invoke('subs:save', sub),
   subsDelete: (id) => ipcRenderer.invoke('subs:delete', id),
-  subsStats: () => ipcRenderer.invoke('subs:stats'),
-  subsCycles: () => ipcRenderer.invoke('subs:cycles'),
+  subsStats: (deviceId) => ipcRenderer.invoke('subs:stats', deviceId),
+  subsCycles: (deviceId) => ipcRenderer.invoke('subs:cycles', deviceId),
   // rolling quota-reset windows (popup countdown); live CLI quota (Codex) is
   // already overlaid into these entries by the main process
-  subsResets: () => ipcRenderer.invoke('subs:resets'),
-  subsBreakdown: (fromMs, toMs) => ipcRenderer.invoke('subs:breakdown', fromMs, toMs),
-  subsTimeline: (fromMs, toMs) => ipcRenderer.invoke('subs:timeline', fromMs, toMs),
+  subsResets: (deviceId) => ipcRenderer.invoke('subs:resets', deviceId),
+  subsBreakdown: (fromMs, toMs, deviceId) => ipcRenderer.invoke('subs:breakdown', fromMs, toMs, deviceId),
+  subsTimeline: (fromMs, toMs, deviceId) => ipcRenderer.invoke('subs:timeline', fromMs, toMs, deviceId),
 
   // cloud sync — push usage to tokenstat-web (token.chinadong.net)
   cloudSyncGet: () => ipcRenderer.invoke('cloudsync:get'),

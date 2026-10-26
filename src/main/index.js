@@ -15,7 +15,7 @@ import { migrateLegacyLitellmConfig } from './core/migrateLitellm.js'
 import { isAutoLaunch, setAutoLaunch, migrateLegacyRunKeys } from './autoLaunch.js'
 import { agyResetWindows, getAgyQuotaState, enableAgyQuota, disableAgyQuota, ensureAgyHook, AGY_MIRROR_PATH } from './agyQuota.js'
 import { makeTrayIcon } from './trayIcon.js'
-import { performSync, testCloudSync, normalizeEndpoint, DEFAULT_ENDPOINT } from './core/cloudSync.js'
+import { performSync, pullCloudAccount, testCloudSync, normalizeEndpoint, DEFAULT_ENDPOINT } from './core/cloudSync.js'
 import { checkForUpdate, downloadUpdate, launchInstaller, UPDATE_REPO, RELEASES_URL } from './updater.js'
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url))
@@ -146,14 +146,31 @@ async function init() {
   }
   store.on('update', (snap) => {
     lastSnapshot = snap
-    if (win && !win.isDestroyed()) win.webContents.send('snapshot', snap)
-    updateTray(snap)
+    const eff = buildEffectiveSnapshot(snap)
+    if (win && !win.isDestroyed()) win.webContents.send('snapshot', eff)
+    updateTray(eff)
     scheduleIngest()
   })
 
   // Register IPC before the (slow) initial scan so the renderer never races a
   // missing handler. snapshot() safely returns whatever has been parsed so far.
-  ipcMain.handle('get-snapshot', () => lastSnapshot || (store ? store.snapshot() : null))
+  ipcMain.handle('get-snapshot', () => buildEffectiveSnapshot(lastSnapshot || (store ? store.snapshot() : null)))
+  ipcMain.handle('devices:get', () =>
+    db ? db.getDeviceViewState() : { selectedDevice: 'local', hasCloudData: false, currentKeyId: null, devices: [] }
+  )
+  ipcMain.handle('devices:select', (_e, deviceId) => {
+    if (!db) return null
+    const state = db.setSelectedDevice(deviceId)
+    broadcastDeviceView()
+    return state
+  })
+  ipcMain.handle('devices:refresh', async () => {
+    if (!db) return null
+    await pullCloudAccount({ db })
+    ingestNow()
+    broadcastDeviceView()
+    return db.getDeviceViewState()
+  })
   ipcMain.handle('open-data-dir', (_e, cli) => {
     if (typeof cli === 'string' && cli.startsWith('litellm:')) {
       const p = db?.getLitellmProvider(cli.slice('litellm:'.length))
@@ -217,11 +234,12 @@ async function init() {
   })
   ipcMain.handle('update:open-releases', (_e, url) => shell.openExternal(url || RELEASES_URL))
 
-  // Report data queries (served from the SQLite hourly table).
-  ipcMain.handle('report:hourly', (_e, dayStartMs) => db?.hourly(dayStartMs) ?? [])
-  ipcMain.handle('report:daily', (_e, fromMs, toMs) => db?.daily(fromMs, toMs) ?? [])
-  ipcMain.handle('report:models', (_e, fromMs, toMs) => db?.models(fromMs, toMs) ?? [])
-  ipcMain.handle('report:span', () => db?.span() ?? { min: null, max: null })
+  // Report data queries (served from the SQLite hourly table, respecting the
+  // active device view: 'account', '<keyId>', or 'local').
+  ipcMain.handle('report:hourly', (_e, dayStartMs, deviceId) => db?.hourly(dayStartMs, deviceId) ?? [])
+  ipcMain.handle('report:daily', (_e, fromMs, toMs, deviceId) => db?.daily(fromMs, toMs, deviceId) ?? [])
+  ipcMain.handle('report:models', (_e, fromMs, toMs, deviceId) => db?.models(fromMs, toMs, deviceId) ?? [])
+  ipcMain.handle('report:span', (_e, deviceId) => db?.span(deviceId) ?? { min: null, max: null })
   // Per-request log is served live from the store (not the hourly DB) so it
   // reflects the exact deduplicated records that drive the totals.
   ipcMain.handle('report:requests', (_e, opts) => store?.requestLog(opts) ?? { rows: [], count: 0 })
@@ -313,33 +331,16 @@ async function init() {
     scheduleCloudSync()
     return result
   })
-  ipcMain.handle('subs:stats', () =>
-    db && store ? computeAllSubscriptionStats(db.listSubscriptions(), store.dedupedRecords(), Date.now()) : []
+  ipcMain.handle('subs:stats', (_e, deviceId) =>
+    db && store ? computeAllSubscriptionStats(db.listSubscriptions(), recordsForView(deviceId), Date.now()) : []
   )
-  ipcMain.handle('subs:cycles', () => ({
-    ...computeCycleDashboard(db?.listSubscriptions() || [], store?.dedupedRecords() || []),
+  ipcMain.handle('subs:cycles', (_e, deviceId) => ({
+    ...computeCycleDashboard(db?.listSubscriptions() || [], recordsForView(deviceId)),
     cliLabels: Object.fromEntries(Object.entries({ ...CLI_META, ...dynamicCliMeta }).map(([id, meta]) => [id, meta.label])),
   }))
   // Quota-reset windows for the tray popup. Recomputed per call (cheap) so the
-  // popup's countdown always reflects the newest records. Where a plan is bound
-  // to a CLI that reports its OWN quota (Codex, via the rate_limits snapshot in
-  // its logs — the same numbers `/status` shows), those live used%/reset values
-  // are overlaid onto the plan's estimated windows; plans/CLIs without a live
-  // source fall back to the estimate. Codex is local, so it's effectively
-  // real-time; any future network source would self-throttle (cf. Cursor's 15m).
-  ipcMain.handle('subs:resets', () => {
-    if (!db || !store) return []
-    const now = Date.now()
-    const subs = db.listSubscriptions()
-    const recs = store.dedupedRecords()
-    // Built once and shared: computeResetWindows needs each plan's owned
-    // records, and mergeLiveLimits needs them again to fill a live window's
-    // real tokens/cost over that window's own span.
-    const index = planRecordIndex(subs, recs, now)
-    const entries = computeResetWindows(subs, recs, now, index)
-    const labels = Object.fromEntries(Object.entries(CLI_META).map(([k, v]) => [k, v.label]))
-    return mergeLiveLimits(entries, buildLiveByCli(), now, labels, index)
-  })
+  // popup's countdown always reflects the newest records and selected device.
+  ipcMain.handle('subs:resets', (_e, deviceId) => computeResetsForView(deviceId))
 
   // Cloud sync (token.chinadong.net / any self-hosted tokenstat-web).
   // Config lives in the cloud_sync DB table; the engine is core/cloudSync.js.
@@ -361,14 +362,14 @@ async function init() {
     const res = await runCloudSync({ resolveSubscriptionsStrategy: strategy })
     return { ...res, state: db ? db.getCloudSync() : null }
   })
-  ipcMain.handle('subs:timeline', (_e, fromMs, toMs) =>
+  ipcMain.handle('subs:timeline', (_e, fromMs, toMs, deviceId) =>
     db && store
-      ? computePlanTimeline(db.listSubscriptions(), store.dedupedRecords(), fromMs, toMs, Date.now())
+      ? computePlanTimeline(db.listSubscriptions(), recordsForView(deviceId), fromMs, toMs, Date.now())
       : null
   )
-  ipcMain.handle('subs:breakdown', (_e, fromMs, toMs) =>
+  ipcMain.handle('subs:breakdown', (_e, fromMs, toMs, deviceId) =>
     db && store
-      ? computePlanBreakdown(db.listSubscriptions(), store.dedupedRecords(), fromMs, toMs, Date.now())
+      ? computePlanBreakdown(db.listSubscriptions(), recordsForView(deviceId), fromMs, toMs, Date.now())
       : { totalCost: 0, plans: [], unplanned: { fees: 0, cost: 0, tokens: 0, turns: 0, models: [] } }
   )
 
@@ -415,8 +416,18 @@ async function init() {
     db.updateCloudSyncState({ fullResync: true })
   }
   startCloudSyncTimer() // pushes to tokenstat-web when enabled (Settings → 云同步)
-  // First push shortly after startup so the cloud reflects a reboot-gap quickly;
-  // waits 5s so the initial local scan/ingest has settled.
+  // Pull multi-device account data immediately on startup if not cached yet,
+  // and run the first full sync pass shortly after startup.
+  if (db && db.getCloudSync().enabled && db.listCloudDevices().length === 0) {
+    pullCloudAccount({ db })
+      .then((r) => {
+        if (r?.ok) {
+          ingestNow()
+          broadcastDeviceView()
+        }
+      })
+      .catch(() => {})
+  }
   setTimeout(() => runCloudSync(), 5000)
   // Prime Claude's live plan-quota (spawns `claude -p /usage` once) so the
   // popup's Quota-windows section can show it without waiting for the first
@@ -498,8 +509,8 @@ function runCloudSync(opts = {}) {
     .then((result) => {
       cloudSyncRetryAt = result.error ? Date.now() + 30000 : 0
       notifyReportUpdated()
-      if (result.pulledSubscriptions || result.subscriptionSync) {
-        broadcastSnapshot()
+      if (result.pulledSubscriptions || result.subscriptionSync || result.pulledAccount) {
+        broadcastDeviceView()
       }
       return result
     })
@@ -532,6 +543,9 @@ function ingestNow() {
   lastIngest = Date.now()
   try {
     db.ingest(store.dedupedRecords())
+    if (lastSnapshot && win && !win.isDestroyed()) {
+      win.webContents.send('snapshot', buildEffectiveSnapshot(lastSnapshot))
+    }
     notifyReportUpdated()
     scheduleCloudSync()
   } catch (e) {
@@ -577,8 +591,101 @@ function refreshLitellmPollers() {
 function watchAgyMirror() {
   fs.watchFile(AGY_MIRROR_PATH, { interval: 20000 }, (cur, prev) => {
     if (cur.mtimeMs === prev.mtimeMs) return
-    if (win && !win.isDestroyed() && lastSnapshot) win.webContents.send('snapshot', lastSnapshot)
+    if (win && !win.isDestroyed() && lastSnapshot) win.webContents.send('snapshot', buildEffectiveSnapshot(lastSnapshot))
   })
+}
+
+function buildEffectiveSnapshot(baseSnap) {
+  if (!db || !baseSnap) return baseSnap
+  const viewState = db.getDeviceViewState()
+  if (!viewState.hasCloudData || viewState.selectedDevice === 'local') {
+    return {
+      ...baseSnap,
+      isCloudOverview: false,
+      selectedDevice: 'local',
+      deviceView: viewState,
+    }
+  }
+  const cloudSnap = db.cloudOverview(viewState.selectedDevice, Date.now())
+  if (!cloudSnap) {
+    return {
+      ...baseSnap,
+      isCloudOverview: false,
+      selectedDevice: 'local',
+      deviceView: viewState,
+    }
+  }
+  const provMap = new Map()
+  for (const p of baseSnap.providers || []) provMap.set(p.id, p)
+  for (const p of cloudSnap.providers || []) if (!provMap.has(p.id)) provMap.set(p.id, p)
+  return {
+    ...baseSnap,
+    ...cloudSnap,
+    providers: [...provMap.values()],
+    live: baseSnap.live,
+  }
+}
+
+function recordsForView(deviceId = null) {
+  if (!db || !store) return []
+  const eff = db.resolveDeviceId(deviceId)
+  if (eff === 'local') return store.dedupedRecords()
+  return db.recordsForDevice(eff)
+}
+
+function computeResetsForView(deviceId = null) {
+  if (!db || !store) return []
+  const now = Date.now()
+  const subs = db.listSubscriptions()
+  const eff = db.resolveDeviceId(deviceId)
+  const recs = recordsForView(eff)
+  const index = planRecordIndex(subs, recs, now)
+  const entries = computeResetWindows(subs, recs, now, index)
+  const labels = Object.fromEntries(Object.entries({ ...CLI_META, ...dynamicCliMeta }).map(([k, v]) => [k, v.label]))
+  const viewState = db.getDeviceViewState()
+  const isCurrentOrLocal = eff === 'local' || (viewState.currentKeyId && eff === viewState.currentKeyId)
+
+  if (isCurrentOrLocal) {
+    return mergeLiveLimits(entries, buildLiveByCli(), now, labels, index)
+  }
+
+  const cloudSnap = db.cloudOverview(eff, now)
+  const cloudResets = cloudSnap?.cloudResets || []
+  const byName = new Map(cloudResets.map((r) => [String(r.name || r.planName || '').toLowerCase(), r]))
+
+  if (eff === 'account') {
+    const mergedLocal = mergeLiveLimits(entries, buildLiveByCli(), now, labels, index)
+    return mergedLocal.map((e) => {
+      if ((e.windows || []).some((w) => w.source === 'live')) return e
+      const cr = byName.get(String(e.name || '').toLowerCase())
+      if (cr && Array.isArray(cr.windows) && cr.windows.length) {
+        return { ...e, windows: cr.windows, renewal: cr.renewal || e.renewal }
+      }
+      return e
+    })
+  }
+
+  // Specific remote device: overlay that device's synced live quota windows
+  return entries.map((e) => {
+    const cr = byName.get(String(e.name || '').toLowerCase())
+    if (cr && Array.isArray(cr.windows) && cr.windows.length) {
+      return { ...e, windows: cr.windows, renewal: cr.renewal || e.renewal }
+    }
+    return e
+  })
+}
+
+function broadcastDeviceView() {
+  const state = db ? db.getDeviceViewState() : null
+  for (const w of BrowserWindow.getAllWindows()) {
+    if (!w.isDestroyed()) w.webContents.send('device-view', state)
+  }
+  if (lastSnapshot) {
+    const eff = buildEffectiveSnapshot(lastSnapshot)
+    if (win && !win.isDestroyed()) win.webContents.send('snapshot', eff)
+    updateTray(eff)
+  }
+  notifyReportUpdated()
 }
 
 // Pushes a fresh snapshot to the popup + tray + ingest, outside the normal
@@ -588,8 +695,9 @@ function broadcastSnapshot() {
   if (!store) return
   const s = store.snapshot()
   lastSnapshot = s
-  if (win && !win.isDestroyed()) win.webContents.send('snapshot', s)
-  updateTray(s)
+  const eff = buildEffectiveSnapshot(s)
+  if (win && !win.isDestroyed()) win.webContents.send('snapshot', eff)
+  updateTray(eff)
   scheduleIngest()
 }
 

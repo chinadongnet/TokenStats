@@ -1,6 +1,6 @@
 import React, { useEffect, useMemo, useRef, useState } from 'react'
 import { t, useLang } from './i18n.js'
-import { SubscriptionDashboard } from './Cycles.jsx'
+import { SubscriptionDashboard, DeviceSwitchSeg } from './Cycles.jsx'
 
 // The 5 fixed built-in CLIs. LiteLLM providers are NOT listed here — they're
 // dynamic, DB-backed entries (`litellm:<providerId>`) fetched via
@@ -207,7 +207,8 @@ export default function Report() {
     <div className="report">
       <header className="rep-head">
         <div className="rep-title"><span className="logo" /> {t('rep.title')}</div>
-        <div className="rep-actions">
+        <div className="rep-actions" style={{ flexWrap: 'wrap' }}>
+          <DeviceSwitchSeg />
           <div className="seg">
             <button className={view === 'charts' ? 'on' : ''} onClick={() => setView('charts')}>{t('rep.charts')}</button>
             <button className={view === 'hour' ? 'on' : ''} onClick={() => setView('hour')}>{t('rep.byHour')}</button>

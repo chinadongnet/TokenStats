@@ -116,8 +116,39 @@ CREATE TABLE IF NOT EXISTS cloud_sync (
   last_sync_at INTEGER,
   last_error   TEXT,
   subs_base_hash TEXT,
-  subs_conflict_json TEXT
+  subs_conflict_json TEXT,
+  selected_device TEXT NOT NULL DEFAULT 'account'
 );
+
+CREATE TABLE IF NOT EXISTS cloud_devices (
+  id           TEXT PRIMARY KEY,
+  name         TEXT NOT NULL,
+  tz           TEXT,
+  app_version  TEXT,
+  last_sync_at INTEGER,
+  revoked      INTEGER NOT NULL DEFAULT 0,
+  is_current   INTEGER NOT NULL DEFAULT 0,
+  status_json  TEXT,
+  updated_at   INTEGER
+);
+
+CREATE TABLE IF NOT EXISTS cloud_usage_hourly (
+  key_id       TEXT    NOT NULL,
+  hour         INTEGER NOT NULL,
+  cli          TEXT    NOT NULL,
+  model        TEXT    NOT NULL,
+  input        INTEGER NOT NULL DEFAULT 0,
+  output       INTEGER NOT NULL DEFAULT 0,
+  cache_read   INTEGER NOT NULL DEFAULT 0,
+  cache_create INTEGER NOT NULL DEFAULT 0,
+  reasoning    INTEGER NOT NULL DEFAULT 0,
+  total        INTEGER NOT NULL DEFAULT 0,
+  cost         REAL    NOT NULL DEFAULT 0,
+  turns        INTEGER NOT NULL DEFAULT 0,
+  PRIMARY KEY (key_id, hour, cli, model)
+);
+CREATE INDEX IF NOT EXISTS idx_cloud_usage_hour ON cloud_usage_hourly(hour);
+CREATE INDEX IF NOT EXISTS idx_cloud_usage_key ON cloud_usage_hourly(key_id, hour);
 
 CREATE TABLE IF NOT EXISTS subscriptions (
   id          TEXT    PRIMARY KEY,
@@ -149,6 +180,7 @@ function migrateSchema(db) {
   const cloudCols = columns('cloud_sync')
   if (!cloudCols.has('subs_base_hash')) db.run('ALTER TABLE cloud_sync ADD COLUMN subs_base_hash TEXT')
   if (!cloudCols.has('subs_conflict_json')) db.run('ALTER TABLE cloud_sync ADD COLUMN subs_conflict_json TEXT')
+  if (!cloudCols.has('selected_device')) db.run("ALTER TABLE cloud_sync ADD COLUMN selected_device TEXT NOT NULL DEFAULT 'account'")
   const rootHourly = columns('usage_root_hourly')
   if (!rootHourly.has('parts_json')) db.run('ALTER TABLE usage_root_hourly ADD COLUMN parts_json TEXT')
   if (!subs.has('reset_periods')) {
@@ -275,6 +307,21 @@ export class UsageDb {
       rootStmt.run([rb.hour, rb.cli, rb.root, rb.model, rb.input, rb.output, rb.cacheRead, rb.cacheCreate, rb.reasoning, rb.total, rb.cost, rb.turns, rb.parts.length ? JSON.stringify(rb.parts) : null])
     }
     rootStmt.free()
+    // Keep the current device's rows in cloud_usage_hourly in sync with local
+    // ingests so "all devices (account)" and "this device" views immediately
+    // reflect new local usage even between cloud sync passes.
+    const curDev = this.rows('SELECT id FROM cloud_devices WHERE is_current = 1 LIMIT 1')[0]
+    if (curDev?.id) {
+      this.db.run('DELETE FROM cloud_usage_hourly WHERE key_id = ?', [curDev.id])
+      const cStmt = this.db.prepare(
+        'INSERT INTO cloud_usage_hourly (key_id,hour,cli,model,input,output,cache_read,cache_create,reasoning,total,cost,turns) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)'
+      )
+      for (const b of buckets.values()) {
+        cStmt.run([curDev.id, b.hour, b.cli, b.model, b.input, b.output, b.cacheRead, b.cacheCreate, b.reasoning, b.total, b.cost, b.turns])
+      }
+      cStmt.free()
+      this.db.run('UPDATE cloud_devices SET last_sync_at = MAX(COALESCE(last_sync_at, 0), ?) WHERE id = ?', [Date.now(), curDev.id])
+    }
     this.db.run('COMMIT')
     this.persist()
     return buckets.size
@@ -443,6 +490,7 @@ export class UsageDb {
       lastError: r.last_error || null,
       subsBaseHash: r.subs_base_hash || null,
       subsConflict,
+      selectedDevice: r.selected_device || 'account',
     }
   }
 
@@ -746,6 +794,405 @@ export class UsageDb {
     return this.getSubscription(id)
   }
 
+  // ---- multi-device cloud account state -----------------------------------
+
+  saveCloudAccountSync(accountSync) {
+    if (!accountSync || !Array.isArray(accountSync.devices)) return
+    const snapMap = new Map()
+    for (const s of accountSync.snapshots || []) {
+      if (s && s.keyId) snapMap.set(s.keyId, s)
+    }
+    this.db.run('BEGIN')
+    try {
+      this.db.run('DELETE FROM cloud_devices')
+      const devStmt = this.db.prepare(
+        `INSERT INTO cloud_devices (id, name, tz, app_version, last_sync_at, revoked, is_current, status_json, updated_at)
+         VALUES (?,?,?,?,?,?,?,?,?)`
+      )
+      for (const d of accountSync.devices) {
+        if (!d || !d.id) continue
+        const snap = snapMap.get(d.id)
+        const isCur = d.isCurrent || (accountSync.currentKeyId && d.id === accountSync.currentKeyId) ? 1 : 0
+        devStmt.run([
+          d.id,
+          String(d.name || d.id),
+          d.tz || null,
+          d.appVersion || null,
+          d.lastSyncAt || null,
+          d.revoked ? 1 : 0,
+          isCur,
+          snap?.status ? JSON.stringify(snap.status) : null,
+          snap?.updatedAt || d.lastSyncAt || null,
+        ])
+      }
+      devStmt.free()
+
+      if (Array.isArray(accountSync.hours)) {
+        this.db.run('DELETE FROM cloud_usage_hourly')
+        const hStmt = this.db.prepare(
+          `INSERT INTO cloud_usage_hourly
+             (key_id, hour, cli, model, input, output, cache_read, cache_create, reasoning, total, cost, turns)
+           VALUES (?,?,?,?,?,?,?,?,?,?,?,?)
+           ON CONFLICT(key_id, hour, cli, model) DO UPDATE SET
+             input=excluded.input, output=excluded.output, cache_read=excluded.cache_read,
+             cache_create=excluded.cache_create, reasoning=excluded.reasoning,
+             total=excluded.total, cost=excluded.cost, turns=excluded.turns`
+        )
+        for (const h of accountSync.hours) {
+          if (!h || !h.keyId || !Number.isFinite(Number(h.hour)) || !h.cli || !h.model) continue
+          hStmt.run([
+            h.keyId,
+            Number(h.hour),
+            String(h.cli),
+            String(h.model),
+            Number(h.input) || 0,
+            Number(h.output) || 0,
+            Number(h.cacheRead) || 0,
+            Number(h.cacheCreate) || 0,
+            Number(h.reasoning) || 0,
+            Number(h.total) || 0,
+            Number(h.cost) || 0,
+            Number(h.turns) || 0,
+          ])
+        }
+        hStmt.free()
+      }
+      this.db.run('COMMIT')
+    } catch (err) {
+      this.db.run('ROLLBACK')
+      throw err
+    }
+    this.persist()
+  }
+
+  listCloudDevices() {
+    return this.rows(
+      'SELECT * FROM cloud_devices ORDER BY is_current DESC, COALESCE(last_sync_at, 0) DESC, name ASC'
+    ).map((r) => {
+      let status = null
+      if (r.status_json) {
+        try {
+          status = JSON.parse(r.status_json)
+        } catch {
+          status = null
+        }
+      }
+      return {
+        id: r.id,
+        name: r.name,
+        tz: r.tz || null,
+        appVersion: r.app_version || null,
+        lastSyncAt: r.last_sync_at ?? null,
+        revoked: !!r.revoked,
+        isCurrent: !!r.is_current,
+        updatedAt: r.updated_at ?? null,
+        status,
+      }
+    })
+  }
+
+  resolveDeviceId(deviceId = null) {
+    const devices = this.listCloudDevices()
+    if (!devices.length) return 'local'
+    const raw = deviceId || this.getCloudSync().selectedDevice || 'account'
+    if (raw === 'account' || raw === 'local') return raw
+    if (devices.some((d) => d.id === raw)) return raw
+    return 'account'
+  }
+
+  getDeviceViewState() {
+    const devices = this.listCloudDevices()
+    const selectedDevice = this.resolveDeviceId()
+    const cur = devices.find((d) => d.isCurrent) || null
+    return {
+      selectedDevice,
+      hasCloudData: devices.length > 0,
+      currentKeyId: cur?.id || null,
+      devices: devices.map(({ status, ...rest }) => rest),
+    }
+  }
+
+  setSelectedDevice(deviceId) {
+    this.getCloudSync()
+    const next = this.resolveDeviceId(deviceId)
+    this.db.run('UPDATE cloud_sync SET selected_device = ? WHERE id = 1', [next])
+    this.persist()
+    return this.getDeviceViewState()
+  }
+
+  // Server-level sources (cursor.com account data and LiteLLM proxy polling)
+  // report identical account-wide numbers on every device where they're enabled.
+  // In the merged 'account' view, only the most recently synced non-revoked
+  // device that has rows for that source is counted — identical to tokenstat-web.
+  cloudServerSourceOwners() {
+    const rows = this.rows(
+      `SELECT DISTINCT h.cli, h.key_id, COALESCE(d.last_sync_at, 0) AS synced
+       FROM cloud_usage_hourly h
+       JOIN cloud_devices d ON d.id = h.key_id
+       WHERE d.revoked = 0
+       ORDER BY synced DESC`
+    )
+    const owners = new Map()
+    for (const r of rows) {
+      if (isServerSourceCli(r.cli) && !owners.has(r.cli)) owners.set(r.cli, r.key_id)
+    }
+    return owners
+  }
+
+  // Deduplicated hourly rows for the selected device ('account', '<keyId>', or 'local').
+  cloudFilteredRows(deviceId = null, fromMs = null, toMs = null) {
+    const eff = this.resolveDeviceId(deviceId)
+    if (eff === 'local') {
+      const conds = []
+      const args = []
+      if (fromMs != null) { conds.push('hour >= ?'); args.push(fromMs) }
+      if (toMs != null) { conds.push('hour < ?'); args.push(toMs) }
+      const where = conds.length ? `WHERE ${conds.join(' AND ')}` : ''
+      return this.rows(
+        `SELECT hour, cli, model, input, output, cache_read, cache_create, reasoning, total, cost, turns
+         FROM usage_hourly ${where} ORDER BY hour`,
+        args
+      )
+    }
+
+    const conds = []
+    const args = []
+    if (eff !== 'account') { conds.push('key_id = ?'); args.push(eff) }
+    if (fromMs != null) { conds.push('hour >= ?'); args.push(fromMs) }
+    if (toMs != null) { conds.push('hour < ?'); args.push(toMs) }
+    const where = conds.length ? `WHERE ${conds.join(' AND ')}` : ''
+    const raw = this.rows(
+      `SELECT key_id, hour, cli, model, input, output, cache_read, cache_create, reasoning, total, cost, turns
+       FROM cloud_usage_hourly ${where} ORDER BY hour`,
+      args
+    )
+    if (eff !== 'account') return raw
+
+    const owners = this.cloudServerSourceOwners()
+    const merged = new Map()
+    for (const r of raw) {
+      if (!keepCloudRow(r, 'account', owners)) continue
+      const k = `${r.hour}|${r.cli}|${r.model}`
+      let b = merged.get(k)
+      if (!b) {
+        b = {
+          hour: r.hour,
+          cli: r.cli,
+          model: r.model,
+          input: 0,
+          output: 0,
+          cache_read: 0,
+          cache_create: 0,
+          reasoning: 0,
+          total: 0,
+          cost: 0,
+          turns: 0,
+        }
+        merged.set(k, b)
+      }
+      b.input += r.input || 0
+      b.output += r.output || 0
+      b.cache_read += r.cache_read || 0
+      b.cache_create += r.cache_create || 0
+      b.reasoning += r.reasoning || 0
+      b.total += r.total || 0
+      b.cost += r.cost || 0
+      b.turns += r.turns || 0
+    }
+    return [...merged.values()].sort((a, b) => a.hour - b.hour)
+  }
+
+  // Synthetic record objects from cloudFilteredRows for subscription cycle /
+  // plan breakdown / timeline calculations when viewing 'account' or a remote device.
+  recordsForDevice(deviceId = null) {
+    return this.cloudFilteredRows(deviceId).map((r) => ({
+      ts: r.hour,
+      hour: r.hour,
+      cli: r.cli,
+      model: r.model,
+      input: r.input || 0,
+      output: r.output || 0,
+      cacheRead: r.cache_read || 0,
+      cacheCreate: r.cache_create || 0,
+      reasoning: r.reasoning || 0,
+      total: r.total || 0,
+      cost: r.cost || 0,
+      turns: r.turns || 1,
+      sessionId: 'cloud',
+      project: r.cli,
+    }))
+  }
+
+  // Exact replica of tokenstat-web/src/lib/usage.js#totalsSince so the desktop
+  // client's 日/周/月/全 numbers match the cloud web dashboard 100%.
+  cloudTotalsSince(fromMs, deviceId = null, owners = null) {
+    const eff = this.resolveDeviceId(deviceId)
+    const HOUR_MS = 3600 * 1000
+    const firstHour = Math.floor(fromMs / HOUR_MS) * HOUR_MS
+    const headFrac = fromMs > 0 ? 1 - (fromMs - firstHour) / HOUR_MS : 1
+
+    let rows
+    if (eff === 'local') {
+      rows = this.rows(
+        `SELECT 'local' AS key_id, hour, cli, model, input, output, cache_read, cache_create, reasoning, total, cost, turns
+         FROM usage_hourly WHERE hour >= ?`,
+        [firstHour]
+      )
+    } else if (eff === 'account') {
+      rows = this.rows(
+        `SELECT key_id, hour, cli, model, input, output, cache_read, cache_create, reasoning, total, cost, turns
+         FROM cloud_usage_hourly WHERE hour >= ?`,
+        [firstHour]
+      )
+    } else {
+      rows = this.rows(
+        `SELECT key_id, hour, cli, model, input, output, cache_read, cache_create, reasoning, total, cost, turns
+         FROM cloud_usage_hourly WHERE key_id = ? AND hour >= ?`,
+        [eff, firstHour]
+      )
+    }
+
+    const effOwners = eff === 'account' ? (owners || this.cloudServerSourceOwners()) : null
+    const blankBucket = () => ({
+      input: 0,
+      output: 0,
+      cacheRead: 0,
+      cacheCreate: 0,
+      reasoning: 0,
+      total: 0,
+      cost: 0,
+      turns: 0,
+      count: 0,
+    })
+    const perCli = {}
+    const perModel = {}
+    const total = blankBucket()
+
+    for (const r of rows) {
+      if (eff === 'account' && !keepCloudRow(r, 'account', effOwners)) continue
+      const w = fromMs > 0 && r.hour === firstHour ? headFrac : 1
+      addWeightedBucket(total, r, w)
+      addWeightedBucket((perCli[r.cli] ||= blankBucket()), r, w)
+      const mk = `${r.cli}|${r.model}`
+      const mb = (perModel[mk] ||= { cli: r.cli, model: r.model, ...blankBucket() })
+      addWeightedBucket(mb, r, w)
+    }
+    roundWeightedBucket(total)
+    for (const b of Object.values(perCli)) roundWeightedBucket(b)
+    for (const b of Object.values(perModel)) roundWeightedBucket(b)
+    return {
+      fromMs,
+      perCli,
+      perModel: Object.values(perModel).sort((a, b) => b.total - a.total),
+      total,
+    }
+  }
+
+  // Cloud-consistent overview for the tray popup when viewing 'account' (all
+  // devices merged) or a specific synced device.
+  cloudOverview(deviceId = null, now = Date.now()) {
+    const viewState = this.getDeviceViewState()
+    const eff = deviceId ? this.resolveDeviceId(deviceId) : viewState.selectedDevice
+    if (!viewState.hasCloudData || eff === 'local') return null
+
+    const owners = eff === 'account' ? this.cloudServerSourceOwners() : null
+    const ranges = {
+      dayStart: now - 24 * 3600 * 1000,
+      weekStart: now - 7 * 24 * 3600 * 1000,
+      monthStart: now - 30 * 24 * 3600 * 1000,
+    }
+    const dayScope = this.cloudTotalsSince(ranges.dayStart, eff, owners)
+    const weekScope = this.cloudTotalsSince(ranges.weekStart, eff, owners)
+    const monthScope = this.cloudTotalsSince(ranges.monthStart, eff, owners)
+    const allScope = this.cloudTotalsSince(0, eff, owners)
+
+    const devices = this.listCloudDevices()
+    const status =
+      eff === 'account'
+        ? mergeCloudStatus(devices.filter((d) => !d.revoked && d.status))
+        : devices.find((d) => d.id === eff)?.status || null
+
+    const providerMap = new Map()
+    for (const p of this.listLitellmProviders()) {
+      if (p.enabled) providerMap.set('litellm:' + p.id, { id: 'litellm:' + p.id, label: p.name, color: p.color })
+    }
+    for (const [cliId, meta] of Object.entries(status?.cliMeta || {})) {
+      if (cliId.startsWith('litellm:') && !providerMap.has(cliId)) {
+        providerMap.set(cliId, { id: cliId, label: meta.label || cliId, color: meta.color || '#f59e0b' })
+      }
+    }
+
+    const normalizedResets = (status?.resets || []).map((r) => {
+      const bindings =
+        Array.isArray(r.bindings) && r.bindings.length
+          ? r.bindings
+          : (r.clis || []).map((cli) => ({ cli, models: null }))
+      return {
+        ...r,
+        name: r.planName || r.name || 'Plan',
+        planName: r.planName || r.name || 'Plan',
+        monthlyUsd: Number(r.monthlyUsd) || 0,
+        bindings,
+        windows: (r.windows || []).map((w) => {
+          const period = w.period || (w.label === '5小时' || w.label === '5h' ? '5h' : w.label === '每周' || w.label === 'wk' ? 'weekly' : w.label === '每月' || w.label === 'mo' ? 'monthly' : w.label)
+          const periodMs =
+            w.periodMs ||
+            (period === '5h' ? 5 * 3600 * 1000 : period === 'weekly' ? 7 * 86400 * 1000 : period === 'monthly' ? 30 * 86400 * 1000 : 0)
+          const rem = w.remainingPercent ?? w.remainingPct ?? 0
+          return {
+            ...w,
+            source: 'live',
+            open: true,
+            period,
+            periodMs,
+            end: w.end ?? w.endMs ?? null,
+            endMs: w.endMs ?? w.end ?? null,
+            remainingPercent: rem,
+            remainingPct: rem,
+            usedPercent: w.usedPercent ?? Math.max(0, 100 - rem),
+            tokens: w.tokens || 0,
+            cost: w.cost || 0,
+          }
+        }),
+        renewal: r.renewal
+          ? {
+              ...r.renewal,
+              end: r.renewal.end ?? r.renewal.endMs ?? null,
+              endMs: r.renewal.endMs ?? r.renewal.end ?? null,
+              periodMs: r.renewal.periodMs || 30 * 86400 * 1000,
+              cost: r.renewal.cost || 0,
+              tokens: r.renewal.tokens || 0,
+            }
+          : null,
+      }
+    })
+
+    return {
+      generatedAt: now,
+      isCloudOverview: true,
+      selectedDevice: eff,
+      deviceView: { ...viewState, selectedDevice: eff },
+      ranges,
+      totals: {
+        all: allScope.total,
+        today: dayScope.total,
+        week: weekScope.total,
+        month: monthScope.total,
+      },
+      perCli: allScope.perCli,
+      todayPerCli: dayScope.perCli,
+      weekPerCli: weekScope.perCli,
+      monthPerCli: monthScope.perCli,
+      perModel: allScope.perModel,
+      todayPerModel: dayScope.perModel,
+      weekPerModel: weekScope.perModel,
+      monthPerModel: monthScope.perModel,
+      providers: [...providerMap.values()],
+      cloudStatus: status,
+      cloudResets: normalizedResets,
+    }
+  }
+
   // ---- queries for the report ---------------------------------------------
 
   rows(sql, params = []) {
@@ -758,20 +1205,35 @@ export class UsageDb {
   }
 
   // Per-hour-per-model rows for one local day (dayStart = local midnight ms).
-  hourly(dayStartMs) {
+  hourly(dayStartMs, deviceId = null) {
     const end = dayStartMs + 24 * 3600 * 1000
-    return this.rows(
-      'SELECT hour, cli, model, total, cost, turns FROM usage_hourly WHERE hour >= ? AND hour < ? ORDER BY hour',
-      [dayStartMs, end]
-    )
+    const eff = this.resolveDeviceId(deviceId)
+    if (eff === 'local') {
+      return this.rows(
+        'SELECT hour, cli, model, total, cost, turns FROM usage_hourly WHERE hour >= ? AND hour < ? ORDER BY hour',
+        [dayStartMs, end]
+      )
+    }
+    return this.cloudFilteredRows(eff, dayStartMs, end).map((r) => ({
+      hour: r.hour,
+      cli: r.cli,
+      model: r.model,
+      total: r.total,
+      cost: r.cost,
+      turns: r.turns,
+    }))
   }
 
   // Per-day-per-cli totals across a range (for the trend chart).
-  daily(fromMs, toMs) {
-    const rows = this.rows(
-      'SELECT hour, cli, SUM(total) AS total, SUM(cost) AS cost, SUM(turns) AS turns FROM usage_hourly WHERE hour >= ? AND hour < ? GROUP BY hour, cli',
-      [fromMs, toMs]
-    )
+  daily(fromMs, toMs, deviceId = null) {
+    const eff = this.resolveDeviceId(deviceId)
+    const rows =
+      eff === 'local'
+        ? this.rows(
+            'SELECT hour, cli, SUM(total) AS total, SUM(cost) AS cost, SUM(turns) AS turns FROM usage_hourly WHERE hour >= ? AND hour < ? GROUP BY hour, cli',
+            [fromMs, toMs]
+          )
+        : this.cloudFilteredRows(eff, fromMs, toMs)
     // collapse hours into local days
     const byDay = new Map()
     for (const r of rows) {
@@ -787,17 +1249,37 @@ export class UsageDb {
   }
 
   // Per-model totals across a range (for the breakdown table / pie).
-  models(fromMs, toMs) {
-    return this.rows(
-      'SELECT cli, model, SUM(total) AS total, SUM(cost) AS cost, SUM(turns) AS turns FROM usage_hourly WHERE hour >= ? AND hour < ? GROUP BY cli, model ORDER BY total DESC',
-      [fromMs, toMs]
-    )
+  models(fromMs, toMs, deviceId = null) {
+    const eff = this.resolveDeviceId(deviceId)
+    if (eff === 'local') {
+      return this.rows(
+        'SELECT cli, model, SUM(total) AS total, SUM(cost) AS cost, SUM(turns) AS turns FROM usage_hourly WHERE hour >= ? AND hour < ? GROUP BY cli, model ORDER BY total DESC',
+        [fromMs, toMs]
+      )
+    }
+    const rows = this.cloudFilteredRows(eff, fromMs, toMs)
+    const byModel = new Map()
+    for (const r of rows) {
+      const k = `${r.cli}|${r.model}`
+      const cur = byModel.get(k) || { cli: r.cli, model: r.model, total: 0, cost: 0, turns: 0 }
+      cur.total += r.total || 0
+      cur.cost += r.cost || 0
+      cur.turns += r.turns || 0
+      byModel.set(k, cur)
+    }
+    return [...byModel.values()].sort((a, b) => b.total - a.total)
   }
 
   // Earliest recorded hour (for default ranges / "since" label).
-  span() {
-    const r = this.rows('SELECT MIN(hour) AS min, MAX(hour) AS max FROM usage_hourly')[0]
-    return { min: r?.min ?? null, max: r?.max ?? null }
+  span(deviceId = null) {
+    const eff = this.resolveDeviceId(deviceId)
+    if (eff === 'local') {
+      const r = this.rows('SELECT MIN(hour) AS min, MAX(hour) AS max FROM usage_hourly')[0]
+      return { min: r?.min ?? null, max: r?.max ?? null }
+    }
+    const rows = this.cloudFilteredRows(eff)
+    if (!rows.length) return { min: null, max: null }
+    return { min: rows[0].hour, max: rows[rows.length - 1].hour }
   }
 }
 
@@ -880,5 +1362,63 @@ function mapSubscriptionRow(r) {
     resetAnchors: parseResetAnchors(r.reset_anchors),
     createdAt: r.created_at,
     updatedAt: r.updated_at,
+  }
+}
+
+function isServerSourceCli(cli) {
+  return cli === 'cursor' || (typeof cli === 'string' && cli.startsWith('litellm:'))
+}
+
+function keepCloudRow(r, deviceId, owners) {
+  if (deviceId && deviceId !== 'account') return r.key_id === deviceId
+  if (isServerSourceCli(r.cli)) return owners.get(r.cli) === r.key_id
+  return true
+}
+
+function addWeightedBucket(b, r, w = 1) {
+  b.input += (r.input || 0) * w
+  b.output += (r.output || 0) * w
+  b.cacheRead += (r.cache_read || 0) * w
+  b.cacheCreate += (r.cache_create || 0) * w
+  b.reasoning += (r.reasoning || 0) * w
+  b.total += (r.total || 0) * w
+  b.cost += (r.cost || 0) * w
+  b.turns += (r.turns || 0) * w
+  b.count += (r.turns || 0) * w
+}
+
+function roundWeightedBucket(b) {
+  b.input = Math.round(b.input)
+  b.output = Math.round(b.output)
+  b.cacheRead = Math.round(b.cacheRead)
+  b.cacheCreate = Math.round(b.cacheCreate)
+  b.reasoning = Math.round(b.reasoning)
+  b.total = Math.round(b.total)
+  b.cost = Math.round(b.cost * 100) / 100
+  b.turns = Math.round(b.turns)
+  b.count = Math.round(b.count)
+}
+
+const FALLBACK_MAX_AGE_MS = 30 * 24 * 3600 * 1000
+
+function mergeCloudStatus(devicesWithStatus) {
+  if (!devicesWithStatus.length) return null
+  const sorted = [...devicesWithStatus].sort((a, b) => (a.updatedAt || 0) - (b.updatedAt || 0))
+  const cliMeta = {}
+  for (const d of sorted) Object.assign(cliMeta, d.status?.cliMeta || {})
+  const newest = sorted[sorted.length - 1]
+  const cutoff = (newest.updatedAt || 0) - FALLBACK_MAX_AGE_MS
+  const newestWith = (field) =>
+    [...sorted]
+      .reverse()
+      .find((d) => (d.updatedAt || 0) >= cutoff && Array.isArray(d.status?.[field]) && d.status[field].length) || null
+  const resetsSrc = newestWith('resets')
+  return {
+    updatedAt: newest.updatedAt,
+    appVersion: newest.status?.appVersion || newest.appVersion || null,
+    cliMeta,
+    resets: resetsSrc?.status?.resets || [],
+    plans: newestWith('plans')?.status?.plans || [],
+    resetsTz: resetsSrc?.tz || null,
   }
 }

@@ -201,6 +201,7 @@ export async function performSync({
     // last batch so the web's "synced at" only flips once everything landed.
     let sent = 0
     let subscriptionSync = null
+    let accountSync = null
     for (let i = 0; i < Math.max(1, Math.ceil(rows.length / ROWS_PER_BATCH)); i++) {
       const batch = rows.slice(i * ROWS_PER_BATCH, (i + 1) * ROWS_PER_BATCH)
       const last = (i + 1) * ROWS_PER_BATCH >= rows.length
@@ -214,6 +215,7 @@ export async function performSync({
           status: last ? status : null,
           ...(last
             ? {
+                includeAccount: true,
                 subscriptions,
                 baseSubscriptionsHash: cfg.subsBaseHash || null,
                 resolveSubscriptionsStrategy: resolveSubscriptionsStrategy || null,
@@ -223,6 +225,11 @@ export async function performSync({
       })
       sent += data.accepted || 0
       if (last && data.subscriptionSync) subscriptionSync = data.subscriptionSync
+      if (last && data.accountSync) accountSync = data.accountSync
+    }
+
+    if (accountSync) {
+      db.saveCloudAccountSync(accountSync)
     }
 
     let pulledSubscriptions = false
@@ -248,10 +255,25 @@ export async function performSync({
     }
 
     db.updateCloudSyncState(syncPatch)
-    return { ok: true, sent, full, subscriptionSync, pulledSubscriptions }
+    return { ok: true, sent, full, subscriptionSync, pulledSubscriptions, pulledAccount: !!accountSync }
   } catch (e) {
     const msg = e.name === 'AbortError' ? 'timeout' : String(e.message || e)
     db.updateCloudSyncState({ lastError: msg }) // flag untouched — a failed full pass retries full
     return { ok: false, error: msg }
+  }
+}
+
+export async function pullCloudAccount({ db }) {
+  const cfg = db.getCloudSync()
+  if (!cfg.enabled || !cfg.apiKey || !cfg.endpoint) return { ok: false, skipped: true }
+  try {
+    const data = await request(cfg.endpoint, '/api/account', { apiKey: cfg.apiKey })
+    if (data?.accountSync) {
+      db.saveCloudAccountSync(data.accountSync)
+      return { ok: true, accountSync: data.accountSync }
+    }
+    return { ok: false, error: 'no accountSync returned' }
+  } catch (e) {
+    return { ok: false, error: e.name === 'AbortError' ? 'timeout' : String(e.message || e) }
   }
 }

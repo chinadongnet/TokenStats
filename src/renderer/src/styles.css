@@ -45,8 +45,30 @@ header {
    kept compact so they fit beside the brand at 380px. */
 .hwin { display: flex; align-items: center; gap: 2px; }
 /* Hairline divider between the scope segment and the icon toolbar. */
-.hwin .seg { margin-right: 6px; padding-right: 0; }
-.hwin .seg button { padding: 4px 9px; font-size: 11px; }
+.hwin .seg { margin-right: 4px; padding-right: 0; }
+.hwin .seg button { padding: 4px 7px; font-size: 11px; }
+
+/* Multi-device switcher strip below the popup header */
+.devbar {
+  display: flex; align-items: center; gap: 4px;
+  padding: 5px 10px; border-bottom: 1px solid var(--line);
+  background: rgba(22, 24, 31, 0.65); overflow-x: auto; flex: none;
+}
+.devbar::-webkit-scrollbar { height: 0; }
+.devbar button {
+  display: inline-flex; align-items: center; gap: 4px;
+  background: transparent; border: 1px solid transparent; color: var(--muted);
+  padding: 3px 8px; border-radius: 6px; font-size: 11px; cursor: pointer;
+  white-space: nowrap; transition: background .12s ease, color .12s ease, border-color .12s ease;
+}
+.devbar button:hover { background: var(--panel2); color: var(--text); }
+.devbar button.on {
+  background: var(--panel2); color: var(--text); border-color: var(--line); font-weight: 600;
+}
+.curdot {
+  display: inline-block; width: 6px; height: 6px; border-radius: 50%;
+  background: var(--ok); margin-right: 3px; vertical-align: middle;
+}
 .logo {
   width: 16px; height: 16px; border-radius: 5px;
   background: linear-gradient(135deg, var(--accent), #10a37f 60%, #4285f4);

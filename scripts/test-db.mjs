@@ -52,5 +52,32 @@ for (const m of db.models(0, Date.now() + 864e5).slice(0, 6)) {
   console.log((m.model || '?').padEnd(28) + ' ' + (m.cli || '').padEnd(7) + ' ' + fmt(m.total).padStart(14))
 }
 
+// Verify multi-device cloud account sync & server-source deduplication
+const nowHour = Math.floor(Date.now() / 3600000) * 3600000
+db.saveCloudAccountSync({
+  currentKeyId: 'dev-1',
+  devices: [
+    { id: 'dev-1', name: 'PC-1', lastSyncAt: 2000, revoked: false, isCurrent: true },
+    { id: 'dev-2', name: 'PC-2', lastSyncAt: 1000, revoked: false, isCurrent: false },
+  ],
+  snapshots: [],
+  hours: [
+    { keyId: 'dev-1', hour: nowHour, cli: 'codex', model: 'gpt-5', input: 100, output: 50, total: 150, cost: 1.5, turns: 1 },
+    { keyId: 'dev-2', hour: nowHour, cli: 'codex', model: 'gpt-5', input: 200, output: 100, total: 300, cost: 3.0, turns: 2 },
+    // cursor is a server-level source -> only dev-1 (newest lastSyncAt) should be counted in 'account'
+    { keyId: 'dev-1', hour: nowHour, cli: 'cursor', model: 'claude-4', input: 500, output: 500, total: 1000, cost: 5.0, turns: 5 },
+    { keyId: 'dev-2', hour: nowHour, cli: 'cursor', model: 'claude-4', input: 500, output: 500, total: 1000, cost: 5.0, turns: 5 },
+  ],
+})
+const accOv = db.cloudOverview('account')
+if (accOv.totals.all.total !== 1450) {
+  throw new Error(`Expected merged account total 1450, got ${accOv.totals.all.total}`)
+}
+const dev2Ov = db.cloudOverview('dev-2')
+if (dev2Ov.totals.all.total !== 1300) {
+  throw new Error(`Expected dev-2 total 1300, got ${dev2Ov.totals.all.total}`)
+}
+console.log('multi-device account overview verified: account=1450, dev-2=1300')
+
 fs.rmSync(dbPath, { force: true })
 console.log('\nOK (temp db removed)')
