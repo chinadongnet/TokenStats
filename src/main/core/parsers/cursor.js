@@ -1,6 +1,8 @@
+import fs from 'node:fs'
 import fsp from 'node:fs/promises'
 import path from 'node:path'
-import { CLI_ROOTS } from '../paths.js'
+import initSqlJs from 'sql.js'
+import { CLI_ROOTS, CONFIG_DIR } from '../paths.js'
 
 // Cursor's IDE keeps a local chat/composer db (state.vscdb, table cursorDiskKV)
 // but — verified 2026-07 by raw-scanning the whole db + WAL for token fields —
@@ -38,13 +40,44 @@ import { CLI_ROOTS } from '../paths.js'
 // it). Successful requests use a 20-second minimum interval; HTTP 403/429
 // backs off for 15 minutes while keeping the previously archived records.
 
-function decodeJwt(token) {
+function decodeJwtPart(segment) {
   try {
-    const [, payloadB64] = token.split('.')
-    return JSON.parse(Buffer.from(payloadB64, 'base64url').toString('utf8'))
+    return JSON.parse(Buffer.from(segment, 'base64url').toString('utf8'))
   } catch {
     return null
   }
+}
+
+function decodeJwt(token) {
+  const parts = String(token || '').split('.')
+  if (parts.length < 3) return null
+  return decodeJwtPart(parts[1])
+}
+
+// SQLite B-tree leaf cells pack the next cell's varint header (payload_size,
+// rowid) immediately after the previous cell's value with no delimiter. When
+// those varint bytes happen to fall in [A-Za-z0-9_-] (e.g. 0x33 0x74 = "3t"),
+// a greedy regex appends them to the JWT signature and cursor.com returns 401.
+// HS256 (32-byte HMAC-SHA256) signatures are always 43 base64url chars.
+function normalizeJwt(rawToken) {
+  const parts = String(rawToken || '').split('.')
+  if (parts.length !== 3) return null
+  const header = decodeJwtPart(parts[0])
+  const payload = decodeJwtPart(parts[1])
+  if (!payload?.sub) return null
+  let sig = parts[2]
+  if (header?.alg === 'HS256' && sig.length > 43) {
+    sig = sig.slice(0, 43)
+  }
+  return `${parts[0]}.${parts[1]}.${sig}`
+}
+
+function isTokenExpired(payload, nowMs = Date.now()) {
+  return Boolean(payload?.exp && payload.exp * 1000 <= nowMs)
+}
+
+function tokenTimestamp(payload) {
+  return Number(payload?.time) || Number(payload?.iat) || Number(payload?.exp) || 0
 }
 
 // Cursor's SQLite database can become enormous (multi-gigabyte on active
@@ -56,18 +89,56 @@ function decodeJwt(token) {
 const ACCESS_TOKEN_KEY = Buffer.from('cursorAuth/accessToken')
 const TOKEN_LOOKAHEAD = 2048
 const TOKEN_SCAN_CHUNK = 256 * 1024
-const TOKEN_SCAN_LIMIT = 256 * 1024 * 1024
-const JWT_RE = /eyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+/g
+const TOKEN_SCAN_LIMIT = 512 * 1024 * 1024
+const DIRECT_JWT_RE = /^[\x00-\x20"']*(eyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+)/
 
-export async function readAccessToken(file) {
-  const handle = await fsp.open(file, 'r')
+function extractCandidateFromBlock(block, keyAt) {
+  const valueStart = keyAt + ACCESS_TOKEN_KEY.length
+  // In SQLite's ItemTable record format, the 22-byte key 'cursorAuth/accessToken'
+  // has serial type 57 (0x39 = 22 * 2 + 13), followed by the value column's
+  // serial-type varint. Index B-tree pages follow 0x39 with a small integer
+  // serial type (< 13) for the rowid and carry no JWT value at all.
+  if (keyAt >= 2 && block[keyAt - 2] === 0x39 && (block[keyAt - 1] & 0x80) === 0) {
+    const serial = block[keyAt - 1]
+    if (serial < 13) return null
+  }
+  if (keyAt >= 3 && block[keyAt - 3] === 0x39 && (block[keyAt - 2] & 0x80) !== 0 && (block[keyAt - 1] & 0x80) === 0) {
+    const serial = ((block[keyAt - 2] & 0x7f) << 7) | block[keyAt - 1]
+    if (serial >= 13 && (serial - 13) % 2 === 0) {
+      const exactLen = (serial - 13) / 2
+      if (exactLen >= 32 && exactLen <= TOKEN_LOOKAHEAD && valueStart + exactLen <= block.length) {
+        const exactText = block.subarray(valueStart, valueStart + exactLen).toString('latin1')
+        const m = exactText.match(DIRECT_JWT_RE)
+        if (m) {
+          const tok = normalizeJwt(m[1])
+          if (tok) return tok
+        }
+      }
+    }
+  }
+  const text = block.subarray(valueStart, Math.min(block.length, valueStart + TOKEN_LOOKAHEAD)).toString('latin1')
+  const match = text.match(DIRECT_JWT_RE)
+  if (!match) return null
+  return normalizeJwt(match[1])
+}
+
+async function scanFileForToken(file, { scanAll = false } = {}) {
+  let handle
+  try {
+    handle = await fsp.open(file, 'r')
+  } catch {
+    return null
+  }
   try {
     const stat = await handle.stat()
     const limit = Math.min(stat.size, TOKEN_SCAN_LIMIT)
     const chunk = Buffer.allocUnsafe(TOKEN_SCAN_CHUNK)
-    const overlapSize = ACCESS_TOKEN_KEY.length + TOKEN_LOOKAHEAD
+    const overlapSize = ACCESS_TOKEN_KEY.length + TOKEN_LOOKAHEAD + 8
     let overlap = Buffer.alloc(0)
     let position = 0
+    let bestValid = null
+    let bestValidTs = -Infinity
+    let expiredFallback = null
 
     while (position < limit) {
       const length = Math.min(chunk.length, limit - position)
@@ -82,10 +153,24 @@ export async function readAccessToken(file) {
         const keyAt = block.indexOf(ACCESS_TOKEN_KEY, from)
         if (keyAt < 0) break
         const valueStart = keyAt + ACCESS_TOKEN_KEY.length
-        const text = block.subarray(valueStart, Math.min(block.length, valueStart + TOKEN_LOOKAHEAD)).toString('latin1')
-        for (const match of text.matchAll(JWT_RE)) {
-          const token = match[0]
-          if (decodeJwt(token)?.sub) return token
+        // If the key is too close to the end of a non-final chunk, wait for the
+        // next chunk's overlap so a split JWT is never truncated mid-token.
+        if (position + bytesRead < limit && block.length - valueStart < TOKEN_LOOKAHEAD) break
+        const token = extractCandidateFromBlock(block, keyAt)
+        if (token) {
+          const payload = decodeJwt(token)
+          if (payload?.sub) {
+            if (!isTokenExpired(payload)) {
+              if (!scanAll) return token
+              const ts = tokenTimestamp(payload)
+              if (ts >= bestValidTs) {
+                bestValid = token
+                bestValidTs = ts
+              }
+            } else {
+              expiredFallback = token
+            }
+          }
         }
         from = valueStart
       }
@@ -93,10 +178,20 @@ export async function readAccessToken(file) {
       overlap = Buffer.from(block.subarray(Math.max(0, block.length - overlapSize)))
       position += bytesRead
     }
-    return null
+    return bestValid || expiredFallback
   } finally {
     await handle.close()
   }
+}
+
+export async function readAccessToken(file) {
+  // Check the WAL first: when Cursor refreshes its auth session while running,
+  // the new ItemTable page lands in state.vscdb-wal before checkpointing to
+  // state.vscdb. WAL frames are append-only, so scanAll picks the newest one.
+  const walToken = await scanFileForToken(file + '-wal', { scanAll: true })
+  if (walToken && !isTokenExpired(decodeJwt(walToken))) return walToken
+  const dbToken = await scanFileForToken(file, { scanAll: false })
+  return dbToken || walToken
 }
 
 // Minimal CSV line parser. The export quotes data-row fields ("a","b") but
@@ -173,15 +268,85 @@ export function parseUsageCsv(text) {
   return records
 }
 
+// Wrap both fetch() and body reading (.text()/.json()) in an explicit timer race.
+// In Node/Electron undici, AbortSignal.timeout() can fail to reject a stalled body
+// stream, which would otherwise wedge single-flight locks (entry.inFlight) forever.
+async function fetchWithTimeout(url, options, timeoutMs, readBody = 'text') {
+  const ctrl = new AbortController()
+  let timer = null
+  const timeoutPromise = new Promise((_, reject) => {
+    timer = setTimeout(() => {
+      ctrl.abort()
+      const err = new Error(`Cursor request timed out after ${timeoutMs}ms`)
+      err.code = 'ETIMEDOUT'
+      reject(err)
+    }, timeoutMs)
+  })
+  try {
+    return await Promise.race([
+      (async () => {
+        const res = await fetch(url, { ...options, signal: ctrl.signal })
+        if (!res.ok) throw Object.assign(new Error(`cursor usage HTTP ${res.status}`), { status: res.status })
+        const body = readBody === 'json' ? await res.json() : await res.text()
+        if (ctrl.signal.aborted) throw new Error('Cursor response aborted on timeout')
+        return body
+      })(),
+      timeoutPromise,
+    ])
+  } finally {
+    if (timer) clearTimeout(timer)
+  }
+}
+
+async function fetchUsageCsvRange(cookie, startDate, endDate, timeoutMs = 20000) {
+  const url = `https://cursor.com/api/dashboard/export-usage-events-csv?startDate=${startDate}&endDate=${endDate}&strategy=tokens`
+  let lastErr = null
+  for (let attempt = 0; attempt < 2; attempt++) {
+    try {
+      const text = await fetchWithTimeout(url, { headers: { Cookie: cookie, Accept: 'text/csv,*/*' } }, timeoutMs, 'text')
+      return parseUsageCsv(text)
+    } catch (err) {
+      lastErr = err
+      if ([401, 403, 429].includes(err?.status) || err?.code === 'ETIMEDOUT') break
+    }
+  }
+  throw lastErr
+}
+
+async function fetchUsageCsvChunks(cookie, startDate, endDate, chunkMs = 3 * 86400000) {
+  const byKey = new Map()
+  for (let cursorMs = startDate; cursorMs < endDate; cursorMs += chunkMs) {
+    const chunkEnd = Math.min(endDate, cursorMs + chunkMs)
+    const rows = await fetchUsageCsvRange(cookie, cursorMs, chunkEnd, 25000)
+    for (const r of rows) {
+      if (r.ts >= startDate && r.ts <= endDate) byKey.set(r.dedupKey, r)
+    }
+  }
+  return [...byKey.values()].sort((a, b) => a.ts - b.ts)
+}
+
 async function fetchUsageCsv(token, fromMs = 0) {
   const payload = decodeJwt(token)
   if (!payload?.sub || (payload.exp && payload.exp * 1000 < Date.now())) throw new Error('Cursor session expired; sign in again')
   const userId = String(payload.sub).split('|').pop()
   const cookie = `WorkosCursorSessionToken=${encodeURIComponent(userId + '::' + token)}`
-  const url = `https://cursor.com/api/dashboard/export-usage-events-csv?startDate=${fromMs}&endDate=${Date.now()}&strategy=tokens`
-  const res = await fetch(url, { headers: { Cookie: cookie, Accept: 'text/csv,*/*' }, signal: AbortSignal.timeout(fromMs ? 20000 : 60000) })
-  if (!res.ok) throw Object.assign(new Error(`cursor usage export HTTP ${res.status}`), { status: res.status })
-  return parseUsageCsv(await res.text())
+  const endDate = Date.now()
+  const spanMs = fromMs > 0 ? endDate - fromMs : Infinity
+  const initialTimeoutMs = fromMs === 0 || spanMs > 5 * 86400000 ? 15000 : 25000
+  try {
+    return await fetchUsageCsvRange(cookie, fromMs, endDate, initialTimeoutMs)
+  } catch (err) {
+    if ([401, 403, 429].includes(err?.status)) throw err
+    // Large multi-day or full-history CSV exports can time out on high-volume
+    // accounts (~3k events/day). Fall back to bounded 3-day chunks.
+    if (fromMs > 0 && spanMs > 86400000) {
+      return await fetchUsageCsvChunks(cookie, fromMs, endDate, 3 * 86400000)
+    }
+    if (fromMs === 0) {
+      return await fetchUsageCsvChunks(cookie, endDate - 30 * 86400000, endDate, 3 * 86400000)
+    }
+    throw err
+  }
 }
 
 // Cursor's monthly included-usage quota, from the same surface the dashboard's
@@ -212,17 +377,50 @@ async function fetchUsageSummary(token) {
   if (payload.exp && payload.exp * 1000 < Date.now()) return []
   const userId = String(payload.sub).split('|').pop()
   const cookie = `WorkosCursorSessionToken=${encodeURIComponent(userId + '::' + token)}`
-  const res = await fetch('https://cursor.com/api/usage-summary', { headers: { Cookie: cookie, Accept: 'application/json' }, signal: AbortSignal.timeout(10000) })
-  if (!res.ok) throw new Error(`cursor usage-summary HTTP ${res.status}`)
-  return parseUsageSummary(await res.json())
+  const json = await fetchWithTimeout(
+    'https://cursor.com/api/usage-summary',
+    { headers: { Cookie: cookie, Accept: 'application/json' } },
+    10000,
+    'json'
+  )
+  return parseUsageSummary(json)
 }
 
 const MIN_FETCH_INTERVAL_MS = 20 * 1000
-const cacheByUser = new Map() // userId -> { records, fetchedAt }
+const cacheByUser = new Map() // userId -> { records, fetchedAt, retryAt }
 let archive = {}
 export function configureCursorArchive(hooks) {
   archive = hooks || {}
   cacheByUser.clear()
+}
+
+export function forceRefreshCursor() {
+  for (const entry of cacheByUser.values()) {
+    entry.fetchedAt = 0
+    entry.retryAt = 0
+  }
+}
+
+let defaultSqlPromise = null
+async function loadDefaultArchive(userId) {
+  if (process.env.AIMON_CURSOR_ROOT || process.env.AIMON_CONFIG) return []
+  const dbPath = path.join(CONFIG_DIR, 'usage.sqlite')
+  if (!fs.existsSync(dbPath)) return []
+  try {
+    if (!defaultSqlPromise) defaultSqlPromise = initSqlJs()
+    const SQL = await defaultSqlPromise
+    const bytes = await fsp.readFile(dbPath)
+    const db = new SQL.Database(bytes)
+    try {
+      const res = db.exec('SELECT records_json FROM cursor_usage_archive WHERE user_id = ?', [userId])
+      const json = res[0]?.values?.[0]?.[0]
+      return json ? JSON.parse(json) : []
+    } finally {
+      db.close()
+    }
+  } catch {
+    return []
+  }
 }
 
 // Newest monthly quota window (used %, reset), refreshed on the same
@@ -236,14 +434,30 @@ export function cursorResetWindows() {
 async function getCloudRecords(token) {
   const payload = decodeJwt(token)
   const userId = payload?.sub ? String(payload.sub) : 'unknown'
-  const entry = cacheByUser.get(userId) || { records: archive.load?.(userId) || [], fetchedAt: 0, retryAt: 0 }
-  cacheByUser.set(userId, entry)
+  let entry = cacheByUser.get(userId)
+  if (!entry) {
+    const initialRecords = typeof archive.load === 'function'
+      ? (archive.load(userId) || [])
+      : await loadDefaultArchive(userId)
+    entry = { records: initialRecords, fetchedAt: 0, retryAt: 0 }
+    cacheByUser.set(userId, entry)
+  }
   if (entry.inFlight) return entry.inFlight
   if (Date.now() < entry.retryAt || Date.now() - entry.fetchedAt < MIN_FETCH_INTERVAL_MS) return entry.records
   entry.inFlight = (async () => {
-    // Replace recent complete hourly buckets and retain archived history. Small
-    // exports avoid downloading the account's entire lifetime on every tick.
-    const fromMs = entry.records.length ? Math.floor((Date.now() - 2 * 86400000) / 3600000) * 3600000 : 0
+    // Replace recent complete hourly buckets and retain archived history. When
+    // the local archive is more than 48h behind (e.g. PC was asleep or offline
+    // for several days), rewind fromMs to 2 hours before the newest archived
+    // cloud record so multi-day gaps are never skipped.
+    let latestCloudTs = 0
+    for (const r of entry.records) {
+      if (String(r.dedupKey || '').startsWith('cursor-cloud:') && r.ts > latestCloudTs) {
+        latestCloudTs = r.ts
+      }
+    }
+    const twoDaysAgo = Date.now() - 2 * 86400000
+    const resumeBase = latestCloudTs > 0 ? Math.min(twoDaysAgo, latestCloudTs - 2 * 3600000) : twoDaysAgo
+    const fromMs = entry.records.length ? Math.max(0, Math.floor(resumeBase / 3600000) * 3600000) : 0
     const [usage, summary] = await Promise.allSettled([fetchUsageCsv(token, fromMs), fetchUsageSummary(token)])
     if (usage.status === 'fulfilled') {
       const records = [...entry.records.filter((r) => r.ts < fromMs), ...usage.value]
@@ -256,8 +470,8 @@ async function getCloudRecords(token) {
       entry.retryAt = 0
     } else {
       const err = usage.reason
-      entry.retryAt = Date.now() + ([403, 429].includes(err.status) ? 15 * 60000 : MIN_FETCH_INTERVAL_MS)
-      console.warn('Cursor usage refresh failed; retaining history:', err.message)
+      entry.retryAt = Date.now() + ([403, 429].includes(err?.status) ? 15 * 60000 : MIN_FETCH_INTERVAL_MS)
+      console.warn('Cursor usage refresh failed; retaining history:', err?.message || err)
     }
     if (summary.status === 'fulfilled' && JSON.stringify(latestWindows) !== JSON.stringify(summary.value)) {
       latestWindows = summary.value
@@ -281,6 +495,7 @@ export const cursor = {
   // throttles real HTTP calls and applies rate-limit backoff.
   network: true,
   revision: 0,
+  forceRefresh: forceRefreshCursor,
   match: (file) => path.basename(file) === 'state.vscdb',
   async parseFile(file) {
     const token = await readAccessToken(file)

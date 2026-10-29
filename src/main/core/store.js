@@ -83,11 +83,11 @@ export class Store extends EventEmitter {
     )
   }
 
-  async ingestFile(file) {
+  async ingestFile(file, opts) {
     // Watch events, sweeps and manual refresh can target the same file. Never
     // tail one byte range twice or replace a newer parse with an older result.
     const previous = this._ingesting.get(file) || Promise.resolve()
-    const next = previous.catch(() => {}).then(() => this._ingestFile(file))
+    const next = previous.catch(() => {}).then(() => this._ingestFile(file, opts))
     this._ingesting.set(file, next)
     try {
       return await next
@@ -96,7 +96,7 @@ export class Store extends EventEmitter {
     }
   }
 
-  async _ingestFile(file) {
+  async _ingestFile(file, { force = false } = {}) {
     const parser = this.parserFor(file)
     if (!parser) return false
     let stat
@@ -122,7 +122,7 @@ export class Store extends EventEmitter {
       }
     }))
     const signature = sidecars.join('|') + (parser.signature ? await parser.signature(file) : '')
-    if (stat.mtimeMs === entry.mtimeMs && stat.size === entry.size && signature === entry.signature) return false
+    if (!force && stat.mtimeMs === entry.mtimeMs && stat.size === entry.size && signature === entry.signature) return false
 
     try {
       if (parser.kind === 'json') {
@@ -242,10 +242,11 @@ export class Store extends EventEmitter {
   // stat to force a re-parse (and thus a re-fetch). The parser self-throttles
   // actual HTTP calls and backs off on rate limits, so timer calls are cheap.
   // "Refresh now" is cheap. Returns true if any record set actually changed.
-  async refreshNetworkParsers() {
+  async refreshNetworkParsers({ force = false } = {}) {
     let changed = false
     for (const parser of PARSERS) {
       if (!parser.network) continue
+      if (force) parser.forceRefresh?.()
       for (const root of parser.roots) {
         for (const file of await walk(root, parser.match)) {
           const entry = this.files.get(file)
@@ -255,7 +256,7 @@ export class Store extends EventEmitter {
             entry.mtimeMs = 0
             entry.size = 0
           }
-          await this.ingestFile(file)
+          await this.ingestFile(file, { force: true })
           const after = JSON.stringify(this.files.get(file)?.records)
           if (after !== before || parser.revision !== beforeRevision) changed = true
         }

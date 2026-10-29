@@ -166,8 +166,14 @@ async function init() {
   })
   ipcMain.handle('devices:refresh', async () => {
     if (!db) return null
-    await pullCloudAccount({ db })
+    if (store) {
+      await store.scanAllLocal()
+      await store.refreshNetworkParsers({ force: true })
+      await Promise.all(store.pollers.map((p) => store.forcePoll(p.cli)))
+    }
     ingestNow()
+    await runCloudSync().catch(() => {})
+    broadcastSnapshot()
     broadcastDeviceView()
     return db.getDeviceViewState()
   })
@@ -915,7 +921,7 @@ function createTray() {
       { label: tray_t('cycles'), click: () => openCycles() },
       { label: tray_t('settings'), click: () => openSettings() },
       { type: 'separator' },
-      { label: tray_t('refresh'), click: async () => { await store.scanAll(); await store.refreshNetworkParsers(); await Promise.all(store.pollers.map((p) => store.forcePoll(p.cli))); broadcastSnapshot() } },
+      { label: tray_t('refresh'), click: async () => { await store.scanAllLocal(); await store.refreshNetworkParsers({ force: true }); await Promise.all(store.pollers.map((p) => store.forcePoll(p.cli))); ingestNow(); broadcastSnapshot() } },
       { label: tray_t('editSources'), click: () => { ensureConfigFile(); shell.openPath(CONFIG_FILE) } },
       { type: 'separator' },
       { label: tray_t('startAtLogin'), type: 'checkbox', checked: isAutoLaunch(), click: (item) => setAutoLaunch(item.checked) },

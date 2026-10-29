@@ -346,12 +346,14 @@ export default function App() {
   }
 
   async function refreshAll() {
-    if (deviceView?.hasCloudData && window.api.devicesRefresh) {
+    if (window.api.devicesRefresh) {
       await window.api.devicesRefresh()
     }
     const s = await window.api.getSnapshot()
     setSnap(s)
     if (s?.deviceView) setDeviceView(s.deviceView)
+    window.api.subsResets().then(setResets)
+    window.api.subsStats().then((r) => setSubStats(r || []))
   }
 
   async function resolveConflictQuick(strategy) {

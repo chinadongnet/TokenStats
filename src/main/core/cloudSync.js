@@ -39,22 +39,43 @@ export function normalizeEndpoint(raw) {
 
 async function request(endpoint, path, { method = 'GET', apiKey, body } = {}) {
   const ctrl = new AbortController()
-  const timer = setTimeout(() => ctrl.abort(), FETCH_TIMEOUT_MS)
+  let timer = null
+  const timeoutPromise = new Promise((_, reject) => {
+    timer = setTimeout(() => {
+      ctrl.abort()
+      const err = new Error('timeout')
+      err.name = 'AbortError'
+      reject(err)
+    }, FETCH_TIMEOUT_MS)
+  })
   try {
-    const res = await fetch(normalizeEndpoint(endpoint) + path, {
-      method,
-      headers: {
-        authorization: `Bearer ${apiKey}`,
-        ...(body ? { 'content-type': 'application/json' } : {}),
-      },
-      body: body ? JSON.stringify(body) : undefined,
-      signal: ctrl.signal,
-    })
-    const data = await res.json().catch(() => ({}))
-    if (!res.ok) throw new Error(data.error || `HTTP ${res.status}`)
-    return data
+    return await Promise.race([
+      (async () => {
+        const res = await fetch(normalizeEndpoint(endpoint) + path, {
+          method,
+          headers: {
+            authorization: `Bearer ${apiKey}`,
+            ...(body ? { 'content-type': 'application/json' } : {}),
+          },
+          body: body ? JSON.stringify(body) : undefined,
+          signal: ctrl.signal,
+        })
+        const data = await res.json().catch((err) => {
+          if (ctrl.signal.aborted || err?.name === 'AbortError') throw err
+          return {}
+        })
+        if (ctrl.signal.aborted) {
+          const err = new Error('timeout')
+          err.name = 'AbortError'
+          throw err
+        }
+        if (!res.ok) throw new Error(data.error || `HTTP ${res.status}`)
+        return data
+      })(),
+      timeoutPromise,
+    ])
   } finally {
-    clearTimeout(timer)
+    if (timer) clearTimeout(timer)
   }
 }
 
