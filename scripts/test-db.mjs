@@ -372,6 +372,29 @@ if (histAccOv.totals.all.total !== 300) {
   throw new Error(`Expected archived history (200) + recent deduplicated (100) = 300, got ${histAccOv.totals.all.total}`)
 }
 
+// Verify same LiteLLM daily bucket across fractional-hour UTC offsets (12:00 UTC vs 11:30 UTC in Asia/Kolkata) is not double-counted
+const noonUtc = Date.UTC(2026, 9, 29, 12, 0, 0)
+const kolkataFlooredUtc = Date.UTC(2026, 9, 29, 11, 30, 0)
+db.saveCloudAccountSync({
+  currentKeyId: 'dev-utc',
+  devices: [
+    { id: 'dev-utc', name: 'UTC-PC', lastSyncAt: 2000, revoked: false, isCurrent: true },
+    { id: 'dev-ist', name: 'Kolkata-PC', lastSyncAt: 1000, revoked: false, isCurrent: false },
+  ],
+  snapshots: [
+    { keyId: 'dev-utc', status: { cliMeta: { 'litellm:local-id': { label: 'Team Proxy', baseUrl: 'https://proxy.example.com/v1' } } } },
+    { keyId: 'dev-ist', status: { cliMeta: { 'litellm:remote-id': { label: 'Team Proxy', baseUrl: 'https://proxy.example.com/v1' } } } },
+  ],
+  hours: [
+    { keyId: 'dev-utc', hour: noonUtc, cli: 'litellm:local-id', model: 'gpt-4o', input: 50, output: 50, total: 100, cost: 1.0, turns: 1 },
+    { keyId: 'dev-ist', hour: kolkataFlooredUtc, cli: 'litellm:remote-id', model: 'gpt-4o', input: 50, output: 50, total: 100, cost: 1.0, turns: 1 },
+  ],
+})
+const crossTzFiltered = db.cloudFilteredRows('account').reduce((a, r) => a + r.total, 0)
+if (crossTzFiltered !== 100) {
+  throw new Error(`Expected 100 tokens across 12:00 UTC vs 11:30 UTC fractional-offset devices, got ${crossTzFiltered}`)
+}
+
 // Verify non-whole-hour timezone bucket weighting (e.g., 10:30 UTC bucket with 10:45 UTC cutoff -> 75%)
 const halfHourStart = Date.UTC(2026, 9, 29, 10, 30, 0)
 const quarterPastCutoff = Date.UTC(2026, 9, 29, 10, 45, 0)

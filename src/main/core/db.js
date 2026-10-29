@@ -1085,20 +1085,20 @@ export class UsageDb {
         devSpanByIdentity.set(idKey, devMap)
       }
       const prev = devMap.get(r.key_id)
-      const minH = Number(r.min_hour)
-      const maxH = Number(r.max_hour)
+      const minB = serverSourceBucketMs(r.min_hour)
+      const maxB = serverSourceBucketMs(r.max_hour)
       if (!prev) {
-        devMap.set(r.key_id, { keyId: r.key_id, minHour: minH, maxHour: maxH, synced: Number(r.synced) || 0 })
+        devMap.set(r.key_id, { keyId: r.key_id, minBucket: minB, maxBucket: maxB, synced: Number(r.synced) || 0 })
       } else {
-        if (minH < prev.minHour) prev.minHour = minH
-        if (maxH > prev.maxHour) prev.maxHour = maxH
+        if (minB < prev.minBucket) prev.minBucket = minB
+        if (maxB > prev.maxBucket) prev.maxBucket = maxB
       }
     }
 
-    // Build per-identity historical coverage segments: the freshest device owns
-    // [its minHour, +Infinity), and any older device whose archived history
-    // extends strictly earlier than the earliest covered hour so far owns the
-    // uncovered prefix [older.minHour, earliestCoveredSoFar).
+    // Build per-identity historical coverage segments using normalized UTC-day
+    // server-source buckets so fractional-hour timezone offsets (e.g. 11:30 UTC
+    // in Asia/Kolkata vs 12:00 UTC for the same LiteLLM daily bucket) are
+    // recognized as the same server bucket rather than older history.
     const segmentsByIdentity = new Map()
     for (const [idKey, devMap] of devSpanByIdentity.entries()) {
       const ordered = [...devMap.values()].sort((a, b) => b.synced - a.synced)
@@ -1106,11 +1106,11 @@ export class UsageDb {
       let earliest = Infinity
       for (const d of ordered) {
         if (!segs.length) {
-          segs.push({ keyId: d.keyId, fromHour: d.minHour, toHour: Infinity })
-          earliest = d.minHour
-        } else if (d.minHour < earliest) {
-          segs.push({ keyId: d.keyId, fromHour: d.minHour, toHour: earliest })
-          earliest = d.minHour
+          segs.push({ keyId: d.keyId, fromBucket: d.minBucket, toBucket: Infinity })
+          earliest = d.minBucket
+        } else if (d.minBucket < earliest) {
+          segs.push({ keyId: d.keyId, fromBucket: d.minBucket, toBucket: earliest })
+          earliest = d.minBucket
         }
       }
       segmentsByIdentity.set(idKey, segs)
@@ -1120,9 +1120,9 @@ export class UsageDb {
     owners.ownerForHour = (idKey, hour) => {
       const segs = segmentsByIdentity.get(idKey)
       if (!segs || !segs.length) return owners.get(idKey) || null
-      const h = Number(hour)
+      const b = serverSourceBucketMs(hour)
       for (const s of segs) {
-        if (h >= s.fromHour && h < s.toHour) return s.keyId
+        if (b >= s.fromBucket && b < s.toBucket) return s.keyId
       }
       return segs[segs.length - 1].keyId
     }
@@ -1393,7 +1393,7 @@ export class UsageDb {
             if (curKeyId) localCoveredServerDevIds.add(`${idKey}|${curKeyId}`)
             localCoveredCurDevHours.add(`${rHour}|${r.cli}|${r.model}`)
           } else {
-            const dk = `${rHour}|${canonCli}|${rawM}`
+            const dk = `${serverSourceBucketMs(rHour)}|${canonCli}|${rawM}`
             const prev = localAliasDeduct.get(dk) || {
               input: 0,
               output: 0,
@@ -1435,12 +1435,16 @@ export class UsageDb {
         const eqClis = owners.equivalentClisFor ? owners.equivalentClisFor(r.key_id, r.cli) : [cli]
         const rawM = isServerSourceCli(r.cli) ? rawModelFor(idKey, r.model) : r.model
         const dispM = isServerSourceCli(r.cli) ? (displayByIdRaw.get(`${idKey}|${rawM}`) || r.model) : r.model
+        const deductKey = isServerSourceCli(r.cli)
+          ? `${serverSourceBucketMs(r.hour)}|${cli}|${rawM}`
+          : `${r.hour}|${cli}|${rawM}`
         const k = `${r.hour}|${cli}|${rawM}`
         let b = mergedCloud.get(k)
         if (!b) {
           b = {
             hour: r.hour,
             cli,
+            deductKey,
             cliAliases: new Set(eqClis),
             model: dispM,
             rawModel: rawM !== dispM ? rawM : null,
@@ -1468,17 +1472,22 @@ export class UsageDb {
       }
 
       const cloudRecs = []
-      for (const [k, b] of mergedCloud.entries()) {
-        const deduct = localAliasDeduct.get(k)
+      for (const b of mergedCloud.values()) {
+        const deduct = localAliasDeduct.get(b.deductKey)
         if (deduct) {
-          b.input = Math.max(0, b.input - deduct.input)
-          b.output = Math.max(0, b.output - deduct.output)
-          b.cache_read = Math.max(0, b.cache_read - deduct.cache_read)
-          b.cache_create = Math.max(0, b.cache_create - deduct.cache_create)
-          b.reasoning = Math.max(0, b.reasoning - deduct.reasoning)
-          b.total = Math.max(0, b.total - deduct.total)
-          b.cost = Math.max(0, b.cost - deduct.cost)
-          b.turns = Math.max(0, b.turns - deduct.turns)
+          const take = (field) => {
+            const d = Math.min(b[field], deduct[field])
+            b[field] -= d
+            deduct[field] -= d
+          }
+          take('input')
+          take('output')
+          take('cache_read')
+          take('cache_create')
+          take('reasoning')
+          take('total')
+          take('cost')
+          take('turns')
         }
         if (b.total > 0 || b.cost > 0) {
           cloudRecs.push(toCloudRec({ ...b, cliAliases: [...b.cliAliases] }))
@@ -1859,6 +1868,10 @@ function deterministicLitellmId(baseUrl) {
 
 function isServerSourceCli(cli) {
   return cli === 'cursor' || (typeof cli === 'string' && cli.startsWith('litellm:'))
+}
+
+function serverSourceBucketMs(hour) {
+  return Math.floor(Number(hour) / 86400000) * 86400000
 }
 
 function keepCloudRow(r, deviceId, owners) {
