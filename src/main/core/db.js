@@ -1987,19 +1987,21 @@ export class UsageDb {
 
   // Cloud-consistent overview for the tray popup when viewing 'account' (all
   // devices merged) or a specific synced device.
-  cloudOverview(deviceId = null, now = Date.now()) {
+  cloudOverview(deviceId = null, now) {
+    const explicitNow = now !== undefined
+    if (!explicitNow) now = Date.now()
     const viewState = this.getDeviceViewState()
     const eff = deviceId ? this.resolveDeviceId(deviceId) : viewState.selectedDevice
     if (!viewState.hasCloudData || eff === 'local') return null
 
-    const nowBucket = Math.floor(now / 15000)
+    const nowKey = explicitNow ? `exact:${now}` : `bucket:${Math.floor(now / 1000)}`
     if (
       this._cloudOverviewMemo &&
       this._cloudOverviewMemo.seq === this._mutationSeq &&
       this._cloudOverviewMemo.eff === eff &&
       this._cloudOverviewMemo.activeCursorUserId === this._activeCursorUserId &&
       this._cloudOverviewMemo.lastIngested === this._lastIngestedRecords &&
-      this._cloudOverviewMemo.nowBucket === nowBucket
+      this._cloudOverviewMemo.nowKey === nowKey
     ) {
       return { ...this._cloudOverviewMemo.value, generatedAt: now }
     }
@@ -2114,7 +2116,7 @@ export class UsageDb {
       eff,
       activeCursorUserId: this._activeCursorUserId,
       lastIngested: this._lastIngestedRecords,
-      nowBucket,
+      nowKey,
       value: result,
     }
     return result

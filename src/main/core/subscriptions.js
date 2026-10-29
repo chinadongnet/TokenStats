@@ -286,6 +286,24 @@ function forEachInRange(sortedRs, fromMs, toMs, fn) {
   }
 }
 
+function hasPlanRecordBetween(idx, aMs, bMs) {
+  if (aMs === bMs) return false
+  const lo = Math.min(aMs, bMs)
+  const hi = Math.max(aMs, bMs)
+  if (idx.tsMax <= lo || idx.tsMin > hi) return false
+  for (const rs of idx.byPlan.values()) {
+    let l = 0
+    let r = rs.length
+    while (l < r) {
+      const mid = (l + r) >> 1
+      if (rs[mid].ts <= lo) l = mid + 1
+      else r = mid
+    }
+    if (l < rs.length && rs[l].ts <= hi) return true
+  }
+  return false
+}
+
 // ONE pass over the records that both computeResetWindows() and
 // mergeLiveLimits() can share: the exclusively-assigned records per plan
 // (sorted by ts, ready for usageIn) plus the same per CLI, which is what a
@@ -305,7 +323,8 @@ export function planRecordIndex(subs, records, nowMs = Date.now()) {
     _planIndexMemo.first === first &&
     _planIndexMemo.last === last &&
     _planIndexMemo.dayStart === dayStart &&
-    _planIndexMemo.subsJson === subsJson
+    _planIndexMemo.subsJson === subsJson &&
+    (!_planIndexMemo.sample || _planIndexMemo.sample.every((r, i) => r === recs[i]))
   ) {
     return _planIndexMemo.value
   }
@@ -331,7 +350,8 @@ export function planRecordIndex(subs, records, nowMs = Date.now()) {
   for (const rs of byCli.values()) rs.sort((a, b) => a.ts - b.ts)
   unplanned.sort((a, b) => a.ts - b.ts)
   const value = { entries, byPlan, byCli, unplanned, tsMin, tsMax }
-  _planIndexMemo = { recs, len, first, last, dayStart, subsJson, value }
+  const sample = len <= 256 ? recs.slice() : null
+  _planIndexMemo = { recs, len, first, last, sample, dayStart, subsJson, value }
   return value
 }
 
@@ -343,7 +363,7 @@ export function computeAllSubscriptionStats(subs, records, nowMs = Date.now()) {
   if (
     _allSubStatsMemo &&
     _allSubStatsMemo.idx === idx &&
-    !(idx.tsMax > Math.min(_allSubStatsMemo.nowMs, nowMs) && idx.tsMax <= Math.max(_allSubStatsMemo.nowMs, nowMs))
+    !hasPlanRecordBetween(idx, _allSubStatsMemo.nowMs, nowMs)
   ) {
     return _allSubStatsMemo.result
   }
@@ -365,7 +385,7 @@ export function computeCycleDashboard(subs, records, nowMs = Date.now()) {
   if (
     _cycleDashMemo &&
     _cycleDashMemo.idx === idx &&
-    !(idx.tsMax > Math.min(_cycleDashMemo.nowMs, nowMs) && idx.tsMax <= Math.max(_cycleDashMemo.nowMs, nowMs))
+    !hasPlanRecordBetween(idx, _cycleDashMemo.nowMs, nowMs)
   ) {
     return { ..._cycleDashMemo.result, asOf: nowMs }
   }

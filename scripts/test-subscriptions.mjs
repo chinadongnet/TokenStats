@@ -164,4 +164,20 @@ assert.ok(!concurrent.ranking.includes('free'), 'free plans have an undefined ra
 assert.equal(concurrent.summary.totalTokens, concurrent.models.reduce((n, m) => n + m.total, 0))
 assert.equal(concurrent.summary.totalTokens, concurrent.plans.reduce((n, p) => n + p.cycles.reduce((sum, c) => sum + c.tokens, 0), 0))
 assert.equal(computeCycleDashboard([], [], now).summary.peakCount, 0)
+
+// Cache invalidation when multiple future-stamped records become current one by one.
+const multiFutureRecs = [
+  record(at(2026, 8, 15, 11) + 30 * 60000, 100, 1),
+  record(at(2026, 8, 15, 12), 200, 2),
+]
+const t1115 = at(2026, 8, 15, 11) + 15 * 60000
+const t1145 = at(2026, 8, 15, 11) + 45 * 60000
+const t1215 = at(2026, 8, 15, 12) + 15 * 60000
+assert.equal(computeAllSubscriptionStats([plan], multiFutureRecs, t1115)[0].totalTokens, 0)
+assert.equal(computeAllSubscriptionStats([plan], multiFutureRecs, t1145)[0].totalTokens, 100)
+assert.equal(computeAllSubscriptionStats([plan], multiFutureRecs, t1215)[0].totalTokens, 300)
+assert.equal(computeCycleDashboard([plan], multiFutureRecs, t1115).summary.totalTokens, 0)
+assert.equal(computeCycleDashboard([plan], multiFutureRecs, t1145).summary.totalTokens, 100)
+assert.equal(computeCycleDashboard([plan], multiFutureRecs, t1215).summary.totalTokens, 300)
+
 console.log('OK: full cycle dashboard, exact boundaries, model totals, historical concurrency, future exclusion and zero-fee ranking')

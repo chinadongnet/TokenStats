@@ -655,7 +655,7 @@ function buildEffectiveSnapshot(baseSnap) {
       deviceView: viewState,
     }
   }
-  const cloudSnap = db.cloudOverview(viewState.selectedDevice, Date.now())
+  const cloudSnap = db.cloudOverview(viewState.selectedDevice)
   if (!cloudSnap) {
     return {
       ...baseSnap,
@@ -804,7 +804,7 @@ function computeResetsForView(deviceId = null) {
     return mergeLiveLimits(entries, buildLiveByCli(), now, labels, index)
   }
 
-  const cloudSnap = db.cloudOverview(eff, now)
+  const cloudSnap = db.cloudOverview(eff)
   const cloudResets = cloudSnap?.cloudResets || []
 
   if (eff === 'account') {
