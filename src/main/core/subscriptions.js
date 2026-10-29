@@ -36,6 +36,63 @@ export const ANCHORED_PERIODS = ['weekly', 'monthly']
 export const ROLLING_PERIOD_MS = { '5h': 5 * 3600 * 1000 }
 const WEEK_MS = 7 * 86400 * 1000
 
+const _monthInfoCache = new Map()
+const _dayStartSubCache = new Map()
+const _tzProbeA = new Date(1704067200000)
+const _tzProbeB = new Date(1719792000000)
+let _tzEnv = undefined
+let _tzOffA = 0
+let _tzOffB = 0
+let _tzKey = ''
+
+function currentTzKey() {
+  const env = process.env.TZ || ''
+  _tzProbeA.setTime(1704067200000)
+  _tzProbeB.setTime(1719792000000)
+  const offA = _tzProbeA.getTimezoneOffset()
+  const offB = _tzProbeB.getTimezoneOffset()
+  if (env !== _tzEnv || offA !== _tzOffA || offB !== _tzOffB) {
+    _tzEnv = env
+    _tzOffA = offA
+    _tzOffB = offB
+    let iana = ''
+    try {
+      iana = Intl.DateTimeFormat().resolvedOptions().timeZone || ''
+    } catch {}
+    _tzKey = `${env}|${offA}|${offB}|${iana}`
+    _monthInfoCache.clear()
+    _dayStartSubCache.clear()
+  }
+  return _tzKey
+}
+
+function monthInfoLocal(ms) {
+  currentTzKey()
+  const q = Math.floor(ms / 900000)
+  let info = _monthInfoCache.get(q)
+  if (info !== undefined) return info
+  const d = new Date(ms)
+  const key = `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}`
+  const monthStart = new Date(d.getFullYear(), d.getMonth(), 1).getTime()
+  info = { key, monthStart }
+  if (_monthInfoCache.size > 50000) _monthInfoCache.clear()
+  _monthInfoCache.set(q, info)
+  return info
+}
+
+function dayStartLocalMs(ms) {
+  currentTzKey()
+  const q = Math.floor(ms / 900000)
+  let ds = _dayStartSubCache.get(q)
+  if (ds !== undefined) return ds
+  const d = new Date(ms)
+  d.setHours(0, 0, 0, 0)
+  ds = d.getTime()
+  if (_dayStartSubCache.size > 50000) _dayStartSubCache.clear()
+  _dayStartSubCache.set(q, ds)
+  return ds
+}
+
 // 'YYYY-MM-DD' -> local midnight ms (matches the app's local-day convention).
 function parseDateLocal(s) {
   if (typeof s !== 'string') return NaN
@@ -68,7 +125,13 @@ function makeMatcher(bindings) {
     })
   }
   return (r) => {
-    const b = map.get(r.cli)
+    let b = map.get(r.cli)
+    if (!b && Array.isArray(r.cliAliases)) {
+      for (const alt of r.cliAliases) {
+        b = map.get(alt)
+        if (b) break
+      }
+    }
     if (!b) return false
     if (b.keyAlias && (r.project || '') !== b.keyAlias) return false
     if (b.models && !b.models.has(r.rawModel || r.model) && !b.models.has(r.model)) return false
@@ -137,11 +200,10 @@ export function computeSubscriptionStats(sub, records, nowMs = Date.now(), { ful
   // their cycle starts (when the charge happens); usage in its record's month.
   const months = new Map() // 'YYYY-MM' -> {month, paid, cost, tokens}
   const monthBucket = (ms) => {
-    const d = new Date(ms)
-    const key = `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}`
+    const { key, monthStart } = monthInfoLocal(ms)
     let b = months.get(key)
     if (!b) {
-      b = { month: key, monthStart: new Date(d.getFullYear(), d.getMonth(), 1).getTime(), paid: 0, cost: 0, tokens: 0 }
+      b = { month: key, monthStart, paid: 0, cost: 0, tokens: 0 }
       months.set(key, b)
     }
     return b
@@ -163,19 +225,20 @@ export function computeSubscriptionStats(sub, records, nowMs = Date.now(), { ful
         else hi = mid - 1
       }
       const c = cycles[lo]
-      c.cost += costFor(r)
+      const cost = costFor(r)
+      c.cost += cost
       c.tokens += r.total
       c.turns += r.turns || 1
       if (includeModels) {
-        const key = JSON.stringify([r.cli, r.model])
+        const key = `${r.cli}|${r.model}`
         const m = c.models.get(key) || { cli: r.cli, model: r.model, total: 0, cost: 0, turns: 0 }
         m.total += r.total
-        m.cost += costFor(r)
+        m.cost += cost
         m.turns += r.turns || 1
         c.models.set(key, m)
       }
       const mb = monthBucket(r.ts)
-      mb.cost += costFor(r)
+      mb.cost += cost
       mb.tokens += r.total
     }
   }
@@ -233,36 +296,112 @@ function planAssigner(subs, nowMs) {
   return { entries, pick }
 }
 
+let _planIndexMemo = null
+
+function forEachInRange(sortedRs, fromMs, toMs, fn) {
+  if (!sortedRs || !sortedRs.length) return
+  let lo = 0
+  let hi = sortedRs.length
+  if (fromMs != null) {
+    while (lo < hi) {
+      const mid = (lo + hi) >> 1
+      if (sortedRs[mid].ts < fromMs) lo = mid + 1
+      else hi = mid
+    }
+  }
+  for (let i = lo; i < sortedRs.length; i++) {
+    const r = sortedRs[i]
+    if (toMs != null && r.ts >= toMs) break
+    fn(r)
+  }
+}
+
+function hasPlanRecordBetween(idx, aMs, bMs) {
+  if (aMs === bMs) return false
+  const lo = Math.min(aMs, bMs)
+  const hi = Math.max(aMs, bMs)
+  if (idx.tsMax <= lo || idx.tsMin > hi) return false
+  for (const rs of idx.byPlan.values()) {
+    let l = 0
+    let r = rs.length
+    while (l < r) {
+      const mid = (l + r) >> 1
+      if (rs[mid].ts <= lo) l = mid + 1
+      else r = mid
+    }
+    if (l < rs.length && rs[l].ts <= hi) return true
+  }
+  return false
+}
+
 // ONE pass over the records that both computeResetWindows() and
 // mergeLiveLimits() can share: the exclusively-assigned records per plan
 // (sorted by ts, ready for usageIn) plus the same per CLI, which is what a
 // live window belonging to no plan needs. Callers that build it once and hand
 // it to both avoid a second full planAssigner sweep per popup refresh.
 export function planRecordIndex(subs, records, nowMs = Date.now()) {
-  const { pick } = planAssigner(subs, nowMs)
+  const tzKey = currentTzKey()
+  const recs = records || []
+  const len = recs.length
+  const first = len ? recs[0] : null
+  const last = len ? recs[len - 1] : null
+  const dayStart = dayStartLocalMs(nowMs)
+  const subsJson = JSON.stringify(subs || [])
+  if (
+    _planIndexMemo &&
+    _planIndexMemo.tzKey === tzKey &&
+    _planIndexMemo.recs === recs &&
+    _planIndexMemo.len === len &&
+    _planIndexMemo.first === first &&
+    _planIndexMemo.last === last &&
+    _planIndexMemo.dayStart === dayStart &&
+    _planIndexMemo.subsJson === subsJson &&
+    (!_planIndexMemo.sample || _planIndexMemo.sample.every((r, i) => r === recs[i]))
+  ) {
+    return _planIndexMemo.value
+  }
+  const { entries, pick } = planAssigner(subs, nowMs)
   const byPlan = new Map((subs || []).map((s) => [s.id, []]))
   const byCli = new Map()
-  for (const r of records || []) {
+  const unplanned = []
+  let tsMin = Infinity
+  let tsMax = -Infinity
+  for (const r of recs) {
+    if (r.ts < tsMin) tsMin = r.ts
+    if (r.ts > tsMax) tsMax = r.ts
     const e = pick(r)
     if (e) byPlan.get(e.sub.id).push(r)
-    if (!byCli.has(r.cli)) byCli.set(r.cli, [])
-    byCli.get(r.cli).push(r)
+    else unplanned.push(r)
+    const clis = Array.isArray(r.cliAliases) && r.cliAliases.length ? r.cliAliases : [r.cli]
+    for (const c of clis) {
+      if (!byCli.has(c)) byCli.set(c, [])
+      byCli.get(c).push(r)
+    }
   }
   for (const rs of byPlan.values()) rs.sort((a, b) => a.ts - b.ts)
   for (const rs of byCli.values()) rs.sort((a, b) => a.ts - b.ts)
-  return { byPlan, byCli }
+  unplanned.sort((a, b) => a.ts - b.ts)
+  const value = { entries, byPlan, byCli, unplanned, tsMin, tsMax }
+  const sample = len <= 256 ? recs.slice() : null
+  _planIndexMemo = { tzKey, recs, len, first, last, sample, dayStart, subsJson, value }
+  return value
 }
 
+let _allSubStatsMemo = null
 export function computeAllSubscriptionStats(subs, records, nowMs = Date.now()) {
   // Pre-assign records so overlapping plans never double-count the same usage
   // (each plan's stats only see the records it owns).
-  const { pick } = planAssigner(subs, nowMs)
-  const owned = new Map((subs || []).map((s) => [s.id, []]))
-  for (const r of records) {
-    const e = pick(r)
-    if (e) owned.get(e.sub.id).push(r)
+  const idx = planRecordIndex(subs, records, nowMs)
+  if (
+    _allSubStatsMemo &&
+    _allSubStatsMemo.idx === idx &&
+    !hasPlanRecordBetween(idx, _allSubStatsMemo.nowMs, nowMs)
+  ) {
+    return _allSubStatsMemo.result
   }
-  return groupSubscriptionStats((subs || []).map((s) => computeSubscriptionStats(s, owned.get(s.id) || [], nowMs)))
+  const result = groupSubscriptionStats((subs || []).map((s) => computeSubscriptionStats(s, idx.byPlan.get(s.id) || [], nowMs)))
+  _allSubStatsMemo = { idx, nowMs, result }
+  return result
 }
 
 function bindingKey(binding) {
@@ -270,17 +409,20 @@ function bindingKey(binding) {
     binding.models?.length ? [...new Set(binding.models)].sort() : null])
 }
 
+let _cycleDashMemo = null
 // All-history cycle dashboard. Every purchase retains its own anchor, fee and
 // clipped coverage; grouping never fills gaps or duplicates overlapping usage.
 export function computeCycleDashboard(subs, records, nowMs = Date.now()) {
-  const { entries, pick } = planAssigner(subs, nowMs)
-  const owned = new Map(entries.map((e) => [e.sub.id, []]))
-  for (const r of records || []) {
-    if (r.ts > nowMs) continue
-    const e = pick(r)
-    if (e) owned.get(e.sub.id).push(r)
+  const idx = planRecordIndex(subs, records, nowMs)
+  if (
+    _cycleDashMemo &&
+    _cycleDashMemo.idx === idx &&
+    !hasPlanRecordBetween(idx, _cycleDashMemo.nowMs, nowMs)
+  ) {
+    return { ..._cycleDashMemo.result, asOf: nowMs }
   }
-  const stats = entries.map((e) => computeSubscriptionStats(e.sub, owned.get(e.sub.id), nowMs,
+  const { entries, byPlan } = idx
+  const stats = entries.map((e) => computeSubscriptionStats(e.sub, byPlan.get(e.sub.id) || [], nowMs,
     { fullHistory: true, includeModels: true }))
   const combineModels = (cycles) => {
     const models = new Map()
@@ -327,9 +469,11 @@ export function computeCycleDashboard(subs, records, nowMs = Date.now()) {
   const models = combineModels(plans.flatMap((p) => p.cycles))
   const summary = Object.fromEntries(['totalTokens', 'totalPaid', 'totalCost', 'totalTurns', 'monthsBilled'].map((k) =>
     [k, plans.reduce((n, p) => n + p[k], 0)]))
-  return { asOf: nowMs, plans, ranking: ranking.map((p) => p.id), models,
+  const result = { asOf: nowMs, plans, ranking: ranking.map((p) => p.id), models,
     summary: { ...summary, currentCount: plans.filter((p) => p.isCurrent).length,
       peakCount, peakAt, bestValueId: ranking[0]?.id || null, mostCyclesId: mostCycles?.id || null } }
+  _cycleDashMemo = { idx, nowMs, result }
+  return result
 }
 
 // Purchases keep their own billing anchors, prices and ownership. Only the
@@ -405,7 +549,8 @@ function groupPlanBuckets(plans) {
 // totals + per-model breakdown (same shape PlanBreakdown consumes), a per-
 // local-day stacked usage series, and the overall data span for zoom clamping.
 export function computePlanTimeline(subs, records, fromMs, toMs, nowMs = Date.now()) {
-  const { entries, pick } = planAssigner(subs, nowMs)
+  const idx = planRecordIndex(subs, records, nowMs)
+  const { entries, byPlan, unplanned: unplannedRecs, tsMin, tsMax } = idx
   const buckets = new Map()
   const plans = entries.map((e) => {
     const cycles = e.cycles
@@ -435,14 +580,7 @@ export function computePlanTimeline(subs, records, fromMs, toMs, nowMs = Date.no
   const unplanned = { id: null, name: null, active: true, monthlyUsd: 0, bindings: [], fees: 0, cost: 0, tokens: 0, turns: 0, models: new Map() }
 
   const days = new Map() // dayMs -> { day, perPlan: {id|'un': {tokens, cost}} }
-  let tsMin = Infinity
-  let tsMax = -Infinity
-  for (const r of records) {
-    if (r.ts < tsMin) tsMin = r.ts
-    if (r.ts > tsMax) tsMax = r.ts
-    if (r.ts < fromMs || r.ts >= toMs) continue
-    const e = pick(r)
-    const b = e ? buckets.get(e.sub.id) : unplanned
+  const addRec = (r, e, b, pk) => {
     const cost = costFor(r)
     b.cost += cost
     b.tokens += r.total
@@ -463,19 +601,22 @@ export function computePlanTimeline(subs, records, fromMs, toMs, nowMs = Date.no
         cy.tokens += r.total
       }
     }
-    const d = new Date(r.ts)
-    d.setHours(0, 0, 0, 0)
-    const dayKey = d.getTime()
+    const dayKey = dayStartLocalMs(r.ts)
     let day = days.get(dayKey)
     if (!day) {
       day = { day: dayKey, perPlan: {} }
       days.set(dayKey, day)
     }
-    const pk = e ? e.sub.groupId || e.sub.id : 'un'
     const slot = day.perPlan[pk] || (day.perPlan[pk] = { tokens: 0, cost: 0 })
     slot.tokens += r.total
     slot.cost += cost
   }
+  for (const e of entries) {
+    const b = buckets.get(e.sub.id)
+    const pk = e.sub.groupId || e.sub.id
+    forEachInRange(byPlan.get(e.sub.id), fromMs, toMs, (r) => addRec(r, e, b, pk))
+  }
+  forEachInRange(unplannedRecs, fromMs, toMs, (r) => addRec(r, null, unplanned, 'un'))
 
   // Overall span (records + every billed cycle, clipped to now+7d) so the UI
   // can clamp zoom-out to where data actually exists.
@@ -568,8 +709,15 @@ function usageIn(rs, start, end) {
   let tokens = 0
   let cost = 0
   let turns = 0
-  for (const r of rs) {
-    if (r.ts < start) continue
+  let lo = 0
+  let hi = rs.length
+  while (lo < hi) {
+    const mid = (lo + hi) >> 1
+    if (rs[mid].ts < start) lo = mid + 1
+    else hi = mid
+  }
+  for (let i = lo; i < rs.length; i++) {
+    const r = rs[i]
     if (r.ts >= end) break
     tokens += r.total
     cost += costFor(r)
@@ -598,20 +746,29 @@ function usageIn(rs, start, end) {
 //
 // Records are assigned through the same exclusive planAssigner the billing
 // stats use, so two plans over the same sources never double-count a request.
+let _resetWindowsMemo = null
 export function computeResetWindows(subs, records, nowMs = Date.now(), index = null) {
   const tracked = (subs || []).filter((s) => s.active && (s.resetPeriods || []).length)
   if (!tracked.length) return []
 
   const idx = index || planRecordIndex(subs, records, nowMs)
+  if (
+    _resetWindowsMemo &&
+    _resetWindowsMemo.idx === idx &&
+    _resetWindowsMemo.nowMs === nowMs
+  ) {
+    return _resetWindowsMemo.result
+  }
 
-  return tracked.map((sub) => {
+  const result = tracked.map((sub) => {
     const rs = idx.byPlan.get(sub.id) || []
     // A rolling window can't be OPENED by a record in the future. LiteLLM has no
     // per-request timestamps and stamps a whole day at noon UTC, so its "today"
     // bucket legitimately sits ahead of now. Anchored windows don't care — such a
     // record still falls inside the current week/month, and dropping it would
     // undercount exactly the plans (Mimo) that use a monthly quota.
-    const past = rs.filter((r) => r.ts <= nowMs)
+    let past = null
+    let pastTs = null
     const anchors = sub.resetAnchors || {}
 
     const windows = []
@@ -631,8 +788,12 @@ export function computeResetWindows(subs, records, nowMs = Date.now(), index = n
         continue
       }
 
+      if (!past) {
+        past = rs.length && rs[rs.length - 1].ts <= nowMs ? rs : rs.filter((r) => r.ts <= nowMs)
+        pastTs = past.map((r) => r.ts)
+      }
       const periodMs = ROLLING_PERIOD_MS[period]
-      const w = rollingWindow(past.map((r) => r.ts), periodMs, nowMs)
+      const w = rollingWindow(pastTs, periodMs, nowMs)
       if (!w) {
         // idle: the next request opens a fresh window
         windows.push({ period, open: false, start: null, end: null, periodMs, msToReset: null, tokens: 0, cost: 0, turns: 0 })
@@ -658,6 +819,7 @@ export function computeResetWindows(subs, records, nowMs = Date.now(), index = n
 
     return {
       id: sub.id,
+      groupId: sub.groupId || sub.id,
       name: sub.name,
       monthlyUsd: Number(sub.monthlyUsd) || 0,
       bindings: sub.bindings || [],
@@ -665,6 +827,8 @@ export function computeResetWindows(subs, records, nowMs = Date.now(), index = n
       renewal,
     }
   })
+  _resetWindowsMemo = { idx, nowMs, result }
+  return result
 }
 
 // ---- live CLI limits overlay ------------------------------------------------
@@ -777,15 +941,12 @@ export function computePlanBreakdown(subs, records, fromMs, toMs, nowMs = Date.n
     turns: 0,
     models: new Map(),
   })
-  const { entries, pick } = planAssigner(subs, nowMs)
+  const { entries, byPlan, unplanned: unplannedRecs } = planRecordIndex(subs, records, nowMs)
   const buckets = new Map(entries.map((e) => [e.sub.id, mkBucket(e.sub, e.cycles)]))
   const unplanned = mkBucket(null, [])
 
   let totalCost = 0
-  for (const r of records) {
-    if (r.ts < fromMs || r.ts >= toMs) continue
-    const e = pick(r)
-    const b = e ? buckets.get(e.sub.id) : unplanned
+  const addRec = (r, b) => {
     const cost = costFor(r)
     b.cost += cost
     b.tokens += r.total
@@ -801,6 +962,11 @@ export function computePlanBreakdown(subs, records, fromMs, toMs, nowMs = Date.n
     m.cost += cost
     m.turns += r.turns || 1
   }
+  for (const e of entries) {
+    const b = buckets.get(e.sub.id)
+    forEachInRange(byPlan.get(e.sub.id), fromMs, toMs, (r) => addRec(r, b))
+  }
+  forEachInRange(unplannedRecs, fromMs, toMs, (r) => addRec(r, unplanned))
 
   const finish = ({ models, ...b }) => ({
     ...b,

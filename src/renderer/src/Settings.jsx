@@ -670,8 +670,21 @@ function CloudSyncCard() {
     })
   }
   useEffect(() => { load() }, [])
+  useEffect(() => window.api.onReportUpdated(() => { load() }), [dirty])
 
   const setDraft = (patch) => { setDirty(true); setNotice(null); setDraftState((d) => ({ ...d, ...patch })) }
+
+  async function resolveConflict(strategy) {
+    setBusy(true)
+    setNotice(t('set.cloudSyncing'))
+    try {
+      const res = await window.api.cloudSyncResolveConflict(strategy)
+      if (res?.state) setCfg((c) => ({ ...c, ...res.state }))
+      setNotice(res?.ok ? t('set.cloudResolved') : res?.error ? t('set.cloudLastError', { error: res.error }) : null)
+    } finally {
+      setBusy(false)
+    }
+  }
 
   async function save() {
     setBusy(true)
@@ -769,6 +782,60 @@ function CloudSyncCard() {
           {testResult.ok
             ? t('set.cloudTestOk', { username: testResult.username, deviceName: testResult.deviceName, rows: testResult.rowCount })
             : t('set.cloudTestFail', { error: testResult.error })}
+        </div>
+      )}
+      {cfg?.subsConflict && (
+        <div
+          style={{
+            marginTop: 12,
+            padding: 12,
+            borderRadius: 8,
+            border: '1px solid rgba(245, 158, 11, 0.55)',
+            background: 'rgba(245, 158, 11, 0.08)',
+          }}
+        >
+          <div style={{ fontWeight: 600, color: '#fbbf24', marginBottom: 4 }}>
+            ⚠️ {t('set.cloudConflictTitle')}
+          </div>
+          <div className="muted small" style={{ marginBottom: 8 }}>
+            {t('set.cloudConflictDesc', {
+              cloudCount: (cfg.subsConflict.cloudSubs || []).length,
+              localCount: (cfg.subsConflict.localSubs || []).length,
+            })}
+          </div>
+          {cfg.subsConflict.diff && (
+            <div className="small" style={{ marginBottom: 10, display: 'flex', flexDirection: 'column', gap: 4 }}>
+              {(cfg.subsConflict.diff.onlyInCloud || []).length > 0 && (
+                <div>
+                  <span className="muted">{t('set.cloudOnlyCloud')} </span>
+                  {cfg.subsConflict.diff.onlyInCloud.map((s) => `${s.name} ($${s.monthlyUsd})`).join(', ')}
+                </div>
+              )}
+              {(cfg.subsConflict.diff.onlyInLocal || []).length > 0 && (
+                <div>
+                  <span className="muted">{t('set.cloudOnlyLocal')} </span>
+                  {cfg.subsConflict.diff.onlyInLocal.map((s) => `${s.name} ($${s.monthlyUsd})`).join(', ')}
+                </div>
+              )}
+              {(cfg.subsConflict.diff.modified || []).map((m, idx) => (
+                <div key={idx}>
+                  <span className="muted">{t('set.cloudModified')} </span>
+                  <b>{m.name}</b> — {(m.changes || []).join('；')}
+                </div>
+              ))}
+            </div>
+          )}
+          <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap' }}>
+            <button className="btn primary" onClick={() => resolveConflict('merge')} disabled={busy}>
+              {t('set.cloudResolveMerge')}
+            </button>
+            <button className="btn" onClick={() => resolveConflict('use_local')} disabled={busy}>
+              {t('set.cloudResolveLocal')}
+            </button>
+            <button className="btn" onClick={() => resolveConflict('use_cloud')} disabled={busy}>
+              {t('set.cloudResolveCloud')}
+            </button>
+          </div>
         </div>
       )}
     </>

@@ -83,11 +83,11 @@ export class Store extends EventEmitter {
     )
   }
 
-  async ingestFile(file) {
+  async ingestFile(file, opts) {
     // Watch events, sweeps and manual refresh can target the same file. Never
     // tail one byte range twice or replace a newer parse with an older result.
     const previous = this._ingesting.get(file) || Promise.resolve()
-    const next = previous.catch(() => {}).then(() => this._ingestFile(file))
+    const next = previous.catch(() => {}).then(() => this._ingestFile(file, opts))
     this._ingesting.set(file, next)
     try {
       return await next
@@ -96,7 +96,7 @@ export class Store extends EventEmitter {
     }
   }
 
-  async _ingestFile(file) {
+  async _ingestFile(file, { force = false } = {}) {
     const parser = this.parserFor(file)
     if (!parser) return false
     let stat
@@ -122,7 +122,7 @@ export class Store extends EventEmitter {
       }
     }))
     const signature = sidecars.join('|') + (parser.signature ? await parser.signature(file) : '')
-    if (stat.mtimeMs === entry.mtimeMs && stat.size === entry.size && signature === entry.signature) return false
+    if (!force && stat.mtimeMs === entry.mtimeMs && stat.size === entry.size && signature === entry.signature) return false
 
     try {
       if (parser.kind === 'json') {
@@ -242,10 +242,11 @@ export class Store extends EventEmitter {
   // stat to force a re-parse (and thus a re-fetch). The parser self-throttles
   // actual HTTP calls and backs off on rate limits, so timer calls are cheap.
   // "Refresh now" is cheap. Returns true if any record set actually changed.
-  async refreshNetworkParsers() {
+  async refreshNetworkParsers({ force = false } = {}) {
     let changed = false
     for (const parser of PARSERS) {
       if (!parser.network) continue
+      if (force) parser.forceRefresh?.()
       for (const root of parser.roots) {
         for (const file of await walk(root, parser.match)) {
           const entry = this.files.get(file)
@@ -255,7 +256,7 @@ export class Store extends EventEmitter {
             entry.mtimeMs = 0
             entry.size = 0
           }
-          await this.ingestFile(file)
+          await this.ingestFile(file, { force: true })
           const after = JSON.stringify(this.files.get(file)?.records)
           if (after !== before || parser.revision !== beforeRevision) changed = true
         }
@@ -371,7 +372,60 @@ export class Store extends EventEmitter {
   // are byte-identical so the choice is immaterial); records without a key
   // (Codex, Antigravity) always pass through.
   dedupedRecords() {
-    return dedupe(this.allRecords())
+    const tzKey = currentTzKey()
+    const prev = this._dedupedMemo
+    if (
+      prev &&
+      prev.tzKey === tzKey &&
+      prev.filesSize === this.files.size &&
+      prev.historySize === this.history.size
+    ) {
+      let same = true
+      let i = 0
+      for (const [file, entry] of this.files.entries()) {
+        const recs = entry?.records
+        const len = Array.isArray(recs) ? recs.length : 0
+        const last = len ? recs[len - 1] : null
+        const s = prev.filesStamp[i++]
+        if (!s || s.file !== file || s.recs !== recs || s.len !== len || s.last !== last) {
+          same = false
+          break
+        }
+      }
+      if (same) {
+        let j = 0
+        for (const [cli, rows] of this.history.entries()) {
+          const len = Array.isArray(rows) ? rows.length : 0
+          const s = prev.historyStamp[j++]
+          if (!s || s.cli !== cli || s.rows !== rows || s.len !== len) {
+            same = false
+            break
+          }
+        }
+      }
+      if (same) return prev.result
+    }
+    const filesStamp = []
+    for (const [file, entry] of this.files.entries()) {
+      const recs = entry?.records
+      const len = Array.isArray(recs) ? recs.length : 0
+      filesStamp.push({ file, recs, len, last: len ? recs[len - 1] : null })
+    }
+    const historyStamp = []
+    for (const [cli, rows] of this.history.entries()) {
+      const len = Array.isArray(rows) ? rows.length : 0
+      historyStamp.push({ cli, rows, len })
+    }
+    const result = dedupe(this.allRecords())
+    this._dedupedMemo = {
+      tzKey,
+      filesSize: this.files.size,
+      historySize: this.history.size,
+      filesStamp,
+      historyStamp,
+      result,
+    }
+    return result
   }
 
   // Per-request rows for the report's request log. One deduped record per
@@ -407,8 +461,15 @@ export class Store extends EventEmitter {
   // Served live from the deduped records (the DB only buckets by cli/model, so
   // it can't answer this). One row per (cli, project), biggest first.
   projectStats({ fromMs = null, toMs = null, cli = null } = {}) {
+    const records = this.dedupedRecords()
+    const cacheKey = `${fromMs ?? ''}|${toMs ?? ''}|${cli ?? ''}`
+    if (!this._projectStatsMemo || this._projectStatsMemo.records !== records) {
+      this._projectStatsMemo = { records, map: new Map() }
+    } else if (this._projectStatsMemo.map.has(cacheKey)) {
+      return this._projectStatsMemo.map.get(cacheKey)
+    }
     const map = new Map() // key: cli|project
-    for (const r of this.dedupedRecords()) {
+    for (const r of records) {
       if (cli && r.cli !== cli) continue
       if (fromMs != null && r.ts < fromMs) continue
       if (toMs != null && r.ts >= toMs) continue
@@ -424,14 +485,33 @@ export class Store extends EventEmitter {
       p.turns += r.turns || 1
       if (r.ts > p.lastTs) p.lastTs = r.ts
     }
-    return [...map.values()].sort((a, b) => b.total - a.total)
+    const result = [...map.values()].sort((a, b) => b.total - a.total)
+    if (this._projectStatsMemo.map.size >= 16) this._projectStatsMemo.map.clear()
+    this._projectStatsMemo.map.set(cacheKey, result)
+    return result
   }
 
   // Build the snapshot consumed by the UI.
   snapshot(nowMs = Date.now()) {
+    const tzKey = currentTzKey()
     const records = this.dedupedRecords()
     const now = new Date(nowMs)
     const todayKey = dayKey(now.getTime())
+    const pollerStamp = this.pollers
+      .map((p) => {
+        const lc = p.liveCandidate?.()
+        return `${p.cli}|${p.meta?.label || ''}|${p.meta?.color || ''}|${lc?.ts || 0}|${lc?.model || ''}`
+      })
+      .join('\n')
+    if (
+      this._snapshotMemo &&
+      this._snapshotMemo.tzKey === tzKey &&
+      this._snapshotMemo.records === records &&
+      this._snapshotMemo.todayKey === todayKey &&
+      this._snapshotMemo.pollerStamp === pollerStamp
+    ) {
+      return { ...this._snapshotMemo.value, generatedAt: now.getTime() }
+    }
     // Day and week are calendar-aligned. Month is the latest 30 local calendar
     // days (including today), so it remains a useful monthly view on the first
     // day of a new calendar month instead of collapsing to the day view.
@@ -461,20 +541,25 @@ export class Store extends EventEmitter {
     const weekPerModel = new Map()
     const monthPerModel = new Map()
     const perDay = new Map() // dayKey -> { [cli]: total }
+    const sessionsMap = new Map()
+    const todaySessionsMap = new Map()
+    const projectsMap = new Map()
+    const cliZeroTemplate = Object.fromEntries(allCliIds.map((c) => [c, 0]))
     let latest = null
 
     for (const r of records) {
       const cost = costFor(r)
       add(perCli[r.cli], r, cost)
       const dk = dayKey(r.ts)
-      if (dk === todayKey) add(todayPerCli[r.cli], r, cost)
+      const isToday = dk === todayKey
+      if (isToday) add(todayPerCli[r.cli], r, cost)
       if (r.ts >= weekStart && weekPerCli[r.cli]) add(weekPerCli[r.cli], r, cost)
       if (r.ts >= monthStart && monthPerCli[r.cli]) add(monthPerCli[r.cli], r, cost)
 
       if (!perModel.has(r.model)) perModel.set(r.model, { model: r.model, cli: r.cli, ...blank() })
       add(perModel.get(r.model), r, cost)
 
-      if (dk === todayKey) {
+      if (isToday) {
         if (!todayPerModel.has(r.model)) todayPerModel.set(r.model, { model: r.model, cli: r.cli, ...blank() })
         add(todayPerModel.get(r.model), r, cost)
       }
@@ -487,10 +572,53 @@ export class Store extends EventEmitter {
         add(monthPerModel.get(r.model), r, cost)
       }
 
-      if (!perDay.has(dk)) perDay.set(dk, { day: dk, total: 0, ...Object.fromEntries(allCliIds.map((c) => [c, 0])) })
-      const d = perDay.get(dk)
+      let d = perDay.get(dk)
+      if (!d) {
+        d = { day: dk, total: 0, ...cliZeroTemplate }
+        perDay.set(dk, d)
+      }
       d[r.cli] += r.total
       d.total += r.total
+
+      const sKey = r.cli + '|' + r.sessionId
+      let s = sessionsMap.get(sKey)
+      if (!s) {
+        s = { cli: r.cli, sessionId: r.sessionId, project: r.project, model: r.model, total: 0, cost: 0, lastTs: 0 }
+        sessionsMap.set(sKey, s)
+      }
+      s.total += r.total
+      s.cost += cost
+      if (r.ts > s.lastTs) {
+        s.lastTs = r.ts
+        s.model = r.model
+        s.project = r.project
+      }
+
+      if (isToday) {
+        let ts = todaySessionsMap.get(sKey)
+        if (!ts) {
+          ts = { cli: r.cli, sessionId: r.sessionId, project: r.project, model: r.model, total: 0, cost: 0, lastTs: 0 }
+          todaySessionsMap.set(sKey, ts)
+        }
+        ts.total += r.total
+        ts.cost += cost
+        if (r.ts > ts.lastTs) {
+          ts.lastTs = r.ts
+          ts.model = r.model
+          ts.project = r.project
+        }
+      }
+
+      const proj = r.project || '(unknown)'
+      const pKey = r.cli + '|' + proj
+      let p = projectsMap.get(pKey)
+      if (!p) {
+        p = { cli: r.cli, sessionId: pKey, project: proj, total: 0, cost: 0, lastTs: 0 }
+        projectsMap.set(pKey, p)
+      }
+      p.total += r.total
+      p.cost += cost
+      if (r.ts > p.lastTs) p.lastTs = r.ts
 
       if (!pollerClis.has(r.cli) && (!latest || r.ts > latest.ts)) latest = r
     }
@@ -501,11 +629,10 @@ export class Store extends EventEmitter {
       if (lc && (!latest || lc.ts > latest.ts)) latest = lc
     }
 
-    const todayRecords = records.filter((r) => dayKey(r.ts) === todayKey)
-    const sessions = sessionSummary(records)
-    const todaySessions = sessionSummary(todayRecords)
+    const sessions = [...sessionsMap.values()].sort((a, b) => b.lastTs - a.lastTs)
+    const todaySessions = [...todaySessionsMap.values()].sort((a, b) => b.lastTs - a.lastTs)
 
-    return {
+    const value = {
       generatedAt: now.getTime(),
       // Local scope boundaries, so the popup can say exactly what range a
       // scope covers. `monthStart` is the start of the 30-day monthly view.
@@ -527,7 +654,7 @@ export class Store extends EventEmitter {
       perDay: [...perDay.values()].sort((a, b) => a.day.localeCompare(b.day)).slice(-30),
       recentSessions: sessions.slice(0, 12),
       todayRecentSessions: todaySessions.slice(0, 12),
-      recentProjects: projectSummary(records).slice(0, 12),
+      recentProjects: [...projectsMap.values()].sort((a, b) => b.total - a.total).slice(0, 12),
       sessionCount: sessions.length,
       live: latest
         ? { cli: latest.cli, model: latest.model, project: latest.project, ts: latest.ts }
@@ -536,6 +663,14 @@ export class Store extends EventEmitter {
       // built-in CLI entries so each shows up as its own labeled/colored row.
       providers: this.pollers.map((p) => ({ id: p.cli, label: p.meta.label, color: p.meta.color })),
     }
+    this._snapshotMemo = {
+      tzKey,
+      records,
+      todayKey,
+      pollerStamp,
+      value,
+    }
+    return value
   }
 
   // ---- live watching -------------------------------------------------------
@@ -681,58 +816,65 @@ function sumCli(perCli) {
   return out
 }
 
-function sessionSummary(records) {
-  const map = new Map()
-  for (const r of records) {
-    const key = r.cli + '|' + r.sessionId
-    let s = map.get(key)
-    if (!s) {
-      s = { cli: r.cli, sessionId: r.sessionId, project: r.project, model: r.model, total: 0, cost: 0, lastTs: 0 }
-      map.set(key, s)
-    }
-    s.total += r.total
-    s.cost += costFor(r)
-    if (r.ts > s.lastTs) {
-      s.lastTs = r.ts
-      s.model = r.model
-      s.project = r.project
-    }
-  }
-  return [...map.values()].sort((a, b) => b.lastTs - a.lastTs)
-}
-
-// Like sessionSummary but merges all sessions of the same project (cli|project)
-// so the All-time view shows one row per project with its total token count.
-function projectSummary(records) {
-  const map = new Map()
-  for (const r of records) {
-    const project = r.project || '(unknown)'
-    const key = r.cli + '|' + project
-    let p = map.get(key)
-    if (!p) {
-      p = { cli: r.cli, sessionId: key, project, total: 0, cost: 0, lastTs: 0 }
-      map.set(key, p)
-    }
-    p.total += r.total
-    p.cost += costFor(r)
-    if (r.ts > p.lastTs) p.lastTs = r.ts
-  }
-  return [...map.values()].sort((a, b) => b.total - a.total)
-}
-
 // Local-day key (YYYY-MM-DD) so "today" matches the user's wall clock.
+// Memoized by 15-minute bucket (900,000 ms), the finest timezone offset
+// granularity on Earth, so 60k+ records share ~3k cached Date conversions.
+const _dayKeyCache = new Map()
+const _hourStartCache = new Map()
+const _tzProbeA = new Date(1704067200000)
+const _tzProbeB = new Date(1719792000000)
+let _tzEnv = undefined
+let _tzOffA = 0
+let _tzOffB = 0
+let _tzKey = ''
+
+function currentTzKey() {
+  const env = process.env.TZ || ''
+  _tzProbeA.setTime(1704067200000)
+  _tzProbeB.setTime(1719792000000)
+  const offA = _tzProbeA.getTimezoneOffset()
+  const offB = _tzProbeB.getTimezoneOffset()
+  if (env !== _tzEnv || offA !== _tzOffA || offB !== _tzOffB) {
+    _tzEnv = env
+    _tzOffA = offA
+    _tzOffB = offB
+    let iana = ''
+    try {
+      iana = Intl.DateTimeFormat().resolvedOptions().timeZone || ''
+    } catch {}
+    _tzKey = `${env}|${offA}|${offB}|${iana}`
+    _dayKeyCache.clear()
+    _hourStartCache.clear()
+  }
+  return _tzKey
+}
+
 function dayKey(ms) {
+  currentTzKey()
+  const q = Math.floor(ms / 900000)
+  let k = _dayKeyCache.get(q)
+  if (k !== undefined) return k
   const d = new Date(ms)
   const y = d.getFullYear()
   const m = String(d.getMonth() + 1).padStart(2, '0')
   const day = String(d.getDate()).padStart(2, '0')
-  return `${y}-${m}-${day}`
+  k = `${y}-${m}-${day}`
+  if (_dayKeyCache.size > 50000) _dayKeyCache.clear()
+  _dayKeyCache.set(q, k)
+  return k
 }
 
 function hourStartLocal(ms) {
+  currentTzKey()
+  const q = Math.floor(ms / 900000)
+  let h = _hourStartCache.get(q)
+  if (h !== undefined) return h
   const d = new Date(ms)
   d.setMinutes(0, 0, 0)
-  return d.getTime()
+  h = d.getTime()
+  if (_hourStartCache.size > 50000) _hourStartCache.clear()
+  _hourStartCache.set(q, h)
+  return h
 }
 
 function subtractLive(r, live) {

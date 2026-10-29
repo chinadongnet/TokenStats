@@ -102,6 +102,29 @@ try {
   const reopened = await new UsageDb({ dbPath: file }).open()
   assert.equal(reopened.getSubscription(c.id).groupId, a.groupId)
   assert.equal(reopened.getSubscription(a.id).groupId, db.getSubscription(a.id).groupId)
+
+  const { serializeSubscriptionsForCloud } = await import('../src/main/core/cloudSync.js')
+  const withAlias = reopened.upsertSubscription({
+    name: 'Mimo Plan',
+    monthlyUsd: 30,
+    startDate: '2026-03-01',
+    active: true,
+    bindings: [{ cli: 'litellm:p1', keyAlias: 'secret-key-alias', models: ['gpt-4o'] }],
+    resetPeriods: ['monthly'],
+    resetAnchors: { monthly: '2026-03-01' },
+  })
+  const cloudPayload = serializeSubscriptionsForCloud(reopened.listSubscriptions())
+  const mimoCloud = cloudPayload.find((s) => s.id === withAlias.id)
+  assert.equal(mimoCloud.bindings[0].keyAlias, undefined, 'keyAlias must never leave the device')
+  reopened.replaceAllSubscriptions(cloudPayload.map((s) => (s.id === withAlias.id ? { ...s, monthlyUsd: 45 } : s)))
+  const afterPull = reopened.getSubscription(withAlias.id)
+  assert.equal(afterPull.monthlyUsd, 45)
+  assert.equal(afterPull.bindings[0].keyAlias, 'secret-key-alias', 'replaceAllSubscriptions preserves local keyAlias')
+  reopened.updateCloudSyncState({ subsBaseHash: 'abc12345', subsConflict: { status: 'conflict', cloudHash: 'abc' } })
+  assert.equal(reopened.getCloudSync().subsBaseHash, 'abc12345')
+  assert.equal(reopened.getCloudSync().subsConflict.status, 'conflict')
+  reopened.updateCloudSyncState({ subsConflict: null })
+  assert.equal(reopened.getCloudSync().subsConflict, null)
 } finally {
   await fsp.rm(folder, { recursive: true, force: true })
 }
@@ -141,4 +164,20 @@ assert.ok(!concurrent.ranking.includes('free'), 'free plans have an undefined ra
 assert.equal(concurrent.summary.totalTokens, concurrent.models.reduce((n, m) => n + m.total, 0))
 assert.equal(concurrent.summary.totalTokens, concurrent.plans.reduce((n, p) => n + p.cycles.reduce((sum, c) => sum + c.tokens, 0), 0))
 assert.equal(computeCycleDashboard([], [], now).summary.peakCount, 0)
+
+// Cache invalidation when multiple future-stamped records become current one by one.
+const multiFutureRecs = [
+  record(at(2026, 8, 15, 11) + 30 * 60000, 100, 1),
+  record(at(2026, 8, 15, 12), 200, 2),
+]
+const t1115 = at(2026, 8, 15, 11) + 15 * 60000
+const t1145 = at(2026, 8, 15, 11) + 45 * 60000
+const t1215 = at(2026, 8, 15, 12) + 15 * 60000
+assert.equal(computeAllSubscriptionStats([plan], multiFutureRecs, t1115)[0].totalTokens, 0)
+assert.equal(computeAllSubscriptionStats([plan], multiFutureRecs, t1145)[0].totalTokens, 100)
+assert.equal(computeAllSubscriptionStats([plan], multiFutureRecs, t1215)[0].totalTokens, 300)
+assert.equal(computeCycleDashboard([plan], multiFutureRecs, t1115).summary.totalTokens, 0)
+assert.equal(computeCycleDashboard([plan], multiFutureRecs, t1145).summary.totalTokens, 100)
+assert.equal(computeCycleDashboard([plan], multiFutureRecs, t1215).summary.totalTokens, 300)
+
 console.log('OK: full cycle dashboard, exact boundaries, model totals, historical concurrency, future exclusion and zero-fee ranking')

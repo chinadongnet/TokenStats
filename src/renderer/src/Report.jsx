@@ -1,6 +1,6 @@
 import React, { useEffect, useMemo, useRef, useState } from 'react'
 import { t, useLang } from './i18n.js'
-import { SubscriptionDashboard } from './Cycles.jsx'
+import { SubscriptionDashboard, DeviceSwitchSeg } from './Cycles.jsx'
 
 // The 5 fixed built-in CLIs. LiteLLM providers are NOT listed here — they're
 // dynamic, DB-backed entries (`litellm:<providerId>`) fetched via
@@ -63,6 +63,20 @@ export default function Report() {
   const [requests, setRequests] = useState({ rows: [], count: 0 })
   const [exporting, setExporting] = useState(false)
   const [copied, setCopied] = useState(false)
+  const [deviceView, setDeviceView] = useState(null)
+
+  const isLocalDeviceView =
+    !deviceView?.hasCloudData ||
+    deviceView.selectedDevice === 'local' ||
+    Boolean(deviceView.currentKeyId && deviceView.selectedDevice === deviceView.currentKeyId)
+
+  useEffect(() => {
+    if (!isLocalDeviceView) {
+      if (view === 'requests') setView('charts')
+      if (breakdown === 'project') setBreakdown('model')
+      if (dayBreakdown === 'project') setDayBreakdown('model')
+    }
+  }, [isLocalDeviceView, view, breakdown, dayBreakdown])
 
   const today = floorDay(Date.now())
   const { fromMs, toMs } = useMemo(() => {
@@ -93,23 +107,61 @@ export default function Report() {
     setPlanBd(bd)
   }
 
+  useEffect(() => {
+    window.api.devicesGet?.().then((v) => v && setDeviceView(v))
+  }, [])
   useEffect(() => { load() }, [day, fromMs, toMs])
-  useEffect(() => window.api.onReportUpdated(() => load()), [day, fromMs, toMs])
+  useEffect(() => window.api.onReportUpdated(() => {
+    window.api.devicesGet?.().then((v) => v && setDeviceView(v))
+    load()
+  }), [day, fromMs, toMs])
+  useEffect(() => (window.api.onDeviceView ? window.api.onDeviceView((v) => {
+    if (v) setDeviceView(v)
+    load()
+    loadProviders()
+  }) : () => {}), [day, fromMs, toMs])
 
   async function loadProviders() {
-    setProviders(await window.api.litellmListProviders())
+    const [localList, snap] = await Promise.all([
+      window.api.litellmListProviders(),
+      window.api.getSnapshot ? window.api.getSnapshot() : Promise.resolve(null),
+    ])
+    const byId = new Map()
+    for (const p of localList || []) {
+      const cliId = String(p.id || '').startsWith('litellm:') ? p.id : 'litellm:' + p.id
+      byId.set(cliId, { id: cliId, label: p.name || p.label || cliId, color: p.color || '#f59e0b' })
+    }
+    for (const p of snap?.providers || []) {
+      const cliId = String(p.id || '').startsWith('litellm:') ? p.id : 'litellm:' + p.id
+      if (!byId.has(cliId)) {
+        byId.set(cliId, { id: cliId, label: p.label || p.name || cliId, color: p.color || '#f59e0b' })
+      }
+    }
+    setProviders([...byId.values()])
   }
   useEffect(() => { loadProviders() }, [])
   useEffect(() => window.api.onReportUpdated(() => loadProviders()), [])
 
-  // 5 fixed built-in CLIs + whatever LiteLLM providers currently exist.
+  // 5 fixed built-in CLIs + local & remote LiteLLM providers + any dynamic CLI
+  // present in the active device view's usage rows.
   const { CLI, ORDER } = useMemo(() => {
-    const dyn = providers.map((p) => ({ id: 'litellm:' + p.id, label: p.name, color: p.color }))
+    const dynMap = new Map()
+    for (const p of providers) {
+      const cliId = String(p.id || '').startsWith('litellm:') ? p.id : 'litellm:' + p.id
+      dynMap.set(cliId, { id: cliId, label: p.label || p.name || cliId, color: p.color || '#f59e0b' })
+    }
+    for (const row of [...daily, ...hourly, ...models, ...dayModels]) {
+      const cliId = row?.cli
+      if (cliId && !FIXED_CLI[cliId] && !dynMap.has(cliId)) {
+        dynMap.set(cliId, { id: cliId, label: FALLBACK_META(cliId).label, color: '#f59e0b' })
+      }
+    }
+    const dyn = [...dynMap.values()]
     return {
       CLI: { ...FIXED_CLI, ...Object.fromEntries(dyn.map((p) => [p.id, { label: p.label, color: p.color }])) },
       ORDER: [...FIXED_ORDER, ...dyn.map((p) => p.id)],
     }
-  }, [providers])
+  }, [providers, daily, hourly, models, dayModels])
 
   // A provider added after this window opened should default to "shown".
   useEffect(() => {
@@ -207,11 +259,12 @@ export default function Report() {
     <div className="report">
       <header className="rep-head">
         <div className="rep-title"><span className="logo" /> {t('rep.title')}</div>
-        <div className="rep-actions">
+        <div className="rep-actions" style={{ flexWrap: 'wrap' }}>
+          <DeviceSwitchSeg />
           <div className="seg">
             <button className={view === 'charts' ? 'on' : ''} onClick={() => setView('charts')}>{t('rep.charts')}</button>
             <button className={view === 'hour' ? 'on' : ''} onClick={() => setView('hour')}>{t('rep.byHour')}</button>
-            <button className={view === 'requests' ? 'on' : ''} onClick={() => setView('requests')}>{t('rep.logs')}</button>
+            {isLocalDeviceView && <button className={view === 'requests' ? 'on' : ''} onClick={() => setView('requests')}>{t('rep.logs')}</button>}
             <button className={view === 'subs' ? 'on' : ''} onClick={() => setView('subs')}>{t('rep.tokenPlans')}</button>
           </div>
           {view === 'charts' && (
@@ -277,6 +330,7 @@ export default function Report() {
         projects={shownDayProjects}
         CLI={CLI}
         label={dayLabel(day)}
+        allowProjects={isLocalDeviceView}
       />
       </>
       )}
@@ -317,6 +371,7 @@ export default function Report() {
         CLI={CLI}
         label={fmtRange(fromMs, toMs)}
         plans={planBd}
+        allowProjects={isLocalDeviceView}
       />
       </>
       )}
@@ -341,7 +396,7 @@ function Tile({ label, value, sub, accent }) {
 // By-plan / by-model / by-project token+cost breakdown, shared by the Charts
 // and By-hour tabs. `plans` (subs:breakdown data) is only passed on the Charts
 // tab — plan fees are monthly, so a per-day plan grouping isn't meaningful.
-function Breakdown({ mode, setMode, models, projects, CLI, label, plans }) {
+function Breakdown({ mode, setMode, models, projects, CLI, label, plans, allowProjects = true }) {
   const maxModel = Math.max(1, ...models.map((m) => m.total))
   const maxProject = Math.max(1, ...projects.map((p) => p.total))
   return (
@@ -350,7 +405,7 @@ function Breakdown({ mode, setMode, models, projects, CLI, label, plans }) {
         <div className="seg">
           {plans && <button className={mode === 'plan' ? 'on' : ''} onClick={() => setMode('plan')}>{t('rep.byPlan')}</button>}
           <button className={mode === 'model' ? 'on' : ''} onClick={() => setMode('model')}>{t('rep.byModel')}</button>
-          <button className={mode === 'project' ? 'on' : ''} onClick={() => setMode('project')}>{t('rep.byProject')}</button>
+          {allowProjects && <button className={mode === 'project' ? 'on' : ''} onClick={() => setMode('project')}>{t('rep.byProject')}</button>}
         </div>
         <span className="card-sub">{label}</span>
       </div>

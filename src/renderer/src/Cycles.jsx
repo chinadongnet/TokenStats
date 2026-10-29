@@ -113,6 +113,43 @@ function Overview({ data, onSelect }) {
   </>
 }
 
+// Reusable device-switcher pill segment for the Report and Cycles windows.
+export function DeviceSwitchSeg() {
+  useLang()
+  const [deviceView, setDeviceView] = useState(null)
+  useEffect(() => {
+    window.api.devicesGet?.().then((d) => d && setDeviceView(d))
+    return window.api.onDeviceView ? window.api.onDeviceView((d) => d && setDeviceView(d)) : () => {}
+  }, [])
+  if (!deviceView?.hasCloudData || !deviceView.devices?.length) return null
+  return (
+    <div className="seg">
+      <button
+        className={deviceView.selectedDevice === 'account' ? 'on' : ''}
+        title={t('dev.accountTip')}
+        onClick={() => window.api.devicesSelect?.('account')}
+      >
+        {t('dev.account')}
+      </button>
+      {deviceView.devices.map((d) => (
+        <button
+          key={d.id}
+          className={deviceView.selectedDevice === d.id ? 'on' : ''}
+          title={
+            d.name +
+            (d.isCurrent ? ' ' + t('dev.currentTag') : '') +
+            (d.lastSyncAt ? ' · ' + t('dev.syncedTip', { time: new Date(d.lastSyncAt).toLocaleString() }) : '')
+          }
+          onClick={() => window.api.devicesSelect?.(d.id)}
+        >
+          {d.isCurrent && <i className="curdot" />}
+          {d.name}
+        </button>
+      ))}
+    </div>
+  )
+}
+
 // Shared by the dedicated cycle window and the report's subscription tab.
 export function SubscriptionDashboard({ embedded = false, renderOverviewExtra }) {
   useLang()
@@ -139,7 +176,14 @@ export function SubscriptionDashboard({ embedded = false, renderOverviewExtra })
   }
   const plan = data?.plans.find((p) => p.id === selected)
   return <div className={embedded ? 'cycles-view cycles-embedded' : 'report cycles-view'} ref={view}>
-    <header className="cd-header"><div className="rep-title"><span className="logo" /> {t(embedded ? 'rep.tokenPlans' : 'cyc.title')}</div><div><span>{data ? t('cd.updated', { time: new Date(data.asOf).toLocaleTimeString() }) : ''}</span><button className="cd-text-button" onClick={() => window.api.openSettings()}>{t('cd.manage')} ↗</button></div></header>
+    <header className="cd-header">
+      <div className="rep-title"><span className="logo" /> {t(embedded ? 'rep.tokenPlans' : 'cyc.title')}</div>
+      <div style={{ display: 'flex', alignItems: 'center', gap: 10 }}>
+        {!embedded && <DeviceSwitchSeg />}
+        <span>{data ? t('cd.updated', { time: new Date(data.asOf).toLocaleTimeString() }) : ''}</span>
+        <button className="cd-text-button" onClick={() => window.api.openSettings()}>{t('cd.manage')} ↗</button>
+      </div>
+    </header>
     {error && <div className="cd-error" role="alert">{t('cd.loadError')} {error}</div>}
     {!data ? <div className="empty">{t('common.loading')}</div> : !data.plans.length ? <div className="cd-panel cd-empty">{t('cyc.empty')}</div>
       : plan ? <Detail key={plan.id} plan={plan} asOf={data.asOf} labels={data.cliLabels} onBack={() => select(null)} /> : <><Overview data={data} onSelect={select} />{renderOverviewExtra?.(data)}</>}

@@ -155,8 +155,8 @@ function levelColor(frac) {
 // usage means splitting the fee over the same span. A month is treated as 4
 // weeks of 7 days — so week = fee/4 and day = fee/28 stay consistent with each
 // other (a "/30 day" against a "/4 week" would not add up).
-const SCOPE_DIV = { day: 28, week: 4, month: 1 }
-const scopeFee = (monthlyUsd, scope) => (Number(monthlyUsd) || 0) / SCOPE_DIV[scope]
+const SCOPE_DIV = { day: 28, week: 4, month: 1, all: 1 }
+const scopeFee = (monthlyUsd, scope) => (Number(monthlyUsd) || 0) / (SCOPE_DIV[scope] || 1)
 const scopeLabel = (scope) => t('scope.' + scope)
 
 // "M/D - M/D" over [start, end) — end is exclusive everywhere in subscriptions.js,
@@ -171,7 +171,7 @@ const spanText = (start, end) => `${md(start)} - ${md(end - 1)}`
 // billing cycles are shown separately below, and can have different anchors;
 // labeling this line with one of those cycles would misdescribe these numbers.
 const scopeSpan = (scope, ranges) => {
-  if (scope === 'day') return ''
+  if (scope === 'day' || scope === 'all') return ''
   if (!ranges) return ''
   if (scope === 'week') {
     if (!ranges.weekStart) return ''
@@ -289,6 +289,10 @@ export default function App() {
   const [copied, setCopied] = useState(false)
   const [resets, setResets] = useState([])
   const [subs, setSubs] = useState([]) // for the monthly subscription total
+  const [subStats, setSubStats] = useState([]) // for all-time cumulative paid total
+  const [deviceView, setDeviceView] = useState(null)
+  const [cloudConflict, setCloudConflict] = useState(null)
+  const [resolvingConflict, setResolvingConflict] = useState(false)
   const [now, setNow] = useState(() => Date.now())
 
   useEffect(() => {
@@ -298,15 +302,73 @@ export default function App() {
     // hidden.
     const loadResets = () => window.api.subsResets().then(setResets)
     const loadSubs = () => window.api.subsList().then((r) => setSubs(r || []))
-    window.api.getSnapshot().then(setSnap)
+    const loadSubStats = () => window.api.subsStats().then((r) => setSubStats(r || []))
+    const loadCloud = () => window.api.cloudSyncGet().then((c) => setCloudConflict(c?.subsConflict || null))
+    const loadDevices = () => window.api.devicesGet?.().then((d) => d && setDeviceView(d))
+    window.api.getSnapshot().then((s) => {
+      setSnap(s)
+      if (s?.deviceView) setDeviceView(s.deviceView)
+    })
     loadResets()
     loadSubs()
-    return window.api.onSnapshot((s) => {
+    loadSubStats()
+    loadCloud()
+    loadDevices()
+    const offSnap = window.api.onSnapshot((s) => {
       setSnap(s)
+      if (s?.deviceView) setDeviceView(s.deviceView)
       loadResets()
       loadSubs()
+      loadSubStats()
+      loadCloud()
     })
+    const offDev = window.api.onDeviceView
+      ? window.api.onDeviceView((d) => {
+          if (d) setDeviceView(d)
+          loadResets()
+          loadSubStats()
+        })
+      : () => {}
+    return () => {
+      offSnap()
+      offDev()
+    }
   }, [])
+
+  async function selectDevice(deviceId) {
+    if (!window.api.devicesSelect) return
+    const next = await window.api.devicesSelect(deviceId)
+    if (next) setDeviceView(next)
+    const s = await window.api.getSnapshot()
+    setSnap(s)
+    window.api.subsResets().then(setResets)
+    window.api.subsStats().then((r) => setSubStats(r || []))
+  }
+
+  async function refreshAll() {
+    if (window.api.devicesRefresh) {
+      await window.api.devicesRefresh()
+    }
+    const s = await window.api.getSnapshot()
+    setSnap(s)
+    if (s?.deviceView) setDeviceView(s.deviceView)
+    window.api.subsResets().then(setResets)
+    window.api.subsStats().then((r) => setSubStats(r || []))
+  }
+
+  async function resolveConflictQuick(strategy) {
+    setResolvingConflict(true)
+    try {
+      const res = await window.api.cloudSyncResolveConflict(strategy)
+      setCloudConflict(res?.state?.subsConflict || null)
+      const nextSubs = await window.api.subsList()
+      setSubs(nextSubs || [])
+      const nextResets = await window.api.subsResets()
+      setResets(nextResets || [])
+    } finally {
+      setResolvingConflict(false)
+    }
+  }
 
   // Keeps the countdown moving between snapshots. Remaining time is derived
   // locally from each window's `end`, so a window expiring while idle flips to
@@ -340,11 +402,47 @@ export default function App() {
 
   // Total monthly fee of currently-active subscriptions (task: top-right badge).
   const monthlyTotal = subs.reduce((a, s) => a + (s.active ? Number(s.monthlyUsd) || 0 : 0), 0)
+  const allTimePaidTotal =
+    subStats.reduce((a, s) => a + (Number(s.totalPaid) || 0), 0) || monthlyTotal
+  const subPaidByGroup = useMemo(() => {
+    const m = new Map()
+    for (const s of subStats) {
+      const paid = Number(s.totalPaid) || 0
+      const gKey = s.groupId || s.id
+      if (gKey) m.set(gKey, paid)
+      if (s.id) m.set(s.id, paid)
+      for (const p of s.periods || []) {
+        if (p?.id) m.set(p.id, paid)
+      }
+    }
+    return m
+  }, [subStats])
+  const planPaidAllTime = (plan) => {
+    if (!plan) return 0
+    const gKey = plan.groupId || plan.id
+    if (gKey && subPaidByGroup.has(gKey)) return subPaidByGroup.get(gKey)
+    if (plan.id && subPaidByGroup.has(plan.id)) return subPaidByGroup.get(plan.id)
+    return Number(plan.monthlyUsd) || 0
+  }
 
   if (!snap) return <div className="loading">{t('app.scanning')}</div>
 
-  const per = scope === 'day' ? snap.todayPerCli : scope === 'week' ? snap.weekPerCli : snap.monthPerCli || snap.perCli
-  const perModelSrc = scope === 'day' ? snap.todayPerModel : scope === 'week' ? snap.weekPerModel : snap.monthPerModel || snap.perModel
+  const per =
+    scope === 'day'
+      ? snap.todayPerCli
+      : scope === 'week'
+        ? snap.weekPerCli
+        : scope === 'month'
+          ? snap.monthPerCli || snap.perCli
+          : snap.perCli
+  const perModelSrc =
+    scope === 'day'
+      ? snap.todayPerModel
+      : scope === 'week'
+        ? snap.weekPerModel
+        : scope === 'month'
+          ? snap.monthPerModel || snap.perModel
+          : snap.perModel
   // Models grouped by CLI (biggest first) for each plan's in-place breakdown.
   const modelsByCli = new Map()
   for (const m of perModelSrc || []) {
@@ -380,6 +478,7 @@ export default function App() {
             <button className={scope === 'day' ? 'on' : ''} title={t('app.scopeDay')} onClick={() => setScope('day')}>{t('scope.day')}</button>
             <button className={scope === 'week' ? 'on' : ''} title={t('app.scopeWeek')} onClick={() => setScope('week')}>{t('scope.week')}</button>
             <button className={scope === 'month' ? 'on' : ''} title={t('app.scopeMonth')} onClick={() => setScope('month')}>{t('scope.month')}</button>
+            <button className={scope === 'all' ? 'on' : ''} title={t('app.scopeAll')} onClick={() => setScope('all')}>{t('scope.all')}</button>
           </div>
           <button className="ghost ico" title={t('app.reportTitle')} onClick={() => window.api.openReport()}><ReportIcon /></button>
           <button className="ghost ico" title={t('app.settingsTitle')} onClick={() => window.api.openSettings()}><SettingsIcon /></button>
@@ -393,33 +492,119 @@ export default function App() {
             )}
             {copied && <div className="shot-toast">{t('app.copied')}</div>}
           </div>
-          <button className="ghost ico" title={t('app.refresh')} onClick={() => window.api.getSnapshot().then(setSnap)}><RefreshIcon /></button>
+          <button className="ghost ico" title={t('app.refresh')} onClick={refreshAll}><RefreshIcon /></button>
           <button className="ghost ico" title={t('app.hide')} onClick={() => window.api.hide()}><MinimizeIcon /></button>
         </div>
       </header>
 
+      {deviceView?.hasCloudData && deviceView.devices?.length > 0 && (
+        <div className="devbar">
+          <button
+            className={deviceView.selectedDevice === 'account' ? 'on' : ''}
+            title={t('dev.accountTip')}
+            onClick={() => selectDevice('account')}
+          >
+            {t('dev.account')}
+          </button>
+          {deviceView.devices.map((d) => (
+            <button
+              key={d.id}
+              className={deviceView.selectedDevice === d.id ? 'on' : ''}
+              title={
+                d.name +
+                (d.isCurrent ? ' ' + t('dev.currentTag') : '') +
+                (d.lastSyncAt ? ' · ' + t('dev.syncedTip', { time: new Date(d.lastSyncAt).toLocaleString() }) : '')
+              }
+              onClick={() => selectDevice(d.id)}
+            >
+              {d.isCurrent && <i className="curdot" />}
+              {d.name}
+            </button>
+          ))}
+        </div>
+      )}
+
       <div className="scroll">
+        {cloudConflict && (
+          <div
+            style={{
+              margin: '6px 10px 2px',
+              padding: '7px 9px',
+              borderRadius: 7,
+              border: '1px solid rgba(245, 158, 11, 0.55)',
+              background: 'rgba(245, 158, 11, 0.1)',
+              fontSize: 11.5,
+              display: 'flex',
+              alignItems: 'center',
+              justifyContent: 'space-between',
+              gap: 6,
+              flexWrap: 'wrap',
+            }}
+          >
+            <span
+              style={{ color: '#fbbf24', fontWeight: 600, cursor: 'pointer' }}
+              onClick={() => window.api.openSettings()}
+            >
+              ⚠️ {t('app.conflictBanner', {
+                n:
+                  (cloudConflict.diff?.onlyInCloud?.length || 0) +
+                  (cloudConflict.diff?.onlyInLocal?.length || 0) +
+                  (cloudConflict.diff?.modified?.length || 0),
+              })}
+            </span>
+            <span style={{ display: 'inline-flex', gap: 4 }}>
+              <button
+                className="ghost"
+                style={{ padding: '2px 6px', fontSize: 11, border: '1px solid rgba(251,191,36,0.5)', borderRadius: 4 }}
+                disabled={resolvingConflict}
+                onClick={() => resolveConflictQuick('merge')}
+              >
+                {t('app.conflictMerge')}
+              </button>
+              <button
+                className="ghost"
+                style={{ padding: '2px 6px', fontSize: 11, border: '1px solid rgba(255,255,255,0.2)', borderRadius: 4 }}
+                disabled={resolvingConflict}
+                onClick={() => resolveConflictQuick('use_local')}
+              >
+                {t('app.conflictLocal')}
+              </button>
+              <button
+                className="ghost"
+                style={{ padding: '2px 6px', fontSize: 11, border: '1px solid rgba(255,255,255,0.2)', borderRadius: 4 }}
+                disabled={resolvingConflict}
+                onClick={() => resolveConflictQuick('use_cloud')}
+              >
+                {t('app.conflictCloud')}
+              </button>
+            </span>
+          </div>
+        )}
         <div className="sum">
           <b>{compact(totalTok)}</b>
           <span className="u">{t('common.tokens')}</span>
           {/* The subscription side of the same scope: what all active plans cost
               over the selected span (monthly fee ÷ 4 for a week, ÷ 28 for a day),
               and what this scope's usage is worth against it. */}
-          {monthlyTotal > 0 && (
-            <span
-              className="mo"
-              title={t('app.scopeRateTip', {
-                scope: scopeLabel(scope),
-                cost: usd(totalCost),
-                fee: usd(scopeFee(monthlyTotal, scope)),
-                usd: usd(monthlyTotal),
-                div: SCOPE_DIV[scope],
-                pct: Math.round((totalCost / scopeFee(monthlyTotal, scope)) * 100),
-              })}
-            >
-              {t('app.scopeFee', { scope: scopeLabel(scope) })} <b>${usd(scopeFee(monthlyTotal, scope))}</b>
-            </span>
-          )}
+          {(scope === 'all' ? allTimePaidTotal > 0 : monthlyTotal > 0) && (() => {
+            const feeVal = scope === 'all' ? allTimePaidTotal : scopeFee(monthlyTotal, scope)
+            return (
+              <span
+                className="mo"
+                title={t('app.scopeRateTip', {
+                  scope: scopeLabel(scope),
+                  cost: usd(totalCost),
+                  fee: usd(feeVal),
+                  usd: usd(scope === 'all' ? allTimePaidTotal : monthlyTotal),
+                  div: SCOPE_DIV[scope],
+                  pct: Math.round((totalCost / feeVal) * 100),
+                })}
+              >
+                {scope === 'all' ? t('app.scopeFeeAll') : t('app.scopeFee', { scope: scopeLabel(scope) })}{' '}
+                <b>${usd(feeVal)}</b>
+              </span>
+            )
+          })()}
         </div>
 
         <div className="cards">
@@ -458,8 +643,11 @@ export default function App() {
                     plan's fee for the SAME span. A plan bound to several CLIs
                     shows its full share on each of their cards — the fee is not
                     split, since there's no meaningful way to attribute it. */}
-                {plan && plan.monthlyUsd > 0 && (() => {
-                  const fee = scopeFee(plan.monthlyUsd, scope)
+                {plan && (scope === 'all' ? planPaidAllTime(plan) > 0 : plan.monthlyUsd > 0) && (() => {
+                  const fee =
+                    scope === 'all'
+                      ? planPaidAllTime(plan)
+                      : scopeFee(plan.monthlyUsd, scope)
                   const pct = (d.cost / fee) * 100
                   const span = scopeSpan(scope, snap.ranges)
                   return (
@@ -469,12 +657,12 @@ export default function App() {
                         scope: scopeLabel(scope),
                         cost: usd(d.cost),
                         fee: usd(fee),
-                        usd: usd(plan.monthlyUsd),
+                        usd: usd(scope === 'all' ? fee : plan.monthlyUsd),
                         div: SCOPE_DIV[scope],
                         pct: Math.round(pct),
                       })}
                     >
-                      {t('app.scopeFee', { scope: scopeLabel(scope) })} <b>${usd(fee)}</b>
+                      {scope === 'all' ? t('app.scopeFeeAll') : t('app.scopeFee', { scope: scopeLabel(scope) })} <b>${usd(fee)}</b>
                       {span && <span className="span">({span})</span>}
                       <em className={valueClass(pct)}>{Math.round(pct)}%</em>
                     </div>
