@@ -417,6 +417,27 @@ if (distinctCursorAcc.totals.all.total !== 300) {
   throw new Error(`Expected distinct Cursor accounts (100 + 200) to sum to 300, got ${distinctCursorAcc.totals.all.total}`)
 }
 
+// Verify switching Cursor accounts updates cursorAccountHash, buildStatusSnapshot, and cloudServerSourceOwners
+const { buildStatusSnapshot } = await import('../src/main/core/cloudSync.js')
+const cursorRecsA = [{ cli: 'cursor', ts: nowHour, model: 'claude-4', input: 50, output: 50, cacheRead: 0, cacheCreate: 0, reasoning: 0, total: 100, turns: 1, dedupKey: 'cursor-cloud:acct-a:1' }]
+const cursorRecsB = [{ cli: 'cursor', ts: nowHour, model: 'claude-4', input: 100, output: 100, cacheRead: 0, cacheCreate: 0, reasoning: 0, total: 200, turns: 2, dedupKey: 'cursor-cloud:acct-b:1' }]
+db.saveCursorUsage('user|acct-a', cursorRecsA)
+const hashA = db.cursorAccountHash()
+db.saveCursorUsage('user|acct-b', cursorRecsB)
+const hashB = db.cursorAccountHash()
+if (!hashA || !hashB || hashA === hashB) {
+  throw new Error(`Expected distinct Cursor account hashes after account switch, got ${hashA} vs ${hashB}`)
+}
+const snapB = buildStatusSnapshot({ db, store: { dedupedRecords: () => cursorRecsB }, liveByCli: {}, appVersion: '0.2.52' })
+if (snapB.cliMeta?.cursor?.accountId !== hashB) {
+  throw new Error(`Expected buildStatusSnapshot to advertise active account hash ${hashB}, got ${snapB.cliMeta?.cursor?.accountId}`)
+}
+const snapBackToA = buildStatusSnapshot({ db, store: { dedupedRecords: () => cursorRecsA }, liveByCli: {}, appVersion: '0.2.52' })
+if (snapBackToA.cliMeta?.cursor?.accountId !== hashA) {
+  throw new Error(`Expected buildStatusSnapshot to follow active parser records back to ${hashA}, got ${snapBackToA.cliMeta?.cursor?.accountId}`)
+}
+db.ingest([])
+
 // Verify non-whole-hour timezone bucket weighting (e.g., 10:30 UTC bucket with 10:45 UTC cutoff -> 75%)
 const halfHourStart = Date.UTC(2026, 9, 29, 10, 30, 0)
 const quarterPastCutoff = Date.UTC(2026, 9, 29, 10, 45, 0)

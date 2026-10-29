@@ -142,6 +142,7 @@ async function init() {
     configureCursorArchive({
       load: (userId) => db.listCursorUsage(userId, legacyRows),
       save: (userId, rows) => db.saveCursorUsage(userId, rows),
+      activate: (userId) => db.setActiveCursorUser(userId),
     })
   }
   store.on('update', (snap) => {

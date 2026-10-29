@@ -389,9 +389,15 @@ async function fetchUsageSummary(token) {
 const MIN_FETCH_INTERVAL_MS = 20 * 1000
 const cacheByUser = new Map() // userId -> { records, fetchedAt, retryAt }
 let archive = {}
+let activeUserId = null
 export function configureCursorArchive(hooks) {
   archive = hooks || {}
+  activeUserId = null
   cacheByUser.clear()
+}
+
+export function cursorActiveUserId() {
+  return activeUserId
 }
 
 export function forceRefreshCursor() {
@@ -434,12 +440,20 @@ export function cursorResetWindows() {
 async function getCloudRecords(token) {
   const payload = decodeJwt(token)
   const userId = payload?.sub ? String(payload.sub) : 'unknown'
+  const tagUser = (rows) =>
+    userId && userId !== 'unknown'
+      ? (rows || []).map((r) => (r && r.userId === userId ? r : { ...r, userId }))
+      : rows || []
+  if (userId && userId !== 'unknown') {
+    activeUserId = userId
+    archive.activate?.(userId)
+  }
   let entry = cacheByUser.get(userId)
   if (!entry) {
     const initialRecords = typeof archive.load === 'function'
       ? (archive.load(userId) || [])
       : await loadDefaultArchive(userId)
-    entry = { records: initialRecords, fetchedAt: 0, retryAt: 0 }
+    entry = { records: tagUser(initialRecords), fetchedAt: 0, retryAt: 0 }
     cacheByUser.set(userId, entry)
   }
   if (entry.inFlight) return entry.inFlight
@@ -460,7 +474,7 @@ async function getCloudRecords(token) {
     const fromMs = entry.records.length ? Math.max(0, Math.floor(resumeBase / 3600000) * 3600000) : 0
     const [usage, summary] = await Promise.allSettled([fetchUsageCsv(token, fromMs), fetchUsageSummary(token)])
     if (usage.status === 'fulfilled') {
-      const records = [...entry.records.filter((r) => r.ts < fromMs), ...usage.value]
+      const records = tagUser([...entry.records.filter((r) => r.ts < fromMs), ...usage.value])
       if (JSON.stringify(records) !== JSON.stringify(entry.records)) {
         entry.records = records
         cursor.revision++
@@ -499,7 +513,11 @@ export const cursor = {
   match: (file) => path.basename(file) === 'state.vscdb',
   async parseFile(file) {
     const token = await readAccessToken(file)
-    if (!token) throw new Error('Cursor access token unavailable')
+    if (!token) {
+      activeUserId = null
+      archive.activate?.(null)
+      throw new Error('Cursor access token unavailable')
+    }
     return getCloudRecords(token)
   },
 }

@@ -99,7 +99,8 @@ CREATE INDEX IF NOT EXISTS idx_litellm_usage_provider ON litellm_usage(provider_
 
 CREATE TABLE IF NOT EXISTS cursor_usage_archive (
   user_id TEXT PRIMARY KEY,
-  records_json TEXT NOT NULL
+  records_json TEXT NOT NULL,
+  updated_at INTEGER NOT NULL DEFAULT 0
 );
 
 CREATE TABLE IF NOT EXISTS applied_migrations (
@@ -183,6 +184,8 @@ function migrateSchema(db) {
   if (!cloudCols.has('selected_device')) db.run("ALTER TABLE cloud_sync ADD COLUMN selected_device TEXT NOT NULL DEFAULT 'account'")
   const rootHourly = columns('usage_root_hourly')
   if (!rootHourly.has('parts_json')) db.run('ALTER TABLE usage_root_hourly ADD COLUMN parts_json TEXT')
+  const cursorArchiveCols = columns('cursor_usage_archive')
+  if (!cursorArchiveCols.has('updated_at')) db.run('ALTER TABLE cursor_usage_archive ADD COLUMN updated_at INTEGER NOT NULL DEFAULT 0')
   if (!subs.has('reset_periods')) {
     db.run('ALTER TABLE subscriptions ADD COLUMN reset_periods TEXT')
     // Quota windows were briefly a single-select `reset_period` column before
@@ -238,6 +241,16 @@ export class UsageDb {
   // Rebuild the hourly table from the full record set, then persist to disk.
   ingest(records) {
     this._lastIngestedRecords = Array.isArray(records) ? records.map((r) => ({ ...r })) : []
+    const cursorRecs = this._lastIngestedRecords.filter((r) => r && r.cli === 'cursor')
+    if (cursorRecs.length) {
+      const matchedUser = this._resolveCursorUserFromRecords(cursorRecs)
+      if (matchedUser) {
+        this._activeCursorUserId = matchedUser
+        this.db.run('UPDATE cursor_usage_archive SET updated_at = ? WHERE user_id = ?', [this._nextCursorArchiveTs(), matchedUser])
+      }
+    } else {
+      this._activeCursorUserId = null
+    }
     const buckets = new Map() // key: hour|cli|model
     const rootBuckets = new Map() // key: hour|cli|root|model
     for (const r of records) {
@@ -603,26 +616,137 @@ export class UsageDb {
     return this.hourlySince(0).filter((r) => r.cli === 'agy')
   }
 
+  _nextCursorArchiveTs() {
+    const maxRow = this.rows('SELECT COALESCE(MAX(updated_at), 0) AS m FROM cursor_usage_archive')[0]
+    const next = Math.max(Date.now(), (this._cursorArchiveSeq || 0) + 1, (Number(maxRow?.m) || 0) + 1)
+    this._cursorArchiveSeq = next
+    return next
+  }
+
+  setActiveCursorUser(userId) {
+    const uid = userId && userId !== 'unknown' ? String(userId) : null
+    this._activeCursorUserId = uid
+    if (uid) {
+      const existing = this.rows('SELECT user_id FROM cursor_usage_archive WHERE user_id = ?', [uid])[0]
+      if (existing) {
+        this.db.run('UPDATE cursor_usage_archive SET updated_at = ? WHERE user_id = ?', [this._nextCursorArchiveTs(), uid])
+        this.persist()
+      }
+    }
+  }
+
   listCursorUsage(userId, legacyRows = null) {
+    const uid = userId && userId !== 'unknown' ? String(userId) : null
+    if (uid) this._activeCursorUserId = uid
     const row = this.rows('SELECT records_json FROM cursor_usage_archive WHERE user_id = ?', [userId])[0]
-    if (row) return JSON.parse(row.records_json)
+    if (row) {
+      if (uid) {
+        this.db.run('UPDATE cursor_usage_archive SET updated_at = ? WHERE user_id = ?', [this._nextCursorArchiveTs(), uid])
+      }
+      const parsed = JSON.parse(row.records_json)
+      return uid ? parsed.map((r) => (r && r.userId === uid ? r : { ...r, userId: uid })) : parsed
+    }
     // Upgrade existing installs without losing older hourly totals. Historical
     // buckets remain aggregates; recent buckets become real request rows.
     if (this.rows('SELECT user_id FROM cursor_usage_archive LIMIT 1').length) return []
     return (legacyRows || this.hourlySince(0)).filter((r) => r.cli === 'cursor').map((r) => ({
-      ...r, ts: r.hour, sessionId: 'cloud', project: 'cursor',
+      ...r,
+      ...(uid ? { userId: uid } : {}),
+      ts: r.hour,
+      sessionId: 'cloud',
+      project: 'cursor',
       dedupKey: `cursor-legacy:${r.hour}:${r.model}`,
     }))
   }
 
   saveCursorUsage(userId, records) {
-    this.db.run('INSERT INTO cursor_usage_archive (user_id, records_json) VALUES (?, ?) ON CONFLICT(user_id) DO UPDATE SET records_json=excluded.records_json',
-      [userId, JSON.stringify(records)])
+    const uid = userId && userId !== 'unknown' ? String(userId) : null
+    if (uid) this._activeCursorUserId = uid
+    const tagged = uid
+      ? (records || []).map((r) => (r && r.userId === uid ? r : { ...r, userId: uid }))
+      : records || []
+    const updatedAt = this._nextCursorArchiveTs()
+    this.db.run(
+      `INSERT INTO cursor_usage_archive (user_id, records_json, updated_at) VALUES (?, ?, ?)
+       ON CONFLICT(user_id) DO UPDATE SET records_json=excluded.records_json, updated_at=excluded.updated_at`,
+      [userId, JSON.stringify(tagged), updatedAt]
+    )
     this.persist()
   }
 
-  cursorAccountHash() {
-    const r = this.rows('SELECT user_id FROM cursor_usage_archive LIMIT 1')[0]
+  _resolveCursorUserFromRecords(cursorRecs) {
+    if (!Array.isArray(cursorRecs) || !cursorRecs.length) return null
+    for (let i = cursorRecs.length - 1; i >= 0; i--) {
+      const r = cursorRecs[i]
+      const uid = r?.userId || r?.cursorUserId || r?.accountId
+      if (uid && uid !== 'unknown') return String(uid)
+    }
+    const archives = this.rows('SELECT user_id, records_json FROM cursor_usage_archive ORDER BY updated_at DESC')
+    if (!archives.length) return null
+    const dedupKeys = new Set()
+    const exactKeys = new Set()
+    const hourKeys = new Set()
+    for (const r of cursorRecs) {
+      if (r.dedupKey && !String(r.dedupKey).startsWith('cursor-legacy:')) dedupKeys.add(String(r.dedupKey))
+      const ts = r.ts ?? r.hour
+      if (Number.isFinite(ts)) {
+        exactKeys.add(`${ts}|${r.model || ''}|${r.total || 0}`)
+        hourKeys.add(`${floorHourLocal(ts)}|${r.model || ''}|${r.total || 0}`)
+      }
+    }
+    let bestUserId = null
+    let bestScore = 0
+    for (const a of archives) {
+      let parsed = []
+      try {
+        parsed = JSON.parse(a.records_json || '[]')
+      } catch {
+        parsed = []
+      }
+      let score = 0
+      for (const ar of parsed) {
+        if (ar.dedupKey && dedupKeys.has(String(ar.dedupKey))) score += 10
+        const ts = ar.ts ?? ar.hour
+        if (Number.isFinite(ts)) {
+          if (exactKeys.has(`${ts}|${ar.model || ''}|${ar.total || 0}`)) score += 2
+          else if (hourKeys.has(`${floorHourLocal(ts)}|${ar.model || ''}|${ar.total || 0}`)) score += 1
+        }
+      }
+      if (score > bestScore) {
+        bestScore = score
+        bestUserId = a.user_id
+      }
+    }
+    return bestScore > 0 ? String(bestUserId) : null
+  }
+
+  cursorAccountHash(records = null) {
+    if (Array.isArray(records)) {
+      const passedCursor = records.filter((r) => r && r.cli === 'cursor')
+      if (passedCursor.length) {
+        const resolved = this._resolveCursorUserFromRecords(passedCursor)
+        if (resolved) {
+          this._activeCursorUserId = resolved
+          return hashCursorAccount(resolved)
+        }
+      }
+    }
+    if (this._activeCursorUserId) {
+      return hashCursorAccount(this._activeCursorUserId)
+    }
+    if (Array.isArray(this._lastIngestedRecords)) {
+      const ingestedCursor = this._lastIngestedRecords.filter((r) => r && r.cli === 'cursor')
+      if (!ingestedCursor.length) return ''
+      const resolved = this._resolveCursorUserFromRecords(ingestedCursor)
+      if (resolved) return hashCursorAccount(resolved)
+    } else {
+      const hourlyCursor = this.rows("SELECT hour, model, total FROM usage_hourly WHERE cli = 'cursor'")
+      if (hourlyCursor.length) {
+        const resolved = this._resolveCursorUserFromRecords(hourlyCursor)
+        if (resolved) return hashCursorAccount(resolved)
+      }
+    }
+    const r = this.rows('SELECT user_id FROM cursor_usage_archive ORDER BY updated_at DESC LIMIT 1')[0]
     return hashCursorAccount(r?.user_id)
   }
 
@@ -1027,9 +1151,11 @@ export class UsageDb {
       for (const [cli, meta] of Object.entries(d.status?.cliMeta || {})) {
         if (cli === 'cursor') {
           const existing = metaByDevCli.get(`${d.id}|cursor`) || {}
-          const accountId = hashCursorAccount(
-            meta?.accountId || meta?.accountHash || meta?.userId || meta?.sub || existing.accountId
-          )
+          const rawAcc =
+            d.isCurrent && existing.accountId
+              ? existing.accountId
+              : meta?.accountId || meta?.accountHash || meta?.userId || meta?.sub || existing.accountId
+          const accountId = hashCursorAccount(rawAcc)
           if (accountId) {
             metaByDevCli.set(`${d.id}|cursor`, { accountId })
           }
