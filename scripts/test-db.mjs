@@ -716,8 +716,15 @@ try {
     throw new Error(`Expected hidden LiteLLM model not to be resurrected when localRecords is [], got ${JSON.stringify(curDevRecs)}`)
   }
 
-  // Verify pullCloudAccount rejects stale responses if credentials change mid-flight.
+  // Verify changing cloud connection identity clears cached remote devices/usage,
+  // and pullCloudAccount rejects stale responses if credentials change mid-flight.
+  if (db.listCloudDevices().length === 0) {
+    throw new Error('Expected cloud_devices to be populated before credential switch')
+  }
   db.saveCloudSync({ endpoint: 'https://old.example.com', apiKey: 'ts_old', enabled: true, syncMinutes: 10 })
+  if (db.listCloudDevices().length !== 0 || db.getDeviceViewState().hasCloudData) {
+    throw new Error(`Expected saveCloudSync to clear cached cloud_devices on credential change, got ${JSON.stringify(db.listCloudDevices())}`)
+  }
   try {
     globalThis.fetch = async () => {
       db.saveCloudSync({ endpoint: 'https://new.example.com', apiKey: 'ts_new', enabled: true, syncMinutes: 10 })

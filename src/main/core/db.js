@@ -623,14 +623,37 @@ export class UsageDb {
 
   // Any config change flags full_resync so the next push re-sends everything —
   // a new key/endpoint means the cloud side has none (or someone else's window)
-  // of this device's history.
+  // of this device's history. When the connection identity (endpoint or apiKey)
+  // changes, cached remote devices and hourly buckets from the previous account
+  // are cleared immediately so they never leak into the new connection's view.
   saveCloudSync({ endpoint, apiKey, enabled, syncMinutes }) {
-    this.getCloudSync() // ensure row
+    const prev = this.getCloudSync() // ensure row
+    const nextEndpoint = String(endpoint || '').trim()
+    const nextApiKey = String(apiKey || '').trim()
+    const connectionChanged = prev.endpoint !== nextEndpoint || prev.apiKey !== nextApiKey
     this.fullResyncGen = (this.fullResyncGen || 0) + 1
-    this.db.run(
-      'UPDATE cloud_sync SET endpoint=?, api_key=?, enabled=?, sync_minutes=?, full_resync=1, last_error=NULL WHERE id=1',
-      [String(endpoint || '').trim(), String(apiKey || '').trim(), enabled ? 1 : 0, Number(syncMinutes) > 0 ? Number(syncMinutes) : 10]
-    )
+    this.db.run('BEGIN')
+    try {
+      if (connectionChanged) {
+        this.db.run('DELETE FROM cloud_devices')
+        this.db.run('DELETE FROM cloud_usage_hourly')
+        this.db.run(
+          "UPDATE cloud_sync SET endpoint=?, api_key=?, enabled=?, sync_minutes=?, full_resync=1, last_sync_at=NULL, last_error=NULL, subs_base_hash=NULL, subs_conflict_json=NULL, selected_device='account' WHERE id=1",
+          [nextEndpoint, nextApiKey, enabled ? 1 : 0, Number(syncMinutes) > 0 ? Number(syncMinutes) : 10]
+        )
+      } else {
+        this.db.run(
+          'UPDATE cloud_sync SET endpoint=?, api_key=?, enabled=?, sync_minutes=?, full_resync=1, last_error=NULL WHERE id=1',
+          [nextEndpoint, nextApiKey, enabled ? 1 : 0, Number(syncMinutes) > 0 ? Number(syncMinutes) : 10]
+        )
+      }
+      this.db.run('COMMIT')
+    } catch (err) {
+      try {
+        this.db.run('ROLLBACK')
+      } catch {}
+      throw err
+    }
     this.persist()
     return this.getCloudSync()
   }
