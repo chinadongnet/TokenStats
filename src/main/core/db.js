@@ -683,17 +683,6 @@ export class UsageDb {
     }
     const archives = this.rows('SELECT user_id, records_json FROM cursor_usage_archive ORDER BY updated_at DESC')
     if (!archives.length) return null
-    const dedupKeys = new Set()
-    const exactKeys = new Set()
-    const hourKeys = new Set()
-    for (const r of cursorRecs) {
-      if (r.dedupKey && !String(r.dedupKey).startsWith('cursor-legacy:')) dedupKeys.add(String(r.dedupKey))
-      const ts = r.ts ?? r.hour
-      if (Number.isFinite(ts)) {
-        exactKeys.add(`${ts}|${r.model || ''}|${r.total || 0}`)
-        hourKeys.add(`${floorHourLocal(ts)}|${r.model || ''}|${r.total || 0}`)
-      }
-    }
     let bestUserId = null
     let bestScore = 0
     for (const a of archives) {
@@ -703,14 +692,35 @@ export class UsageDb {
       } catch {
         parsed = []
       }
-      let score = 0
+      const aDedupKeys = new Set()
+      const aExactKeys = new Set()
+      const aHourKeys = new Set()
       for (const ar of parsed) {
-        if (ar.dedupKey && dedupKeys.has(String(ar.dedupKey))) score += 10
+        if (ar.dedupKey && !String(ar.dedupKey).startsWith('cursor-legacy:')) aDedupKeys.add(String(ar.dedupKey))
         const ts = ar.ts ?? ar.hour
         if (Number.isFinite(ts)) {
-          if (exactKeys.has(`${ts}|${ar.model || ''}|${ar.total || 0}`)) score += 2
-          else if (hourKeys.has(`${floorHourLocal(ts)}|${ar.model || ''}|${ar.total || 0}`)) score += 1
+          aExactKeys.add(`${ts}|${ar.model || ''}|${ar.total || 0}`)
+          aHourKeys.add(`${floorHourLocal(ts)}|${ar.model || ''}|${ar.total || 0}`)
         }
+      }
+      let score = 0
+      let matched = 0
+      for (const r of cursorRecs) {
+        const dk = r.dedupKey && !String(r.dedupKey).startsWith('cursor-legacy:') ? String(r.dedupKey) : ''
+        const ts = r.ts ?? r.hour
+        if (dk && aDedupKeys.has(dk)) {
+          score += 10
+          matched++
+        } else if (Number.isFinite(ts) && aExactKeys.has(`${ts}|${r.model || ''}|${r.total || 0}`)) {
+          score += 2
+          matched++
+        } else if (Number.isFinite(ts) && aHourKeys.has(`${floorHourLocal(ts)}|${r.model || ''}|${r.total || 0}`)) {
+          score += 1
+          matched++
+        }
+      }
+      if (matched === cursorRecs.length && parsed.length === cursorRecs.length) {
+        score += 1
       }
       if (score > bestScore) {
         bestScore = score
