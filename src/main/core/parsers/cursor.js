@@ -325,7 +325,7 @@ async function fetchUsageCsvChunks(cookie, startDate, endDate, chunkMs = 3 * 864
   return [...byKey.values()].sort((a, b) => a.ts - b.ts)
 }
 
-async function fetchUsageCsv(token, fromMs = 0) {
+async function fetchUsageCsv(token, fromMs = 0, { backfillBeforeMs = 0, recentFromMs = 0 } = {}) {
   const payload = decodeJwt(token)
   if (!payload?.sub || (payload.exp && payload.exp * 1000 < Date.now())) throw new Error('Cursor session expired; sign in again')
   const userId = String(payload.sub).split('|').pop()
@@ -334,16 +334,32 @@ async function fetchUsageCsv(token, fromMs = 0) {
   const spanMs = fromMs > 0 ? endDate - fromMs : Infinity
   const initialTimeoutMs = fromMs === 0 || spanMs > 5 * 86400000 ? 15000 : 25000
   try {
-    return await fetchUsageCsvRange(cookie, fromMs, endDate, initialTimeoutMs)
+    const rows = await fetchUsageCsvRange(cookie, fromMs, endDate, initialTimeoutMs)
+    return { rows, replacedFromMs: fromMs, backfillBeforeMs: 0 }
   } catch (err) {
     if ([401, 403, 429].includes(err?.status)) throw err
     // Large multi-day or full-history CSV exports can time out on high-volume
     // accounts (~3k events/day). Fall back to bounded 3-day chunks.
     if (fromMs > 0 && spanMs > 86400000) {
-      return await fetchUsageCsvChunks(cookie, fromMs, endDate, 3 * 86400000)
+      const rows = await fetchUsageCsvChunks(cookie, fromMs, endDate, 3 * 86400000)
+      return { rows, replacedFromMs: fromMs, backfillBeforeMs }
     }
     if (fromMs === 0) {
-      return await fetchUsageCsvChunks(cookie, endDate - 30 * 86400000, endDate, 3 * 86400000)
+      if (backfillBeforeMs > 0) {
+        const olderStart = Math.max(0, backfillBeforeMs - 30 * 86400000)
+        const olderRows = await fetchUsageCsvChunks(cookie, olderStart, backfillBeforeMs, 3 * 86400000)
+        const tailStart = recentFromMs > backfillBeforeMs ? recentFromMs : backfillBeforeMs
+        const recentRows = await fetchUsageCsvChunks(cookie, tailStart, endDate, 3 * 86400000)
+        return {
+          rows: [...olderRows, ...recentRows],
+          olderRange: [olderStart, backfillBeforeMs],
+          replacedFromMs: tailStart,
+          backfillBeforeMs: olderRows.length > 0 ? olderStart : 0,
+        }
+      }
+      const partialStart = Math.max(0, endDate - 30 * 86400000)
+      const rows = await fetchUsageCsvChunks(cookie, partialStart, endDate, 3 * 86400000)
+      return { rows, replacedFromMs: partialStart, backfillBeforeMs: partialStart }
     }
     throw err
   }
@@ -440,10 +456,15 @@ export function cursorResetWindows() {
 async function getCloudRecords(token) {
   const payload = decodeJwt(token)
   const userId = payload?.sub ? String(payload.sub) : 'unknown'
-  const tagUser = (rows) =>
-    userId && userId !== 'unknown'
-      ? (rows || []).map((r) => (r && r.userId === userId ? r : { ...r, userId }))
-      : rows || []
+  const tagUser = (rows, backfillMs = 0) =>
+    (rows || []).map((r) => {
+      if (!r) return r
+      const next = { ...r }
+      if (userId && userId !== 'unknown') next.userId = userId
+      if (backfillMs > 0) next.backfillBeforeMs = backfillMs
+      else delete next.backfillBeforeMs
+      return next
+    })
   if (userId && userId !== 'unknown') {
     activeUserId = userId
     archive.activate?.(userId)
@@ -453,7 +474,16 @@ async function getCloudRecords(token) {
     const initialRecords = typeof archive.load === 'function'
       ? (archive.load(userId) || [])
       : await loadDefaultArchive(userId)
-    entry = { records: tagUser(initialRecords), fetchedAt: 0, retryAt: 0 }
+    const savedBackfill = (initialRecords || []).reduce(
+      (min, r) => (Number(r?.backfillBeforeMs) > 0 && (min === 0 || r.backfillBeforeMs < min) ? Number(r.backfillBeforeMs) : min),
+      0
+    )
+    entry = {
+      records: tagUser(initialRecords, savedBackfill),
+      fetchedAt: 0,
+      retryAt: 0,
+      backfillBeforeMs: savedBackfill,
+    }
     cacheByUser.set(userId, entry)
   }
   if (entry.inFlight) return entry.inFlight
@@ -471,10 +501,27 @@ async function getCloudRecords(token) {
     }
     const twoDaysAgo = Date.now() - 2 * 86400000
     const resumeBase = latestCloudTs > 0 ? Math.min(twoDaysAgo, latestCloudTs - 2 * 3600000) : twoDaysAgo
-    const fromMs = entry.records.length ? Math.max(0, Math.floor(resumeBase / 3600000) * 3600000) : 0
-    const [usage, summary] = await Promise.allSettled([fetchUsageCsv(token, fromMs), fetchUsageSummary(token)])
+    const recentFromMs = entry.records.length ? Math.max(0, Math.floor(resumeBase / 3600000) * 3600000) : 0
+    const backfillBeforeMs = Number(entry.backfillBeforeMs) > 0 ? Number(entry.backfillBeforeMs) : 0
+    const fromMs = backfillBeforeMs > 0 ? 0 : recentFromMs
+    const [usage, summary] = await Promise.allSettled([
+      fetchUsageCsv(token, fromMs, { backfillBeforeMs, recentFromMs }),
+      fetchUsageSummary(token),
+    ])
     if (usage.status === 'fulfilled') {
-      const records = tagUser([...entry.records.filter((r) => r.ts < fromMs), ...usage.value])
+      const { rows: fetchedRows, olderRange, replacedFromMs, backfillBeforeMs: nextBackfill } = usage.value
+      const byKey = new Map()
+      for (const r of entry.records) {
+        if (r.ts < replacedFromMs && (!olderRange || r.ts < olderRange[0] || r.ts >= olderRange[1])) {
+          byKey.set(r.dedupKey, r)
+        }
+      }
+      for (const r of fetchedRows) {
+        byKey.set(r.dedupKey, r)
+      }
+      const merged = [...byKey.values()].sort((a, b) => a.ts - b.ts)
+      const records = tagUser(merged, nextBackfill)
+      entry.backfillBeforeMs = nextBackfill
       if (JSON.stringify(records) !== JSON.stringify(entry.records)) {
         entry.records = records
         cursor.revision++

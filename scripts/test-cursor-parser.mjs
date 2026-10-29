@@ -112,6 +112,51 @@ try {
   assert.equal(records.length, 4, 'archived 6d record + 4d/3d/1d records must all be retained')
   assert.equal(savedRecords?.length, 4)
 
+  // Cold-start fallback backfill: if the initial full-history (startDate=0) export
+  // fails and falls back to 30-day chunks, subsequent refreshes (including after
+  // restarting from the saved archive) must continue backfilling older history.
+  const fortyFiveDaysAgo = now - 45 * 86400000
+  const fullCsv = [
+    'Date,Kind,Model,Input (w/ Cache Write),Input (w/o Cache Write),Cache Read,Output Tokens,Total Tokens',
+    `"${new Date(oneDayAgo).toISOString()}","Included","claude-4.6-opus-max-thinking","0","400","0","200","600"`,
+    `"${new Date(fortyFiveDaysAgo).toISOString()}","Included","claude-4.6-opus-max-thinking","0","500","0","250","750"`,
+  ].join('\n')
+  let coldSaved = []
+  let failZeroStartOnce = true
+  configureCursorArchive({
+    load: () => coldSaved,
+    save: (_user, rows) => { coldSaved = JSON.parse(JSON.stringify(rows)) },
+  })
+  globalThis.fetch = async (url) => {
+    const u = String(url)
+    if (u.includes('/api/usage-summary')) return new Response('{}', { status: 200 })
+    const start = Number(new URL(u).searchParams.get('startDate'))
+    const end = Number(new URL(u).searchParams.get('endDate'))
+    if (start === 0 && failZeroStartOnce) {
+      return new Response('gateway timeout', { status: 504 })
+    }
+    const lines = [
+      'Date,Kind,Model,Input (w/ Cache Write),Input (w/o Cache Write),Cache Read,Output Tokens,Total Tokens',
+    ]
+    if (oneDayAgo >= start && oneDayAgo <= end) {
+      lines.push(`"${new Date(oneDayAgo).toISOString()}","Included","claude-4.6-opus-max-thinking","0","400","0","200","600"`)
+    }
+    if (fortyFiveDaysAgo >= start && fortyFiveDaysAgo <= end) {
+      lines.push(`"${new Date(fortyFiveDaysAgo).toISOString()}","Included","claude-4.6-opus-max-thinking","0","500","0","250","750"`)
+    }
+    return new Response(lines.join('\n'), { status: 200 })
+  }
+  const partialRecs = await cursor.parseFile(sqliteFile)
+  assert.equal(partialRecs.length, 1, 'initial 30-day fallback returns the 1d record')
+  // Simulate app restart with the persisted partial archive; next refresh must backfill the 45d record
+  failZeroStartOnce = false
+  configureCursorArchive({
+    load: () => coldSaved,
+    save: (_user, rows) => { coldSaved = JSON.parse(JSON.stringify(rows)) },
+  })
+  const backfilledRecs = await cursor.parseFile(sqliteFile)
+  assert.equal(backfilledRecs.length, 2, 'subsequent refresh after cold-start fallback must backfill 45d history')
+
   console.log('cursor token reader & gap recovery: ok')
 } finally {
   globalThis.fetch = originalFetch

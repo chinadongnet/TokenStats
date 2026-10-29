@@ -244,8 +244,8 @@ export class UsageDb {
     const cursorRecs = this._lastIngestedRecords.filter((r) => r && r.cli === 'cursor')
     if (cursorRecs.length) {
       const matchedUser = this._resolveCursorUserFromRecords(cursorRecs)
+      this._activeCursorUserId = matchedUser
       if (matchedUser) {
-        this._activeCursorUserId = matchedUser
         this.db.run('UPDATE cursor_usage_archive SET updated_at = ? WHERE user_id = ?', [this._nextCursorArchiveTs(), matchedUser])
       }
     } else {
@@ -307,6 +307,18 @@ export class UsageDb {
           })
         }
       }
+    }
+
+    const prevLocalKeys = new Set(
+      this.rows('SELECT hour, cli, model FROM usage_hourly').map((r) => `${r.hour}|${r.cli}|${r.model}`)
+    )
+    const removedKeys = new Set()
+    for (const k of prevLocalKeys) {
+      if (!buckets.has(k)) removedKeys.add(k)
+    }
+    this._locallyRemovedKeys = removedKeys
+    if (this._deletedLitellmClis) {
+      for (const b of buckets.values()) this._deletedLitellmClis.delete(b.cli)
     }
 
     this.db.run('BEGIN')
@@ -398,6 +410,8 @@ export class UsageDb {
   }
 
   deleteLitellmProvider(id) {
+    if (!this._deletedLitellmClis) this._deletedLitellmClis = new Set()
+    this._deletedLitellmClis.add('litellm:' + id)
     this.db.run('DELETE FROM litellm_providers WHERE id = ?', [id])
     this.db.run('DELETE FROM litellm_model_settings WHERE provider_id = ?', [id])
     this.db.run('DELETE FROM litellm_usage WHERE provider_id = ?', [id])
@@ -748,13 +762,12 @@ export class UsageDb {
       const ingestedCursor = this._lastIngestedRecords.filter((r) => r && r.cli === 'cursor')
       if (!ingestedCursor.length) return ''
       const resolved = this._resolveCursorUserFromRecords(ingestedCursor)
+      return resolved ? hashCursorAccount(resolved) : ''
+    }
+    const hourlyCursor = this.rows("SELECT hour, model, total FROM usage_hourly WHERE cli = 'cursor'")
+    if (hourlyCursor.length) {
+      const resolved = this._resolveCursorUserFromRecords(hourlyCursor)
       if (resolved) return hashCursorAccount(resolved)
-    } else {
-      const hourlyCursor = this.rows("SELECT hour, model, total FROM usage_hourly WHERE cli = 'cursor'")
-      if (hourlyCursor.length) {
-        const resolved = this._resolveCursorUserFromRecords(hourlyCursor)
-        if (resolved) return hashCursorAccount(resolved)
-      }
     }
     const r = this.rows('SELECT user_id FROM cursor_usage_archive ORDER BY updated_at DESC LIMIT 1')[0]
     return hashCursorAccount(r?.user_id)
@@ -950,7 +963,7 @@ export class UsageDb {
 
   // ---- multi-device cloud account state -----------------------------------
 
-  saveCloudAccountSync(accountSync) {
+  saveCloudAccountSync(accountSync, opts = {}) {
     if (!accountSync || !Array.isArray(accountSync.devices)) return
     const snapMap = new Map()
     for (const s of accountSync.snapshots || []) {
@@ -1011,11 +1024,11 @@ export class UsageDb {
         }
         hStmt.free()
 
-        // If local usage was ingested while /api/sync was in flight, the
-        // returned accountSync snapshot still carries the older submitted
-        // totals for this device. Overlay any newer/higher rows from the
-        // local usage_hourly table for the current device so account and
-        // current-device views never regress behind local ingests.
+        // If local usage was ingested, renamed, hidden, or deleted while
+        // /api/sync was in flight, the returned accountSync snapshot still
+        // carries the older submitted rows for this device. Reconcile the
+        // current device's row set against authoritative local data so
+        // renamed/hidden/deleted rows are removed and newer local totals win.
         const curDev = accountSync.devices.find(
           (d) => d && d.id && (d.isCurrent || (accountSync.currentKeyId && d.id === accountSync.currentKeyId))
         )
@@ -1024,6 +1037,20 @@ export class UsageDb {
             'SELECT hour, cli, model, input, output, cache_read, cache_create, reasoning, total, cost, turns FROM usage_hourly'
           )
           if (localRows.length) {
+            const localKeySet = new Set(localRows.map((r) => `${r.hour}|${r.cli}|${r.model}`))
+            const existingCurRows = this.rows(
+              'SELECT hour, cli, model FROM cloud_usage_hourly WHERE key_id = ?',
+              [curDev.id]
+            )
+            const delStmt = this.db.prepare(
+              'DELETE FROM cloud_usage_hourly WHERE key_id = ? AND hour = ? AND cli = ? AND model = ?'
+            )
+            for (const er of existingCurRows) {
+              if (!localKeySet.has(`${er.hour}|${er.cli}|${er.model}`)) {
+                delStmt.run([curDev.id, er.hour, er.cli, er.model])
+              }
+            }
+            delStmt.free()
             const lStmt = this.db.prepare(
               `INSERT INTO cloud_usage_hourly
                  (key_id, hour, cli, model, input, output, cache_read, cache_create, reasoning, total, cost, turns)
@@ -1051,6 +1078,37 @@ export class UsageDb {
               ])
             }
             lStmt.free()
+          } else if (opts?.authoritativeLocal) {
+            this.db.run('DELETE FROM cloud_usage_hourly WHERE key_id = ?', [curDev.id])
+          } else {
+            const existingCurRows = this.rows(
+              'SELECT hour, cli, model FROM cloud_usage_hourly WHERE key_id = ?',
+              [curDev.id]
+            )
+            const invalidLitellmModels = new Set()
+            for (const s of this.rows('SELECT provider_id, model, visible, display_name FROM litellm_model_settings')) {
+              const cli = 'litellm:' + s.provider_id
+              if (s.visible === 0) {
+                invalidLitellmModels.add(`${cli}|${s.model}`)
+                if (s.display_name) invalidLitellmModels.add(`${cli}|${s.display_name}`)
+              } else if (s.display_name && s.display_name !== s.model) {
+                invalidLitellmModels.add(`${cli}|${s.model}`)
+              }
+            }
+            const delStmt = this.db.prepare(
+              'DELETE FROM cloud_usage_hourly WHERE key_id = ? AND hour = ? AND cli = ? AND model = ?'
+            )
+            for (const er of existingCurRows) {
+              const fullKey = `${er.hour}|${er.cli}|${er.model}`
+              if (
+                this._locallyRemovedKeys?.has(fullKey) ||
+                this._deletedLitellmClis?.has(er.cli) ||
+                invalidLitellmModels.has(`${er.cli}|${er.model}`)
+              ) {
+                delStmt.run([curDev.id, er.hour, er.cli, er.model])
+              }
+            }
+            delStmt.free()
           }
         }
       }

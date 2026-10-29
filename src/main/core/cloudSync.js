@@ -279,7 +279,7 @@ export async function performSync({
     }
 
     if (accountSync) {
-      db.saveCloudAccountSync(accountSync)
+      db.saveCloudAccountSync(accountSync, { authoritativeLocal: true })
     }
 
     let pulledSubscriptions = false

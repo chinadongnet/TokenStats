@@ -70,6 +70,36 @@ const nowHour = Math.floor(Date.now() / 3600000) * 3600000
 db.ingest([
   {
     ts: nowHour,
+    cli: 'codex',
+    model: 'gpt-5',
+    project: 'codex',
+    sessionId: 'c0',
+    input: 100,
+    output: 50,
+    cacheRead: 0,
+    cacheCreate: 0,
+    reasoning: 0,
+    total: 150,
+    cost: 1.5,
+    turns: 1,
+  },
+  {
+    ts: nowHour,
+    cli: 'cursor',
+    model: 'claude-4',
+    project: 'cursor',
+    sessionId: 'cur0',
+    input: 500,
+    output: 500,
+    cacheRead: 0,
+    cacheCreate: 0,
+    reasoning: 0,
+    total: 1000,
+    cost: 5.0,
+    turns: 5,
+  },
+  {
+    ts: nowHour,
     cli: 'litellm:uuid-a',
     model: 'gpt-4o',
     project: 'team-key',
@@ -235,6 +265,52 @@ db.saveCloudAccountSync({
 const postSyncAcc = db.cloudOverview('account')
 if (postSyncAcc.totals.all.total !== 200) {
   throw new Error(`Expected mid-flight local ingest (200) to be preserved over stale sync response (100), got ${postSyncAcc.totals.all.total}`)
+}
+
+// Verify mid-flight model rename and source removal remove obsolete current-device rows from sync response
+db.ingest([
+  {
+    ts: nowHour,
+    cli: 'litellm:p1',
+    model: 'Friendly GPT-4o',
+    project: 'litellm:p1',
+    sessionId: 'l1',
+    input: 50,
+    output: 50,
+    cacheRead: 0,
+    cacheCreate: 0,
+    reasoning: 0,
+    total: 100,
+    cost: 1.0,
+    turns: 1,
+  },
+])
+db.saveCloudAccountSync({
+  currentKeyId: 'dev-1',
+  devices: [{ id: 'dev-1', name: 'PC-1', lastSyncAt: 2000, revoked: false, isCurrent: true }],
+  snapshots: [],
+  hours: [
+    // Stale server row still under the pre-rename model id
+    { keyId: 'dev-1', hour: nowHour, cli: 'litellm:p1', model: 'gpt-4o', input: 50, output: 50, total: 100, cost: 1.0, turns: 1 },
+  ],
+})
+const postRenameAcc = db.cloudOverview('account')
+if (postRenameAcc.totals.all.total !== 100) {
+  throw new Error(`Expected mid-flight renamed model not to duplicate old server row (100), got ${postRenameAcc.totals.all.total}`)
+}
+db.ingest([])
+db.saveCloudAccountSync({
+  currentKeyId: 'dev-1',
+  devices: [{ id: 'dev-1', name: 'PC-1', lastSyncAt: 2000, revoked: false, isCurrent: true }],
+  snapshots: [],
+  hours: [
+    // Stale server row for a model/source that was just hidden or deleted locally
+    { keyId: 'dev-1', hour: nowHour, cli: 'litellm:p1', model: 'Friendly GPT-4o', input: 50, output: 50, total: 100, cost: 1.0, turns: 1 },
+  ],
+})
+const postHideAcc = db.cloudOverview('account')
+if (postHideAcc.totals.all.total !== 0) {
+  throw new Error(`Expected hidden/deleted local source not to be restored by stale sync response (0), got ${postHideAcc.totals.all.total}`)
 }
 
 // Verify local ingest does not advance last_sync_at or steal server-source ownership from a fresher remote device
