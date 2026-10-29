@@ -54,7 +54,7 @@ for (const m of db.models(0, Date.now() + 864e5).slice(0, 6)) {
 
 // Verify multi-device cloud account sync & server-source deduplication
 const { computeAllSubscriptionStats } = await import('../src/main/core/subscriptions.js')
-const { performSync } = await import('../src/main/core/cloudSync.js')
+const { performSync, pullCloudAccount } = await import('../src/main/core/cloudSync.js')
 
 const p1 = db.upsertLitellmProvider({ name: 'Team Proxy', baseUrl: 'https://proxy.example.com/v1/', apiKey: 'k1' })
 const db2Path = path.join(os.tmpdir(), 'aimon-test-usage-2.sqlite')
@@ -714,6 +714,30 @@ try {
   const curDevRecs = db.recordsForDevice('dev_a', [])
   if (curDevRecs.some((r) => r.cli === 'litellm:' + provHide.id)) {
     throw new Error(`Expected hidden LiteLLM model not to be resurrected when localRecords is [], got ${JSON.stringify(curDevRecs)}`)
+  }
+
+  // Verify pullCloudAccount rejects stale responses if credentials change mid-flight.
+  db.saveCloudSync({ endpoint: 'https://old.example.com', apiKey: 'ts_old', enabled: true, syncMinutes: 10 })
+  try {
+    globalThis.fetch = async () => {
+      db.saveCloudSync({ endpoint: 'https://new.example.com', apiKey: 'ts_new', enabled: true, syncMinutes: 10 })
+      return new Response(
+        JSON.stringify({
+          accountSync: {
+            currentKeyId: 'stale_dev',
+            devices: [{ id: 'stale_dev', name: 'Stale Old Device', lastSyncAt: nowMs }],
+            hours: [],
+          },
+        }),
+        { status: 200, headers: { 'content-type': 'application/json' } }
+      )
+    }
+    const pullRes = await pullCloudAccount({ db })
+    if (!pullRes.skipped || db.listCloudDevices().some((d) => d.id === 'stale_dev')) {
+      throw new Error(`Expected pullCloudAccount to skip stale response after credential switch, got ${JSON.stringify(pullRes)}`)
+    }
+  } finally {
+    globalThis.fetch = origFetch
   }
 }
 

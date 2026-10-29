@@ -356,16 +356,19 @@ export async function pullCloudAccount({ db }) {
   if (!cfg.enabled || !cfg.apiKey || !cfg.endpoint) return { ok: false, skipped: true }
   const connEndpoint = normalizeEndpoint(cfg.endpoint)
   const connApiKey = String(cfg.apiKey).trim()
+  const startLastSyncAt = cfg.lastSyncAt ?? null
   const isSameConnection = () => {
     const cur = db.getCloudSync()
     return (
       cur.enabled &&
       normalizeEndpoint(cur.endpoint) === connEndpoint &&
-      String(cur.apiKey).trim() === connApiKey
+      String(cur.apiKey).trim() === connApiKey &&
+      (cur.lastSyncAt ?? null) === startLastSyncAt
     )
   }
   try {
     const data = await request(cfg.endpoint, '/api/account', { apiKey: cfg.apiKey })
+    if (!isSameConnection()) return { ok: false, skipped: true }
     if (data?.accountSync) {
       db.saveCloudAccountSync(data.accountSync)
       return { ok: true, accountSync: data.accountSync }
