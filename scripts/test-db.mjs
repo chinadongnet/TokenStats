@@ -237,6 +237,91 @@ if (postSyncAcc.totals.all.total !== 200) {
   throw new Error(`Expected mid-flight local ingest (200) to be preserved over stale sync response (100), got ${postSyncAcc.totals.all.total}`)
 }
 
+// Verify local ingest does not advance last_sync_at or steal server-source ownership from a fresher remote device
+db.saveCloudAccountSync({
+  currentKeyId: 'dev-1',
+  devices: [
+    { id: 'dev-1', name: 'PC-1', lastSyncAt: 1000, revoked: false, isCurrent: true },
+    { id: 'dev-2', name: 'PC-2', lastSyncAt: 2000, revoked: false, isCurrent: false },
+  ],
+  snapshots: [
+    { keyId: 'dev-1', status: { cliMeta: { 'litellm:local-id': { label: 'Team Proxy', baseUrl: 'https://proxy.example.com/v1' } } } },
+    { keyId: 'dev-2', status: { cliMeta: { 'litellm:remote-id': { label: 'Team Proxy', baseUrl: 'https://proxy.example.com/v1' } } } },
+  ],
+  hours: [
+    { keyId: 'dev-1', hour: nowHour, cli: 'cursor', model: 'claude-4', input: 50, output: 50, total: 100, cost: 1.0, turns: 1 },
+    { keyId: 'dev-2', hour: nowHour, cli: 'cursor', model: 'claude-4', input: 100, output: 100, total: 200, cost: 2.0, turns: 2 },
+    { keyId: 'dev-1', hour: nowHour, cli: 'litellm:local-id', model: 'gpt-4o', input: 50, output: 50, total: 100, cost: 1.0, turns: 1 },
+    { keyId: 'dev-2', hour: nowHour, cli: 'litellm:remote-id', model: 'gpt-4o', input: 50, output: 50, total: 100, cost: 1.0, turns: 1 },
+  ],
+})
+db.ingest([
+  {
+    ts: nowHour,
+    cli: 'cursor',
+    model: 'claude-4',
+    project: 'cursor',
+    sessionId: 'c1',
+    input: 50,
+    output: 50,
+    cacheRead: 0,
+    cacheCreate: 0,
+    reasoning: 0,
+    total: 100,
+    cost: 1.0,
+    turns: 1,
+  },
+  {
+    ts: nowHour,
+    cli: 'claude',
+    model: 'claude-sonnet-4-5',
+    project: 'local-proj',
+    sessionId: 's1',
+    input: 1,
+    output: 0,
+    cacheRead: 0,
+    cacheCreate: 0,
+    reasoning: 0,
+    total: 1,
+    cost: 0.01,
+    turns: 1,
+  },
+  {
+    ts: nowHour,
+    cli: 'litellm:local-id',
+    model: 'gpt-4o',
+    project: 'litellm:local-id',
+    sessionId: 'l1',
+    input: 50,
+    output: 50,
+    cacheRead: 0,
+    cacheCreate: 0,
+    reasoning: 0,
+    total: 100,
+    cost: 1.0,
+    turns: 1,
+  },
+])
+const fresherRemoteAcc = db.cloudOverview('account')
+if (fresherRemoteAcc.totals.all.total !== 301) {
+  throw new Error(`Expected fresher remote Cursor (200) + LiteLLM (100) + local Claude (1) = 301, got ${fresherRemoteAcc.totals.all.total}`)
+}
+const remoteBoundSub = {
+  id: 'sub-remote-litellm',
+  groupId: 'sub-remote-litellm',
+  name: 'Remote Synced LiteLLM Plan',
+  monthlyUsd: 20,
+  startDate: todayIso,
+  active: true,
+  bindings: [{ cli: 'litellm:remote-id', models: null }],
+  resetPeriods: ['monthly'],
+  resetAnchors: { monthly: todayIso },
+}
+const remoteSubAccStats = computeAllSubscriptionStats([remoteBoundSub], db.recordsForDevice('account'), nowHour + 1000)
+if (remoteSubAccStats[0]?.currentCycle?.tokens !== 100) {
+  throw new Error(`Expected 100 attributed tokens for remote-bound LiteLLM subscription in account view, got ${remoteSubAccStats[0]?.currentCycle?.tokens}`)
+}
+
 console.log('multi-device account overview, cross-device LiteLLM dedupe, keyAlias attribution & concurrent sync guard verified')
 
 fs.rmSync(dbPath, { force: true })

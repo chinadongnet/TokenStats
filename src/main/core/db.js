@@ -326,7 +326,6 @@ export class UsageDb {
         cStmt.run([curDev.id, b.hour, b.cli, b.model, b.input, b.output, b.cacheRead, b.cacheCreate, b.reasoning, b.total, b.cost, b.turns])
       }
       cStmt.free()
-      this.db.run('UPDATE cloud_devices SET last_sync_at = MAX(COALESCE(last_sync_at, 0), ?) WHERE id = ?', [Date.now(), curDev.id])
     }
     this.db.run('COMMIT')
     this.persist()
@@ -1041,10 +1040,28 @@ export class UsageDb {
       return cli
     }
 
+    const clisByIdentity = new Map()
+    const recordIdentityCli = (idKey, cli) => {
+      if (!idKey || !cli) return
+      let set = clisByIdentity.get(idKey)
+      if (!set) {
+        set = new Set()
+        clisByIdentity.set(idKey, set)
+      }
+      set.add(cli)
+    }
+
     for (const p of localProviders) {
       const cli = 'litellm:' + p.id
       const idKey = identityFor('local', cli)
       if (!localCliByIdentity.has(idKey)) localCliByIdentity.set(idKey, cli)
+      recordIdentityCli(idKey, cli)
+    }
+    for (const d of devices) {
+      for (const cli of Object.keys(d.status?.cliMeta || {})) {
+        if (!cli.startsWith('litellm:')) continue
+        recordIdentityCli(identityFor(d.id, cli), cli)
+      }
     }
 
     const owners = new Map()
@@ -1052,6 +1069,7 @@ export class UsageDb {
     for (const r of rows) {
       if (!isServerSourceCli(r.cli)) continue
       const idKey = identityFor(r.key_id, r.cli)
+      recordIdentityCli(idKey, r.cli)
       if (!owners.has(idKey)) {
         owners.set(idKey, r.key_id)
         canonicalCliByIdentity.set(idKey, localCliByIdentity.get(idKey) || r.cli)
@@ -1066,6 +1084,12 @@ export class UsageDb {
       if (!String(cli || '').startsWith('litellm:')) return cli
       const idKey = identityFor(keyId, cli)
       return localCliByIdentity.get(idKey) || canonicalCliByIdentity.get(idKey) || cli
+    }
+    owners.equivalentClisFor = (keyId, cli) => {
+      if (!String(cli || '').startsWith('litellm:')) return [cli]
+      const idKey = identityFor(keyId, cli)
+      const canon = owners.canonicalCliFor(keyId, cli)
+      return [...new Set([canon, cli, ...(clisByIdentity.get(idKey) || [])])]
     }
     return owners
   }
@@ -1237,6 +1261,7 @@ export class UsageDb {
         ts: r.hour,
         hour: r.hour,
         cli,
+        ...(Array.isArray(r.cliAliases) && r.cliAliases.length > 1 ? { cliAliases: r.cliAliases } : {}),
         model: r.model,
         input: r.input || 0,
         output: r.output || 0,
@@ -1273,6 +1298,7 @@ export class UsageDb {
       const keptLocal = []
       const localCoveredServerIdentities = new Set()
       const localCoveredCurDevHours = new Set()
+      const localAliasDeduct = new Map()
       for (const r of local) {
         if (!isServerSourceCli(r.cli)) {
           keptLocal.push(r)
@@ -1281,10 +1307,41 @@ export class UsageDb {
         }
         const idKey = owners.identityFor(curKeyId || 'local', r.cli)
         const curOwns = !curKeyId || owners.get(idKey) === curKeyId || !owners.has(idKey)
-        if (curOwns || aliasServerIdentities.has(idKey)) {
-          keptLocal.push(r)
-          localCoveredServerIdentities.add(idKey)
-          localCoveredCurDevHours.add(`${floorHourLocal(r.ts)}|${r.cli}|${r.model}`)
+        const hasAlias = Boolean(r.project && r.project !== r.cli)
+        if (curOwns || hasAlias) {
+          const canonCli = owners.canonicalCliFor ? owners.canonicalCliFor(curKeyId || 'local', r.cli) : r.cli
+          const cliAliases = owners.equivalentClisFor ? owners.equivalentClisFor(curKeyId || 'local', r.cli) : [canonCli]
+          keptLocal.push({
+            ...r,
+            cli: canonCli,
+            ...(cliAliases.length > 1 ? { cliAliases } : {}),
+            project: r.project === r.cli ? canonCli : r.project,
+          })
+          if (curOwns) {
+            localCoveredServerIdentities.add(idKey)
+            localCoveredCurDevHours.add(`${floorHourLocal(r.ts)}|${r.cli}|${r.model}`)
+          } else {
+            const dk = `${floorHourLocal(r.ts)}|${canonCli}|${r.model}`
+            const prev = localAliasDeduct.get(dk) || {
+              input: 0,
+              output: 0,
+              cache_read: 0,
+              cache_create: 0,
+              reasoning: 0,
+              total: 0,
+              cost: 0,
+              turns: 0,
+            }
+            prev.input += r.input || 0
+            prev.output += r.output || 0
+            prev.cache_read += r.cacheRead || 0
+            prev.cache_create += r.cacheCreate || 0
+            prev.reasoning += r.reasoning || 0
+            prev.total += r.total || 0
+            prev.cost += r.cost != null ? r.cost : costFor(r)
+            prev.turns += r.turns || 1
+            localAliasDeduct.set(dk, prev)
+          }
         }
       }
 
@@ -1302,12 +1359,14 @@ export class UsageDb {
           if (localCoveredCurDevHours.has(`${r.hour}|${r.cli}|${r.model}`)) continue
         }
         const cli = owners.canonicalCliFor ? owners.canonicalCliFor(r.key_id, r.cli) : r.cli
+        const eqClis = owners.equivalentClisFor ? owners.equivalentClisFor(r.key_id, r.cli) : [cli]
         const k = `${r.hour}|${cli}|${r.model}`
         let b = mergedCloud.get(k)
         if (!b) {
           b = {
             hour: r.hour,
             cli,
+            cliAliases: new Set(eqClis),
             model: r.model,
             input: 0,
             output: 0,
@@ -1319,6 +1378,8 @@ export class UsageDb {
             turns: 0,
           }
           mergedCloud.set(k, b)
+        } else {
+          for (const c of eqClis) b.cliAliases.add(c)
         }
         b.input += r.input || 0
         b.output += r.output || 0
@@ -1330,7 +1391,25 @@ export class UsageDb {
         b.turns += r.turns || 0
       }
 
-      return [...keptLocal, ...[...mergedCloud.values()].map((r) => toCloudRec(r))]
+      const cloudRecs = []
+      for (const [k, b] of mergedCloud.entries()) {
+        const deduct = localAliasDeduct.get(k)
+        if (deduct) {
+          b.input = Math.max(0, b.input - deduct.input)
+          b.output = Math.max(0, b.output - deduct.output)
+          b.cache_read = Math.max(0, b.cache_read - deduct.cache_read)
+          b.cache_create = Math.max(0, b.cache_create - deduct.cache_create)
+          b.reasoning = Math.max(0, b.reasoning - deduct.reasoning)
+          b.total = Math.max(0, b.total - deduct.total)
+          b.cost = Math.max(0, b.cost - deduct.cost)
+          b.turns = Math.max(0, b.turns - deduct.turns)
+        }
+        if (b.total > 0 || b.cost > 0) {
+          cloudRecs.push(toCloudRec({ ...b, cliAliases: [...b.cliAliases] }))
+        }
+      }
+
+      return [...keptLocal, ...cloudRecs]
     }
 
     return this.cloudFilteredRows(eff).map((r) => toCloudRec(r))

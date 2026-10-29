@@ -68,7 +68,13 @@ function makeMatcher(bindings) {
     })
   }
   return (r) => {
-    const b = map.get(r.cli)
+    let b = map.get(r.cli)
+    if (!b && Array.isArray(r.cliAliases)) {
+      for (const alt of r.cliAliases) {
+        b = map.get(alt)
+        if (b) break
+      }
+    }
     if (!b) return false
     if (b.keyAlias && (r.project || '') !== b.keyAlias) return false
     if (b.models && !b.models.has(r.rawModel || r.model) && !b.models.has(r.model)) return false
@@ -245,8 +251,11 @@ export function planRecordIndex(subs, records, nowMs = Date.now()) {
   for (const r of records || []) {
     const e = pick(r)
     if (e) byPlan.get(e.sub.id).push(r)
-    if (!byCli.has(r.cli)) byCli.set(r.cli, [])
-    byCli.get(r.cli).push(r)
+    const clis = Array.isArray(r.cliAliases) && r.cliAliases.length ? r.cliAliases : [r.cli]
+    for (const c of clis) {
+      if (!byCli.has(c)) byCli.set(c, [])
+      byCli.get(c).push(r)
+    }
   }
   for (const rs of byPlan.values()) rs.sort((a, b) => a.ts - b.ts)
   for (const rs of byCli.values()) rs.sort((a, b) => a.ts - b.ts)
