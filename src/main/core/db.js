@@ -2380,16 +2380,67 @@ function mergeCloudStatus(devicesWithStatus) {
   for (const d of sorted) Object.assign(cliMeta, d.status?.cliMeta || {})
   const newest = sorted[sorted.length - 1]
   const cutoff = (newest.updatedAt || 0) - FALLBACK_MAX_AGE_MS
+  const eligible = [...sorted].reverse().filter((d) => (d.updatedAt || 0) >= cutoff)
   const newestWith = (field) =>
-    [...sorted]
-      .reverse()
-      .find((d) => (d.updatedAt || 0) >= cutoff && Array.isArray(d.status?.[field]) && d.status[field].length) || null
+    eligible.find((d) => Array.isArray(d.status?.[field]) && d.status[field].length) || null
   const resetsSrc = newestWith('resets')
+
+  const entryClis = (item) =>
+    new Set(
+      (item?.bindings || [])
+        .map((b) => b?.cli)
+        .concat(item?.clis || [])
+        .filter(Boolean)
+    )
+  const clisOverlap = (a, b) => {
+    for (const c of a) {
+      if (b.has(c)) return true
+    }
+    return false
+  }
+  const sameResetEntry = (a, b) => {
+    if (
+      (a.id && (b.id === a.id || b.groupId === a.id)) ||
+      (a.groupId && (b.groupId === a.groupId || b.id === a.groupId))
+    ) {
+      return true
+    }
+    const nameA = String(a.planName || a.name || '').trim().toLowerCase()
+    const nameB = String(b.planName || b.name || '').trim().toLowerCase()
+    const clisA = entryClis(a)
+    const clisB = entryClis(b)
+    if (nameA && nameA === nameB && (!clisA.size || !clisB.size || clisOverlap(clisA, clisB))) {
+      return true
+    }
+    if (!(Number(a.monthlyUsd) > 0) && !(Number(b.monthlyUsd) > 0) && clisA.size && clisOverlap(clisA, clisB)) {
+      return true
+    }
+    return false
+  }
+
+  const mergedResets = []
+  for (const d of eligible) {
+    for (const r of d.status?.resets || []) {
+      if (!r || typeof r !== 'object') continue
+      const existing = mergedResets.find((m) => sameResetEntry(m, r))
+      if (!existing) {
+        mergedResets.push({ ...r })
+      } else {
+        if ((!Array.isArray(existing.windows) || !existing.windows.length) && Array.isArray(r.windows) && r.windows.length) {
+          existing.windows = r.windows
+        }
+        if (!existing.renewal && r.renewal) {
+          existing.renewal = r.renewal
+        }
+      }
+    }
+  }
+
   return {
     updatedAt: newest.updatedAt,
     appVersion: newest.status?.appVersion || newest.appVersion || null,
     cliMeta,
-    resets: resetsSrc?.status?.resets || [],
+    resets: mergedResets,
     plans: newestWith('plans')?.status?.plans || [],
     resetsTz: resetsSrc?.tz || null,
   }

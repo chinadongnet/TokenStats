@@ -660,6 +660,50 @@ try {
   } finally {
     globalThis.fetch = origFetch
   }
+
+  // Verify account-level mergeCloudStatus combines live quota entries across eligible devices
+  // instead of keeping only the newest device's resets list.
+  db.saveCloudAccountSync({
+    currentKeyId: 'dev_a',
+    devices: [
+      { id: 'dev_a', name: 'Laptop A', lastSyncAt: nowMs - 120000 },
+      { id: 'dev_b', name: 'Desktop B', lastSyncAt: nowMs - 30000 },
+    ],
+    snapshots: [
+      {
+        keyId: 'dev_a',
+        updatedAt: nowMs - 120000,
+        status: {
+          resets: [
+            { id: 'live:codex', planName: 'Codex', clis: ['codex'], windows: [{ period: '5h', remainingPct: 80 }] },
+            { id: 'live:cursor', planName: 'Cursor', clis: ['cursor'], windows: [{ period: 'monthly', remainingPct: 90 }] },
+          ],
+        },
+      },
+      {
+        keyId: 'dev_b',
+        updatedAt: nowMs - 30000,
+        status: {
+          resets: [
+            { id: 'live:cursor', planName: 'Cursor', clis: ['cursor'], windows: [{ period: 'monthly', remainingPct: 65 }] },
+          ],
+        },
+      },
+    ],
+    hours: [
+      { keyId: 'dev_a', hour: oneDayHour, cli: 'codex', model: 'gpt-5', input: 10, output: 10, total: 20, cost: 0.01, turns: 1 },
+    ],
+  })
+  const mergedOverview = db.cloudOverview('account', nowMs)
+  const mergedResets = mergedOverview?.cloudResets || []
+  const codexReset = mergedResets.find((r) => (r.clis || []).includes('codex'))
+  const cursorReset = mergedResets.find((r) => (r.clis || []).includes('cursor'))
+  if (!codexReset || !cursorReset) {
+    throw new Error(`Expected account cloudResets to merge both Codex and Cursor across devices, got ${JSON.stringify(mergedResets)}`)
+  }
+  if (cursorReset.windows?.[0]?.remainingPercent !== 65) {
+    throw new Error(`Expected newer device's Cursor quota (65%) to win over older device (90%), got ${JSON.stringify(cursorReset)}`)
+  }
 }
 
 console.log('multi-device account overview, cross-device LiteLLM dedupe, keyAlias attribution & concurrent sync guard verified')
