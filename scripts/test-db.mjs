@@ -267,6 +267,40 @@ if (postSyncAcc.totals.all.total !== 200) {
   throw new Error(`Expected mid-flight local ingest (200) to be preserved over stale sync response (100), got ${postSyncAcc.totals.all.total}`)
 }
 
+// Verify authoritative local reduction (e.g. rewritten/shrunk bucket from 200 to 100) replaces higher stale sync response
+db.ingest([
+  {
+    ts: nowHour,
+    cli: 'claude',
+    model: 'claude-sonnet-4-5',
+    project: 'local-proj',
+    sessionId: 's1',
+    input: 60,
+    output: 40,
+    cacheRead: 0,
+    cacheCreate: 0,
+    reasoning: 0,
+    total: 100,
+    cost: 1.0,
+    turns: 1,
+  },
+])
+db.saveCloudAccountSync(
+  {
+    currentKeyId: 'dev-1',
+    devices: [{ id: 'dev-1', name: 'PC-1', lastSyncAt: 2000, revoked: false, isCurrent: true }],
+    snapshots: [],
+    hours: [
+      { keyId: 'dev-1', hour: nowHour, cli: 'claude', model: 'claude-sonnet-4-5', input: 120, output: 80, total: 200, cost: 2.0, turns: 2 },
+    ],
+  },
+  { authoritativeLocal: true }
+)
+const postShrinkAcc = db.cloudOverview('account')
+if (postShrinkAcc.totals.all.total !== 100) {
+  throw new Error(`Expected authoritative local reduction (100) to replace stale sync response (200), got ${postShrinkAcc.totals.all.total}`)
+}
+
 // Verify mid-flight model rename and source removal remove obsolete current-device rows from sync response
 db.ingest([
   {

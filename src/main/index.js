@@ -669,33 +669,64 @@ function mergeCloudResetsIntoEntries(baseEntries, cloudResets, { preferExistingL
         .concat(item?.clis || [])
         .filter(Boolean)
     )
+  const clisOverlap = (a, b) => {
+    for (const c of a) {
+      if (b.has(c)) return true
+    }
+    return false
+  }
+  const pickBest = (candidates) => {
+    if (!candidates.length) return null
+    return candidates.find((cr) => Array.isArray(cr.windows) && cr.windows.length > 0) || candidates[0]
+  }
   const findMatchingCloud = (entry) => {
+    const unused = cloudResets.filter((cr) => !usedCloud.has(cr))
+    if (!unused.length) return null
+
+    if (entry.id || entry.groupId) {
+      const byId = unused.filter(
+        (cr) =>
+          (entry.id && (cr.id === entry.id || cr.groupId === entry.id)) ||
+          (entry.groupId && (cr.groupId === entry.groupId || cr.id === entry.groupId))
+      )
+      if (byId.length) return pickBest(byId)
+    }
+
     const targetName = String(entry.name || '').toLowerCase()
-    const byExactName = cloudResets.find(
-      (cr) => !usedCloud.has(cr) && String(cr.name || cr.planName || '').toLowerCase() === targetName
-    )
-    if (byExactName) return byExactName
     const eClis = entryClis(entry)
+
+    if (targetName && eClis.size) {
+      const byNameAndCli = unused.filter(
+        (cr) =>
+          String(cr.name || cr.planName || '').toLowerCase() === targetName &&
+          clisOverlap(eClis, entryClis(cr))
+      )
+      if (byNameAndCli.length) return pickBest(byNameAndCli)
+    }
+
+    if (targetName) {
+      const byNameUnbound = unused.filter((cr) => {
+        if (String(cr.name || cr.planName || '').toLowerCase() !== targetName) return false
+        const crClis = entryClis(cr)
+        return !eClis.size || !crClis.size
+      })
+      if (byNameUnbound.length) return pickBest(byNameUnbound)
+    }
+
     if (!eClis.size) return null
-    return (
-      cloudResets.find((cr) => {
-        if (usedCloud.has(cr) || Number(cr.monthlyUsd) > 0) return false
-        for (const c of entryClis(cr)) {
-          if (eClis.has(c)) return true
-        }
-        return false
-      }) || null
+    const bySyntheticCli = unused.filter(
+      (cr) => !(Number(cr.monthlyUsd) > 0) && clisOverlap(eClis, entryClis(cr))
     )
+    return pickBest(bySyntheticCli)
   }
 
   const out = baseEntries.map((e) => {
     const cr = findMatchingCloud(e)
+    if (cr) usedCloud.add(cr)
     if (preferExistingLive && (e.windows || []).some((w) => w.source === 'live')) {
-      if (cr) usedCloud.add(cr)
       return e
     }
     if (cr && Array.isArray(cr.windows) && cr.windows.length) {
-      usedCloud.add(cr)
       return { ...e, windows: cr.windows, renewal: cr.renewal || e.renewal }
     }
     return e
@@ -720,8 +751,10 @@ function mergeCloudResetsIntoEntries(baseEntries, cloudResets, { preferExistingL
       Array.isArray(cr.bindings) && cr.bindings.length
         ? cr.bindings
         : crClis.map((cli) => ({ cli, models: null }))
+    const fallbackId = cr.id || `live:${crClis[0] || String(cr.name || cr.planName || 'remote').toLowerCase()}`
     out.push({
-      id: cr.id || `live:${crClis[0] || String(cr.name || cr.planName || 'remote').toLowerCase()}`,
+      id: fallbackId,
+      groupId: cr.groupId || fallbackId,
       name: cr.name || cr.planName || 'Plan',
       monthlyUsd: Number(cr.monthlyUsd) || 0,
       bindings,

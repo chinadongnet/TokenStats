@@ -147,6 +147,8 @@ export function buildStatusSnapshot({ db, store, liveByCli, appVersion }) {
         }))
       if (!windows.length && !(e.monthlyUsd > 0)) return null
       return {
+        id: e.id || null,
+        groupId: e.groupId || e.id || null,
         planName: e.name,
         monthlyUsd: Number(e.monthlyUsd) || 0,
         // Which CLI cards this plan covers — lets the web popup draw the same

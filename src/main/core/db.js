@@ -1037,29 +1037,11 @@ export class UsageDb {
             'SELECT hour, cli, model, input, output, cache_read, cache_create, reasoning, total, cost, turns FROM usage_hourly'
           )
           if (localRows.length) {
-            const localKeySet = new Set(localRows.map((r) => `${r.hour}|${r.cli}|${r.model}`))
-            const existingCurRows = this.rows(
-              'SELECT hour, cli, model FROM cloud_usage_hourly WHERE key_id = ?',
-              [curDev.id]
-            )
-            const delStmt = this.db.prepare(
-              'DELETE FROM cloud_usage_hourly WHERE key_id = ? AND hour = ? AND cli = ? AND model = ?'
-            )
-            for (const er of existingCurRows) {
-              if (!localKeySet.has(`${er.hour}|${er.cli}|${er.model}`)) {
-                delStmt.run([curDev.id, er.hour, er.cli, er.model])
-              }
-            }
-            delStmt.free()
+            this.db.run('DELETE FROM cloud_usage_hourly WHERE key_id = ?', [curDev.id])
             const lStmt = this.db.prepare(
               `INSERT INTO cloud_usage_hourly
                  (key_id, hour, cli, model, input, output, cache_read, cache_create, reasoning, total, cost, turns)
-               VALUES (?,?,?,?,?,?,?,?,?,?,?,?)
-               ON CONFLICT(key_id, hour, cli, model) DO UPDATE SET
-                 input=excluded.input, output=excluded.output, cache_read=excluded.cache_read,
-                 cache_create=excluded.cache_create, reasoning=excluded.reasoning,
-                 total=excluded.total, cost=excluded.cost, turns=excluded.turns
-               WHERE excluded.total >= cloud_usage_hourly.total`
+               VALUES (?,?,?,?,?,?,?,?,?,?,?,?)`
             )
             for (const r of localRows) {
               lStmt.run([
