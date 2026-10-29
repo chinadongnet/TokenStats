@@ -147,10 +147,11 @@ async function init() {
   }
   store.on('update', (snap) => {
     lastSnapshot = snap
-    const eff = buildEffectiveSnapshot(snap)
-    if (win && !win.isDestroyed()) win.webContents.send('snapshot', eff)
-    updateTray(eff)
-    scheduleIngest()
+    if (!scheduleIngest()) {
+      const eff = buildEffectiveSnapshot(snap)
+      if (win && !win.isDestroyed()) win.webContents.send('snapshot', eff)
+      updateTray(eff)
+    }
   })
 
   // Register IPC before the (slow) initial scan so the renderer never races a
@@ -458,7 +459,13 @@ async function init() {
   // Prime Claude's live plan-quota (spawns `claude -p /usage` once) so the
   // popup's Quota-windows section can show it without waiting for the first
   // 15-min refresh. Fire-and-forget; a snapshot after it lands shows the data.
-  primeClaudeLimits().then(() => broadcastSnapshot()).catch(() => {})
+  primeClaudeLimits()
+    .then(() => {
+      if (win && !win.isDestroyed() && lastSnapshot) {
+        win.webContents.send('snapshot', buildEffectiveSnapshot(lastSnapshot))
+      }
+    })
+    .catch(() => {})
   refreshAgyLimits()
   setInterval(() => refreshAgyLimits(), 20000)
   if (process.env.AIMON_AUTO_REPORT) openReport() // dev/test convenience
@@ -468,7 +475,13 @@ async function init() {
 
 function refreshAgyLimits(force = false) {
   if (!getAgyQuotaState().enabled) return
-  primeAgyLimits({ force }).then(() => broadcastSnapshot()).catch(() => {})
+  primeAgyLimits({ force })
+    .then(() => {
+      if (win && !win.isDestroyed() && lastSnapshot) {
+        win.webContents.send('snapshot', buildEffectiveSnapshot(lastSnapshot))
+      }
+    })
+    .catch(() => {})
 }
 
 // Live per-CLI quota windows, shared by the popup's subs:resets handler and
@@ -558,25 +571,35 @@ function startCloudSyncTimer() {
 
 // Throttle DB ingests: at most once every 4s, with a trailing run.
 function scheduleIngest() {
+  if (!db || !store) return false
   const since = Date.now() - lastIngest
-  if (since >= 4000) return ingestNow()
-  if (ingestTimer) return
-  ingestTimer = setTimeout(() => { ingestTimer = null; ingestNow() }, 4000 - since)
+  if (since >= 4000) {
+    return ingestNow()
+  }
+  if (!ingestTimer) {
+    ingestTimer = setTimeout(() => { ingestTimer = null; ingestNow() }, 4000 - since)
+  }
+  return false
 }
 
 function ingestNow() {
-  if (!db || !store) return
+  if (!db || !store) return false
   lastIngest = Date.now()
+  let sent = false
   try {
     db.ingest(store.dedupedRecords())
-    if (lastSnapshot && win && !win.isDestroyed()) {
-      win.webContents.send('snapshot', buildEffectiveSnapshot(lastSnapshot))
+    if (lastSnapshot) {
+      const eff = buildEffectiveSnapshot(lastSnapshot)
+      if (win && !win.isDestroyed()) win.webContents.send('snapshot', eff)
+      updateTray(eff)
+      sent = true
     }
     notifyReportUpdated()
     scheduleCloudSync()
   } catch (e) {
     console.error('ingest failed:', e)
   }
+  return sent
 }
 
 // Rebuilds store.pollers from the current DB provider rows — called on
@@ -814,10 +837,11 @@ function broadcastSnapshot() {
   if (!store) return
   const s = store.snapshot()
   lastSnapshot = s
-  const eff = buildEffectiveSnapshot(s)
-  if (win && !win.isDestroyed()) win.webContents.send('snapshot', eff)
-  updateTray(eff)
-  scheduleIngest()
+  if (!scheduleIngest()) {
+    const eff = buildEffectiveSnapshot(s)
+    if (win && !win.isDestroyed()) win.webContents.send('snapshot', eff)
+    updateTray(eff)
+  }
 }
 
 function createWindow() {

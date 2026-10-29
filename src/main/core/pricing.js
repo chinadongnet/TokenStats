@@ -28,13 +28,23 @@ const TABLE = [
 ]
 
 const DEFAULT = [1, 5, 0.1, 1]
+const _ratesCache = new Map()
 
 function ratesFor(model) {
-  const m = (model || '').toLowerCase()
+  const raw = model || ''
+  let cached = _ratesCache.get(raw)
+  if (cached) return cached
+  const m = raw.toLowerCase()
   for (const [key, ...rates] of TABLE) {
-    if (m.includes(key)) return rates
+    if (m.includes(key)) {
+      cached = rates
+      break
+    }
   }
-  return DEFAULT
+  if (!cached) cached = DEFAULT
+  if (_ratesCache.size > 2000) _ratesCache.clear()
+  _ratesCache.set(raw, cached)
+  return cached
 }
 
 // Estimate USD cost for one normalized usage record. A record may carry a

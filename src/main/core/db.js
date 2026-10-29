@@ -235,20 +235,49 @@ export class UsageDb {
       // no existing db yet
     }
     this.db = bytes ? new this.SQL.Database(bytes) : new this.SQL.Database()
+    this._mutationSeq = 1
+    const origRun = this.db.run.bind(this.db)
+    this.db.run = (...args) => {
+      this._mutationSeq = (this._mutationSeq || 0) + 1
+      return origRun(...args)
+    }
     this.db.run(SCHEMA)
     migrateSchema(this.db)
+    if (bytes) {
+      const hasStaleRootRows =
+        this.rows("SELECT 1 FROM usage_root_hourly WHERE cli != 'agy' AND root NOT LIKE 'alias:%' LIMIT 1").length > 0
+      if (hasStaleRootRows) {
+        this.db.run("DELETE FROM usage_root_hourly WHERE cli != 'agy' AND root NOT LIKE 'alias:%'")
+      }
+      const fl = this.rows('PRAGMA freelist_count')[0]?.freelist_count || 0
+      if (hasStaleRootRows || fl > 1000) {
+        this.db.run('VACUUM')
+        this.persist()
+      }
+    }
     return this
   }
 
   // Rebuild the hourly table from the full record set, then persist to disk.
   ingest(records) {
-    this._lastIngestedRecords = Array.isArray(records) ? records.map((r) => ({ ...r })) : []
+    if (
+      Array.isArray(records) &&
+      this._lastIngestedInputRef === records &&
+      this._lastIngestedRecords &&
+      this._lastIngestedRecords.length === records.length &&
+      this._lastIngestMutationSeq === this._mutationSeq
+    ) {
+      return this._lastIngestBucketCount || 0
+    }
+    this._lastIngestedInputRef = Array.isArray(records) ? records : null
+    this._lastIngestedRecords = Array.isArray(records) ? records.slice() : []
+    let cursorArchiveTouched = false
     const cursorRecs = this._lastIngestedRecords.filter((r) => r && r.cli === 'cursor')
     if (cursorRecs.length) {
       const matchedUser = this._resolveCursorUserFromRecords(cursorRecs)
       this._activeCursorUserId = matchedUser
       if (matchedUser) {
-        this.db.run('UPDATE cursor_usage_archive SET updated_at = ? WHERE user_id = ?', [this._nextCursorArchiveTs(), matchedUser])
+        cursorArchiveTouched = this._touchCursorArchiveUser(matchedUser, false)
       }
     } else {
       this._activeCursorUserId = null
@@ -279,7 +308,7 @@ export class UsageDb {
         (typeof r.cli === 'string' && r.cli.startsWith('litellm:') && r.project && r.project !== r.cli
           ? 'alias:' + r.project
           : null)
-      if (effRoot) {
+      if (effRoot && (r.cli === 'agy' || effRoot.startsWith('alias:'))) {
         const rKey = hour + '|' + r.cli + '|' + effRoot + '|' + r.model
         let rb = rootBuckets.get(rKey)
         if (!rb) {
@@ -294,39 +323,55 @@ export class UsageDb {
         rb.total += r.total
         rb.cost += cost
         rb.turns += turns
-        if (Array.isArray(r.parts) && r.parts.length) {
-          rb.parts.push(...r.parts)
-        } else if (r.dedupKey) {
-          rb.parts.push({
-            dedupKey: r.dedupKey,
-            input: r.input,
-            output: r.output,
-            cacheRead: r.cacheRead,
-            cacheCreate: r.cacheCreate,
-            reasoning: r.reasoning,
-            total: r.total,
-            turns,
-          })
+        if (r.cli === 'agy') {
+          if (Array.isArray(r.parts) && r.parts.length) {
+            rb.parts.push(...r.parts)
+          } else if (r.dedupKey) {
+            rb.parts.push({
+              dedupKey: r.dedupKey,
+              input: r.input,
+              output: r.output,
+              cacheRead: r.cacheRead,
+              cacheCreate: r.cacheCreate,
+              reasoning: r.reasoning,
+              total: r.total,
+              turns,
+            })
+          }
         }
       }
     }
 
-    const prevHourlyRows = this.rows('SELECT hour, cli, model, total, cost, turns FROM usage_hourly')
+    const prevHourlyRows = this.rows(
+      'SELECT hour, cli, model, input, output, cache_read, cache_create, reasoning, total, cost, turns FROM usage_hourly'
+    )
     const prevLocalMap = new Map(prevHourlyRows.map((r) => [`${r.hour}|${r.cli}|${r.model}`, r]))
     const removedKeys = new Set()
     const historicalCutoff = Date.now() - 6 * 24 * 3600 * 1000
     let historicalChanged = false
+    let bucketsChanged = buckets.size !== prevLocalMap.size
     for (const [k, prev] of prevLocalMap.entries()) {
       if (!buckets.has(k)) {
         removedKeys.add(k)
+        bucketsChanged = true
         if (prev.hour < historicalCutoff) historicalChanged = true
       }
     }
     for (const [k, b] of buckets.entries()) {
-      if (b.hour >= historicalCutoff) continue
       const prev = prevLocalMap.get(k)
-      if (!prev || prev.total !== b.total || prev.turns !== b.turns || Math.abs((prev.cost || 0) - (b.cost || 0)) > 1e-6) {
-        historicalChanged = true
+      const sameBucket =
+        prev &&
+        prev.input === b.input &&
+        prev.output === b.output &&
+        prev.cache_read === b.cacheRead &&
+        prev.cache_create === b.cacheCreate &&
+        prev.reasoning === b.reasoning &&
+        prev.total === b.total &&
+        prev.turns === b.turns &&
+        Math.abs((prev.cost || 0) - (b.cost || 0)) <= 1e-6
+      if (!sameBucket) {
+        bucketsChanged = true
+        if (b.hour < historicalCutoff) historicalChanged = true
       }
     }
     this._locallyRemovedKeys = removedKeys
@@ -335,6 +380,22 @@ export class UsageDb {
     }
     if (historicalChanged) {
       this.getCloudSync()
+    }
+
+    const rootBucketsSig = [...rootBuckets.values()]
+      .map((rb) => `${rb.hour}|${rb.cli}|${rb.root}|${rb.model}|${rb.total}|${rb.turns}|${rb.parts.length}`)
+      .join('\n')
+    const curDev = this.rows('SELECT id FROM cloud_devices WHERE is_current = 1 LIMIT 1')[0]
+    if (
+      !bucketsChanged &&
+      !historicalChanged &&
+      !cursorArchiveTouched &&
+      this._lastIngestMutationSeq === this._mutationSeq &&
+      this._lastRootBucketsSig === rootBucketsSig &&
+      this._lastIngestCurDevId === (curDev?.id || null)
+    ) {
+      this._lastIngestBucketCount = buckets.size
+      return buckets.size
     }
 
     this.db.run('BEGIN')
@@ -357,7 +418,6 @@ export class UsageDb {
     // Keep the current device's rows in cloud_usage_hourly in sync with local
     // ingests so "all devices (account)" and "this device" views immediately
     // reflect new local usage even between cloud sync passes.
-    const curDev = this.rows('SELECT id FROM cloud_devices WHERE is_current = 1 LIMIT 1')[0]
     if (curDev?.id) {
       this.db.run('DELETE FROM cloud_usage_hourly WHERE key_id = ?', [curDev.id])
       const cStmt = this.db.prepare(
@@ -374,10 +434,15 @@ export class UsageDb {
     }
     this.db.run('COMMIT')
     this.persist()
+    this._lastRootBucketsSig = rootBucketsSig
+    this._lastIngestCurDevId = curDev?.id || null
+    this._lastIngestBucketCount = buckets.size
+    this._lastIngestMutationSeq = this._mutationSeq
     return buckets.size
   }
 
   persist() {
+    this._mutationSeq = (this._mutationSeq || 0) + 1
     const data = Buffer.from(this.db.export())
     fs.mkdirSync(path.dirname(this.dbPath), { recursive: true })
     fs.writeFileSync(this.dbPath, data)
@@ -657,15 +722,25 @@ export class UsageDb {
     return next
   }
 
+  _touchCursorArchiveUser(uid, persistIfChanged = false) {
+    if (!uid) return false
+    const top = this.rows('SELECT user_id FROM cursor_usage_archive ORDER BY updated_at DESC LIMIT 1')[0]
+    if (!top || top.user_id === uid) return false
+    const existing = this.rows('SELECT user_id FROM cursor_usage_archive WHERE user_id = ?', [uid])[0]
+    if (!existing) return false
+    const nextTs = this._nextCursorArchiveTs()
+    this.db.run('UPDATE cursor_usage_archive SET updated_at = ? WHERE user_id = ?', [nextTs, uid])
+    const cached = this._cursorArchiveIndexCache?.get(uid)
+    if (cached) cached.updatedAt = nextTs
+    if (persistIfChanged) this.persist()
+    return true
+  }
+
   setActiveCursorUser(userId) {
     const uid = userId && userId !== 'unknown' ? String(userId) : null
     this._activeCursorUserId = uid
     if (uid) {
-      const existing = this.rows('SELECT user_id FROM cursor_usage_archive WHERE user_id = ?', [uid])[0]
-      if (existing) {
-        this.db.run('UPDATE cursor_usage_archive SET updated_at = ? WHERE user_id = ?', [this._nextCursorArchiveTs(), uid])
-        this.persist()
-      }
+      this._touchCursorArchiveUser(uid, true)
     }
   }
 
@@ -675,7 +750,7 @@ export class UsageDb {
     const row = this.rows('SELECT records_json, backfill_before_ms FROM cursor_usage_archive WHERE user_id = ?', [userId])[0]
     if (row) {
       if (uid) {
-        this.db.run('UPDATE cursor_usage_archive SET updated_at = ? WHERE user_id = ?', [this._nextCursorArchiveTs(), uid])
+        this._touchCursorArchiveUser(uid, false)
       }
       const parsed = JSON.parse(row.records_json)
       const out = uid ? parsed.map((r) => (r && r.userId === uid ? r : { ...r, userId: uid })) : parsed
@@ -711,6 +786,16 @@ export class UsageDb {
             (min, r) => (Number(r?.backfillBeforeMs) > 0 && (min === 0 || r.backfillBeforeMs < min) ? Number(r.backfillBeforeMs) : min),
             Number(records?.backfillBeforeMs) > 0 ? Number(records.backfillBeforeMs) : 0
           )
+    const nextJson = JSON.stringify(tagged)
+    const existingRow = this.rows('SELECT records_json, backfill_before_ms FROM cursor_usage_archive WHERE user_id = ?', [userId])[0]
+    if (
+      existingRow &&
+      existingRow.records_json === nextJson &&
+      (Number(existingRow.backfill_before_ms) || 0) === resolvedBackfill
+    ) {
+      this._touchCursorArchiveUser(uid || userId, true)
+      return
+    }
     const historicalCutoff = Date.now() - 6 * 24 * 3600 * 1000
     const histSig = (rows) =>
       (rows || [])
@@ -718,7 +803,6 @@ export class UsageDb {
         .map((r) => `${r.dedupKey || ''}|${r.ts ?? r.hour}|${r.model || ''}|${r.total || 0}|${r.input || 0}|${r.output || 0}`)
         .sort()
         .join('\n')
-    const existingRow = this.rows('SELECT records_json FROM cursor_usage_archive WHERE user_id = ?', [userId])[0]
     let prevRecords = []
     if (existingRow?.records_json) {
       try {
@@ -733,7 +817,7 @@ export class UsageDb {
     this.db.run(
       `INSERT INTO cursor_usage_archive (user_id, records_json, updated_at, backfill_before_ms) VALUES (?, ?, ?, ?)
        ON CONFLICT(user_id) DO UPDATE SET records_json=excluded.records_json, updated_at=excluded.updated_at, backfill_before_ms=excluded.backfill_before_ms`,
-      [userId, JSON.stringify(tagged), updatedAt, resolvedBackfill]
+      [userId, nextJson, updatedAt, resolvedBackfill]
     )
     if (nextHist !== prevHist) {
       this.getCloudSync()
@@ -750,28 +834,43 @@ export class UsageDb {
       const uid = r?.userId || r?.cursorUserId || r?.accountId
       if (uid && uid !== 'unknown') return String(uid)
     }
-    const archives = this.rows('SELECT user_id, records_json FROM cursor_usage_archive ORDER BY updated_at DESC')
-    if (!archives.length) return null
+    const archiveMeta = this.rows('SELECT user_id, updated_at, LENGTH(records_json) AS json_len FROM cursor_usage_archive ORDER BY updated_at DESC')
+    if (!archiveMeta.length) return null
+    if (!this._cursorArchiveIndexCache) this._cursorArchiveIndexCache = new Map()
     let bestUserId = null
     let bestScore = 0
-    for (const a of archives) {
-      let parsed = []
-      try {
-        parsed = JSON.parse(a.records_json || '[]')
-      } catch {
-        parsed = []
-      }
-      const aDedupKeys = new Set()
-      const aExactKeys = new Set()
-      const aHourKeys = new Set()
-      for (const ar of parsed) {
-        if (ar.dedupKey && !String(ar.dedupKey).startsWith('cursor-legacy:')) aDedupKeys.add(String(ar.dedupKey))
-        const ts = ar.ts ?? ar.hour
-        if (Number.isFinite(ts)) {
-          aExactKeys.add(`${ts}|${ar.model || ''}|${ar.total || 0}`)
-          aHourKeys.add(`${floorHourLocal(ts)}|${ar.model || ''}|${ar.total || 0}`)
+    for (const a of archiveMeta) {
+      let idx = this._cursorArchiveIndexCache.get(a.user_id)
+      if (!idx || idx.updatedAt !== a.updated_at || idx.jsonLen !== a.json_len) {
+        const row = this.rows('SELECT records_json FROM cursor_usage_archive WHERE user_id = ?', [a.user_id])[0]
+        let parsed = []
+        try {
+          parsed = JSON.parse(row?.records_json || '[]')
+        } catch {
+          parsed = []
         }
+        const aDedupKeys = new Set()
+        const aExactKeys = new Set()
+        const aHourKeys = new Set()
+        for (const ar of parsed) {
+          if (ar.dedupKey && !String(ar.dedupKey).startsWith('cursor-legacy:')) aDedupKeys.add(String(ar.dedupKey))
+          const ts = ar.ts ?? ar.hour
+          if (Number.isFinite(ts)) {
+            aExactKeys.add(`${ts}|${ar.model || ''}|${ar.total || 0}`)
+            aHourKeys.add(`${floorHourLocal(ts)}|${ar.model || ''}|${ar.total || 0}`)
+          }
+        }
+        idx = {
+          updatedAt: a.updated_at,
+          jsonLen: a.json_len,
+          length: parsed.length,
+          aDedupKeys,
+          aExactKeys,
+          aHourKeys,
+        }
+        this._cursorArchiveIndexCache.set(a.user_id, idx)
       }
+      const { aDedupKeys, aExactKeys, aHourKeys, length } = idx
       let score = 0
       let matched = 0
       for (const r of cursorRecs) {
@@ -788,7 +887,7 @@ export class UsageDb {
           matched++
         }
       }
-      if (matched === cursorRecs.length && parsed.length === cursorRecs.length) {
+      if (matched === cursorRecs.length && length === cursorRecs.length) {
         score += 1
       }
       if (score > bestScore) {
@@ -813,19 +912,38 @@ export class UsageDb {
     if (this._activeCursorUserId) {
       return hashCursorAccount(this._activeCursorUserId)
     }
+    if (
+      !Array.isArray(records) &&
+      this._cursorHashMemo &&
+      this._cursorHashMemo.seq === this._mutationSeq &&
+      this._cursorHashMemo.lastIngested === this._lastIngestedRecords
+    ) {
+      return this._cursorHashMemo.hash
+    }
+    let hash = ''
     if (Array.isArray(this._lastIngestedRecords)) {
       const ingestedCursor = this._lastIngestedRecords.filter((r) => r && r.cli === 'cursor')
-      if (!ingestedCursor.length) return ''
-      const resolved = this._resolveCursorUserFromRecords(ingestedCursor)
-      return resolved ? hashCursorAccount(resolved) : ''
+      if (ingestedCursor.length) {
+        const resolved = this._resolveCursorUserFromRecords(ingestedCursor)
+        hash = resolved ? hashCursorAccount(resolved) : ''
+      }
+    } else {
+      const hourlyCursor = this.rows("SELECT hour, model, total FROM usage_hourly WHERE cli = 'cursor'")
+      if (hourlyCursor.length) {
+        const resolved = this._resolveCursorUserFromRecords(hourlyCursor)
+        if (resolved) hash = hashCursorAccount(resolved)
+      }
+      if (!hash) {
+        const r = this.rows('SELECT user_id FROM cursor_usage_archive ORDER BY updated_at DESC LIMIT 1')[0]
+        hash = hashCursorAccount(r?.user_id)
+      }
     }
-    const hourlyCursor = this.rows("SELECT hour, model, total FROM usage_hourly WHERE cli = 'cursor'")
-    if (hourlyCursor.length) {
-      const resolved = this._resolveCursorUserFromRecords(hourlyCursor)
-      if (resolved) return hashCursorAccount(resolved)
+    this._cursorHashMemo = {
+      seq: this._mutationSeq,
+      lastIngested: this._lastIngestedRecords,
+      hash,
     }
-    const r = this.rows('SELECT user_id FROM cursor_usage_archive ORDER BY updated_at DESC LIMIT 1')[0]
-    return hashCursorAccount(r?.user_id)
+    return hash
   }
 
   hasMigration(name) {
@@ -1158,7 +1276,10 @@ export class UsageDb {
   }
 
   listCloudDevices() {
-    return this.rows(
+    if (this._cloudDevicesMemo && this._cloudDevicesMemo.seq === this._mutationSeq) {
+      return this._cloudDevicesMemo.devices
+    }
+    const devices = this.rows(
       'SELECT * FROM cloud_devices ORDER BY is_current DESC, COALESCE(last_sync_at, 0) DESC, name ASC'
     ).map((r) => {
       let status = null
@@ -1181,6 +1302,8 @@ export class UsageDb {
         status,
       }
     })
+    this._cloudDevicesMemo = { seq: this._mutationSeq, devices }
+    return devices
   }
 
   resolveDeviceId(deviceId = null) {
@@ -1223,6 +1346,14 @@ export class UsageDb {
   // the winning owner device. Unidentified LiteLLM sources retain their own
   // CLI identity so unrelated proxies are never collapsed.
   cloudServerSourceOwners() {
+    if (
+      this._cloudOwnersMemo &&
+      this._cloudOwnersMemo.seq === this._mutationSeq &&
+      this._cloudOwnersMemo.activeCursorUserId === this._activeCursorUserId &&
+      this._cloudOwnersMemo.lastIngested === this._lastIngestedRecords
+    ) {
+      return this._cloudOwnersMemo.owners
+    }
     const localProviders = this.listLitellmProviders()
     const devices = this.listCloudDevices()
     const metaByDevCli = new Map()
@@ -1397,6 +1528,12 @@ export class UsageDb {
       const canon = owners.canonicalCliFor(keyId, cli)
       return [...new Set([canon, cli, ...(clisByIdentity.get(idKey) || [])])]
     }
+    this._cloudOwnersMemo = {
+      seq: this._mutationSeq,
+      activeCursorUserId: this._activeCursorUserId,
+      lastIngested: this._lastIngestedRecords,
+      owners,
+    }
     return owners
   }
 
@@ -1559,6 +1696,28 @@ export class UsageDb {
     const eff = this.resolveDeviceId(deviceId)
     const local = this._resolveLocalRecords(localRecords)
     if (eff === 'local') return local
+    const memo = this._recordsForDeviceMemo
+    if (
+      memo &&
+      memo.seq === this._mutationSeq &&
+      memo.eff === eff &&
+      memo.localRef === local &&
+      memo.localLen === (local ? local.length : 0) &&
+      memo.activeCursorUserId === this._activeCursorUserId
+    ) {
+      return memo.result
+    }
+    const cacheAndReturn = (result) => {
+      this._recordsForDeviceMemo = {
+        seq: this._mutationSeq,
+        eff,
+        localRef: local,
+        localLen: local ? local.length : 0,
+        activeCursorUserId: this._activeCursorUserId,
+        result,
+      }
+      return result
+    }
 
     const curDev = this.rows('SELECT id FROM cloud_devices WHERE is_current = 1 LIMIT 1')[0]
     const toCloudRec = (r, cliOverride = null) => {
@@ -1584,12 +1743,12 @@ export class UsageDb {
     }
 
     if (curDev?.id && eff === curDev.id) {
-      if (!local.length) return this.cloudFilteredRows(eff).map((r) => toCloudRec(r))
+      if (!local.length) return cacheAndReturn(this.cloudFilteredRows(eff).map((r) => toCloudRec(r)))
       const coveredHours = new Set(local.map((r) => `${floorHourLocal(r.ts)}|${r.cli}|${r.model}`))
       const extraCloud = this.cloudFilteredRows(eff)
         .filter((r) => !coveredHours.has(`${r.hour}|${r.cli}|${r.model}`))
         .map((r) => toCloudRec(r))
-      return [...local, ...extraCloud]
+      return cacheAndReturn([...local, ...extraCloud])
     }
 
     if (eff === 'account') {
@@ -1754,10 +1913,10 @@ export class UsageDb {
         }
       }
 
-      return [...keptLocal, ...cloudRecs]
+      return cacheAndReturn([...keptLocal, ...cloudRecs])
     }
 
-    return this.cloudFilteredRows(eff).map((r) => toCloudRec(r))
+    return cacheAndReturn(this.cloudFilteredRows(eff).map((r) => toCloudRec(r)))
   }
 
   // Exact replica of tokenstat-web/src/lib/usage.js#totalsSince so the desktop
@@ -1832,6 +1991,18 @@ export class UsageDb {
     const viewState = this.getDeviceViewState()
     const eff = deviceId ? this.resolveDeviceId(deviceId) : viewState.selectedDevice
     if (!viewState.hasCloudData || eff === 'local') return null
+
+    const nowBucket = Math.floor(now / 15000)
+    if (
+      this._cloudOverviewMemo &&
+      this._cloudOverviewMemo.seq === this._mutationSeq &&
+      this._cloudOverviewMemo.eff === eff &&
+      this._cloudOverviewMemo.activeCursorUserId === this._activeCursorUserId &&
+      this._cloudOverviewMemo.lastIngested === this._lastIngestedRecords &&
+      this._cloudOverviewMemo.nowBucket === nowBucket
+    ) {
+      return { ...this._cloudOverviewMemo.value, generatedAt: now }
+    }
 
     const owners = eff === 'account' ? this.cloudServerSourceOwners() : null
     const ranges = {
@@ -1914,7 +2085,7 @@ export class UsageDb {
       }
     })
 
-    return {
+    const result = {
       generatedAt: now,
       isCloudOverview: true,
       selectedDevice: eff,
@@ -1938,6 +2109,15 @@ export class UsageDb {
       cloudStatus: status,
       cloudResets: normalizedResets,
     }
+    this._cloudOverviewMemo = {
+      seq: this._mutationSeq,
+      eff,
+      activeCursorUserId: this._activeCursorUserId,
+      lastIngested: this._lastIngestedRecords,
+      nowBucket,
+      value: result,
+    }
+    return result
   }
 
   // ---- queries for the report ---------------------------------------------
@@ -2030,16 +2210,30 @@ export class UsageDb {
   }
 }
 
+const _floorHourCache = new Map()
 export function floorHourLocal(ts) {
+  const q = Math.floor(ts / 900000)
+  let h = _floorHourCache.get(q)
+  if (h !== undefined) return h
   const d = new Date(ts)
   d.setMinutes(0, 0, 0)
-  return d.getTime()
+  h = d.getTime()
+  if (_floorHourCache.size > 50000) _floorHourCache.clear()
+  _floorHourCache.set(q, h)
+  return h
 }
 
+const _floorDayCache = new Map()
 export function floorDayLocal(ts) {
+  const q = Math.floor(ts / 900000)
+  let day = _floorDayCache.get(q)
+  if (day !== undefined) return day
   const d = new Date(ts)
   d.setHours(0, 0, 0, 0)
-  return d.getTime()
+  day = d.getTime()
+  if (_floorDayCache.size > 50000) _floorDayCache.clear()
+  _floorDayCache.set(q, day)
+  return day
 }
 
 function mapProviderRow(r) {
