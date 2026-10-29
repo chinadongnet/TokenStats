@@ -230,7 +230,11 @@ export async function performSync({
   // rewritten rows this pass captured too early) apart from the raise being
   // consumed here; see db.updateCloudSyncState.
   const genAtStart = db.fullResyncGen || 0
-  const fromMs = full ? 0 : now - RESYNC_WINDOW_MS
+  const rollingStart =
+    cfg.lastSyncAt > 0
+      ? Math.min(now - RESYNC_WINDOW_MS, Math.max(0, Math.floor((cfg.lastSyncAt - 2 * 3600000) / 3600000) * 3600000))
+      : now - RESYNC_WINDOW_MS
+  const fromMs = full ? 0 : rollingStart
   const rows = db.hourlySince(fromMs)
   const device = {
     tz: Intl.DateTimeFormat().resolvedOptions().timeZone,

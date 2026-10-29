@@ -141,7 +141,7 @@ async function init() {
     store.files.set('bootstrap:cursor', { parser: cursor, records })
     configureCursorArchive({
       load: (userId) => db.listCursorUsage(userId, legacyRows),
-      save: (userId, rows) => db.saveCursorUsage(userId, rows),
+      save: (userId, rows, backfillBeforeMs) => db.saveCursorUsage(userId, rows, backfillBeforeMs),
       activate: (userId) => db.setActiveCursorUser(userId),
     })
   }

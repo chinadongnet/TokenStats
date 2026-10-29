@@ -345,8 +345,9 @@ async function fetchUsageCsv(token, fromMs = 0, { backfillBeforeMs = 0, recentFr
       return { rows, replacedFromMs: fromMs, backfillBeforeMs }
     }
     if (fromMs === 0) {
+      const historyFloorMs = endDate > Date.UTC(2023, 0, 1) + 90 * 86400000 ? Date.UTC(2023, 0, 1) : 0
       if (backfillBeforeMs > 0) {
-        const olderStart = Math.max(0, backfillBeforeMs - 30 * 86400000)
+        const olderStart = Math.max(historyFloorMs, backfillBeforeMs - 30 * 86400000)
         const olderRows = await fetchUsageCsvChunks(cookie, olderStart, backfillBeforeMs, 3 * 86400000)
         const tailStart = recentFromMs > backfillBeforeMs ? recentFromMs : backfillBeforeMs
         const recentRows = await fetchUsageCsvChunks(cookie, tailStart, endDate, 3 * 86400000)
@@ -354,12 +355,12 @@ async function fetchUsageCsv(token, fromMs = 0, { backfillBeforeMs = 0, recentFr
           rows: [...olderRows, ...recentRows],
           olderRange: [olderStart, backfillBeforeMs],
           replacedFromMs: tailStart,
-          backfillBeforeMs: olderRows.length > 0 ? olderStart : 0,
+          backfillBeforeMs: olderStart > historyFloorMs ? olderStart : 0,
         }
       }
-      const partialStart = Math.max(0, endDate - 30 * 86400000)
+      const partialStart = Math.max(historyFloorMs, endDate - 30 * 86400000)
       const rows = await fetchUsageCsvChunks(cookie, partialStart, endDate, 3 * 86400000)
-      return { rows, replacedFromMs: partialStart, backfillBeforeMs: partialStart }
+      return { rows, replacedFromMs: partialStart, backfillBeforeMs: partialStart > historyFloorMs ? partialStart : 0 }
     }
     throw err
   }
@@ -456,8 +457,8 @@ export function cursorResetWindows() {
 async function getCloudRecords(token) {
   const payload = decodeJwt(token)
   const userId = payload?.sub ? String(payload.sub) : 'unknown'
-  const tagUser = (rows, backfillMs = 0) =>
-    (rows || []).map((r) => {
+  const tagUser = (rows, backfillMs = 0) => {
+    const out = (rows || []).map((r) => {
       if (!r) return r
       const next = { ...r }
       if (userId && userId !== 'unknown') next.userId = userId
@@ -465,6 +466,11 @@ async function getCloudRecords(token) {
       else delete next.backfillBeforeMs
       return next
     })
+    if (backfillMs > 0) {
+      Object.defineProperty(out, 'backfillBeforeMs', { value: backfillMs, enumerable: false, configurable: true })
+    }
+    return out
+  }
   if (userId && userId !== 'unknown') {
     activeUserId = userId
     archive.activate?.(userId)
@@ -476,12 +482,13 @@ async function getCloudRecords(token) {
       : await loadDefaultArchive(userId)
     const savedBackfill = (initialRecords || []).reduce(
       (min, r) => (Number(r?.backfillBeforeMs) > 0 && (min === 0 || r.backfillBeforeMs < min) ? Number(r.backfillBeforeMs) : min),
-      0
+      Number(initialRecords?.backfillBeforeMs) > 0 ? Number(initialRecords.backfillBeforeMs) : 0
     )
     entry = {
       records: tagUser(initialRecords, savedBackfill),
       fetchedAt: 0,
       retryAt: 0,
+      coveredUntilMs: 0,
       backfillBeforeMs: savedBackfill,
     }
     cacheByUser.set(userId, entry)
@@ -499,11 +506,16 @@ async function getCloudRecords(token) {
         latestCloudTs = r.ts
       }
     }
+    const resumeAnchor = Math.max(latestCloudTs, entry.coveredUntilMs || 0)
     const twoDaysAgo = Date.now() - 2 * 86400000
-    const resumeBase = latestCloudTs > 0 ? Math.min(twoDaysAgo, latestCloudTs - 2 * 3600000) : twoDaysAgo
-    const recentFromMs = entry.records.length ? Math.max(0, Math.floor(resumeBase / 3600000) * 3600000) : 0
+    const resumeBase = resumeAnchor > 0 ? Math.min(twoDaysAgo, resumeAnchor - 2 * 3600000) : twoDaysAgo
     const backfillBeforeMs = Number(entry.backfillBeforeMs) > 0 ? Number(entry.backfillBeforeMs) : 0
+    const recentFromMs =
+      entry.records.length || backfillBeforeMs > 0
+        ? Math.max(0, Math.floor(resumeBase / 3600000) * 3600000)
+        : 0
     const fromMs = backfillBeforeMs > 0 ? 0 : recentFromMs
+    const fetchStartedAt = Date.now()
     const [usage, summary] = await Promise.allSettled([
       fetchUsageCsv(token, fromMs, { backfillBeforeMs, recentFromMs }),
       fetchUsageSummary(token),
@@ -521,12 +533,14 @@ async function getCloudRecords(token) {
       }
       const merged = [...byKey.values()].sort((a, b) => a.ts - b.ts)
       const records = tagUser(merged, nextBackfill)
+      const prevJson = JSON.stringify(entry.records)
+      entry.records = records
       entry.backfillBeforeMs = nextBackfill
-      if (JSON.stringify(records) !== JSON.stringify(entry.records)) {
-        entry.records = records
+      entry.coveredUntilMs = fetchStartedAt
+      if (JSON.stringify(records) !== prevJson) {
         cursor.revision++
       }
-      archive.save?.(userId, entry.records)
+      archive.save?.(userId, entry.records, nextBackfill)
       entry.fetchedAt = Date.now()
       entry.retryAt = 0
     } else {

@@ -589,6 +589,79 @@ try {
   globalThis.fetch = origFetch
 }
 
+// Verify recovering a 10-day-old Cursor bucket on an already-synced device raises fullResync and uploads the historical bucket
+{
+  const nowMs = Date.now()
+  const oneDayHour = Math.floor((nowMs - 1 * 86400000) / 3600000) * 3600000
+  const tenDayHour = Math.floor((nowMs - 10 * 86400000) / 3600000) * 3600000
+  const recRecent = {
+    cli: 'cursor',
+    ts: oneDayHour,
+    model: 'claude-4.6-opus-max-thinking',
+    input: 100,
+    output: 50,
+    cacheRead: 0,
+    cacheCreate: 0,
+    reasoning: 0,
+    total: 150,
+    cost: 0.1,
+    turns: 1,
+    dedupKey: `cursor-cloud:${oneDayHour}:claude-4.6-opus-max-thinking:100:50:0:0:150:0`,
+  }
+  const recTenDaysAgo = {
+    cli: 'cursor',
+    ts: tenDayHour,
+    model: 'claude-4.6-opus-max-thinking',
+    input: 400,
+    output: 200,
+    cacheRead: 0,
+    cacheCreate: 0,
+    reasoning: 0,
+    total: 600,
+    cost: 0.4,
+    turns: 2,
+    dedupKey: `cursor-cloud:${tenDayHour}:claude-4.6-opus-max-thinking:400:200:0:0:600:0`,
+  }
+  db.saveCursorUsage('user|sync-gap', [recRecent])
+  db.ingest([recRecent])
+  db.saveCloudSync({ endpoint: 'https://token.chinadong.net', apiKey: 'ts_gap', enabled: true, syncMinutes: 10 })
+  db.updateCloudSyncState({ fullResync: false, lastSyncAt: nowMs - 60000 })
+  if (db.getCloudSync().fullResync !== false) {
+    throw new Error('Expected fullResync to start false before historical gap recovery')
+  }
+  db.saveCursorUsage('user|sync-gap', [recTenDaysAgo, recRecent])
+  if (!db.getCloudSync().fullResync) {
+    throw new Error('Expected saveCursorUsage with recovered 10-day-old record to raise fullResync')
+  }
+  db.updateCloudSyncState({ fullResync: false })
+  db.ingest([recTenDaysAgo, recRecent])
+  if (!db.getCloudSync().fullResync) {
+    throw new Error('Expected ingest with recovered 10-day-old bucket to raise fullResync')
+  }
+  let uploadedHours = []
+  try {
+    globalThis.fetch = async (_url, opts) => {
+      const body = JSON.parse(opts.body)
+      uploadedHours = body.hours || []
+      return new Response(JSON.stringify({ accepted: uploadedHours.length }), {
+        status: 200,
+        headers: { 'content-type': 'application/json' },
+      })
+    }
+    const gapSyncRes = await performSync({
+      db,
+      store: { dedupedRecords: () => [recTenDaysAgo, recRecent] },
+      liveByCli: {},
+      appVersion: '0.2.52',
+    })
+    if (!gapSyncRes.ok || !uploadedHours.some((h) => h.hour === tenDayHour && h.total === 600)) {
+      throw new Error(`Expected incremental performSync to upload recovered 10-day-old bucket, got ${JSON.stringify(uploadedHours)}`)
+    }
+  } finally {
+    globalThis.fetch = origFetch
+  }
+}
+
 console.log('multi-device account overview, cross-device LiteLLM dedupe, keyAlias attribution & concurrent sync guard verified')
 
 fs.rmSync(dbPath, { force: true })

@@ -100,7 +100,8 @@ CREATE INDEX IF NOT EXISTS idx_litellm_usage_provider ON litellm_usage(provider_
 CREATE TABLE IF NOT EXISTS cursor_usage_archive (
   user_id TEXT PRIMARY KEY,
   records_json TEXT NOT NULL,
-  updated_at INTEGER NOT NULL DEFAULT 0
+  updated_at INTEGER NOT NULL DEFAULT 0,
+  backfill_before_ms INTEGER NOT NULL DEFAULT 0
 );
 
 CREATE TABLE IF NOT EXISTS applied_migrations (
@@ -186,6 +187,7 @@ function migrateSchema(db) {
   if (!rootHourly.has('parts_json')) db.run('ALTER TABLE usage_root_hourly ADD COLUMN parts_json TEXT')
   const cursorArchiveCols = columns('cursor_usage_archive')
   if (!cursorArchiveCols.has('updated_at')) db.run('ALTER TABLE cursor_usage_archive ADD COLUMN updated_at INTEGER NOT NULL DEFAULT 0')
+  if (!cursorArchiveCols.has('backfill_before_ms')) db.run('ALTER TABLE cursor_usage_archive ADD COLUMN backfill_before_ms INTEGER NOT NULL DEFAULT 0')
   if (!subs.has('reset_periods')) {
     db.run('ALTER TABLE subscriptions ADD COLUMN reset_periods TEXT')
     // Quota windows were briefly a single-select `reset_period` column before
@@ -309,16 +311,30 @@ export class UsageDb {
       }
     }
 
-    const prevLocalKeys = new Set(
-      this.rows('SELECT hour, cli, model FROM usage_hourly').map((r) => `${r.hour}|${r.cli}|${r.model}`)
-    )
+    const prevHourlyRows = this.rows('SELECT hour, cli, model, total, cost, turns FROM usage_hourly')
+    const prevLocalMap = new Map(prevHourlyRows.map((r) => [`${r.hour}|${r.cli}|${r.model}`, r]))
     const removedKeys = new Set()
-    for (const k of prevLocalKeys) {
-      if (!buckets.has(k)) removedKeys.add(k)
+    const historicalCutoff = Date.now() - 6 * 24 * 3600 * 1000
+    let historicalChanged = false
+    for (const [k, prev] of prevLocalMap.entries()) {
+      if (!buckets.has(k)) {
+        removedKeys.add(k)
+        if (prev.hour < historicalCutoff) historicalChanged = true
+      }
+    }
+    for (const [k, b] of buckets.entries()) {
+      if (b.hour >= historicalCutoff) continue
+      const prev = prevLocalMap.get(k)
+      if (!prev || prev.total !== b.total || prev.turns !== b.turns || Math.abs((prev.cost || 0) - (b.cost || 0)) > 1e-6) {
+        historicalChanged = true
+      }
     }
     this._locallyRemovedKeys = removedKeys
     if (this._deletedLitellmClis) {
       for (const b of buckets.values()) this._deletedLitellmClis.delete(b.cli)
+    }
+    if (historicalChanged) {
+      this.getCloudSync()
     }
 
     this.db.run('BEGIN')
@@ -351,6 +367,10 @@ export class UsageDb {
         cStmt.run([curDev.id, b.hour, b.cli, b.model, b.input, b.output, b.cacheRead, b.cacheCreate, b.reasoning, b.total, b.cost, b.turns])
       }
       cStmt.free()
+    }
+    if (historicalChanged) {
+      this.fullResyncGen = (this.fullResyncGen || 0) + 1
+      this.db.run('UPDATE cloud_sync SET full_resync = 1 WHERE id = 1')
     }
     this.db.run('COMMIT')
     this.persist()
@@ -652,13 +672,18 @@ export class UsageDb {
   listCursorUsage(userId, legacyRows = null) {
     const uid = userId && userId !== 'unknown' ? String(userId) : null
     if (uid) this._activeCursorUserId = uid
-    const row = this.rows('SELECT records_json FROM cursor_usage_archive WHERE user_id = ?', [userId])[0]
+    const row = this.rows('SELECT records_json, backfill_before_ms FROM cursor_usage_archive WHERE user_id = ?', [userId])[0]
     if (row) {
       if (uid) {
         this.db.run('UPDATE cursor_usage_archive SET updated_at = ? WHERE user_id = ?', [this._nextCursorArchiveTs(), uid])
       }
       const parsed = JSON.parse(row.records_json)
-      return uid ? parsed.map((r) => (r && r.userId === uid ? r : { ...r, userId: uid })) : parsed
+      const out = uid ? parsed.map((r) => (r && r.userId === uid ? r : { ...r, userId: uid })) : parsed
+      const backfillBeforeMs = Number(row.backfill_before_ms) || 0
+      if (backfillBeforeMs > 0) {
+        Object.defineProperty(out, 'backfillBeforeMs', { value: backfillBeforeMs, enumerable: false, configurable: true })
+      }
+      return out
     }
     // Upgrade existing installs without losing older hourly totals. Historical
     // buckets remain aggregates; recent buckets become real request rows.
@@ -673,18 +698,48 @@ export class UsageDb {
     }))
   }
 
-  saveCursorUsage(userId, records) {
+  saveCursorUsage(userId, records, backfillBeforeMs = null) {
     const uid = userId && userId !== 'unknown' ? String(userId) : null
     if (uid) this._activeCursorUserId = uid
     const tagged = uid
       ? (records || []).map((r) => (r && r.userId === uid ? r : { ...r, userId: uid }))
       : records || []
+    const resolvedBackfill =
+      backfillBeforeMs != null && Number.isFinite(Number(backfillBeforeMs))
+        ? Math.max(0, Number(backfillBeforeMs))
+        : (records || []).reduce(
+            (min, r) => (Number(r?.backfillBeforeMs) > 0 && (min === 0 || r.backfillBeforeMs < min) ? Number(r.backfillBeforeMs) : min),
+            Number(records?.backfillBeforeMs) > 0 ? Number(records.backfillBeforeMs) : 0
+          )
+    const historicalCutoff = Date.now() - 6 * 24 * 3600 * 1000
+    const histSig = (rows) =>
+      (rows || [])
+        .filter((r) => r && Number(r.ts ?? r.hour) < historicalCutoff)
+        .map((r) => `${r.dedupKey || ''}|${r.ts ?? r.hour}|${r.model || ''}|${r.total || 0}|${r.input || 0}|${r.output || 0}`)
+        .sort()
+        .join('\n')
+    const existingRow = this.rows('SELECT records_json FROM cursor_usage_archive WHERE user_id = ?', [userId])[0]
+    let prevRecords = []
+    if (existingRow?.records_json) {
+      try {
+        prevRecords = JSON.parse(existingRow.records_json)
+      } catch {
+        prevRecords = []
+      }
+    }
+    const nextHist = histSig(tagged)
+    const prevHist = histSig(prevRecords)
     const updatedAt = this._nextCursorArchiveTs()
     this.db.run(
-      `INSERT INTO cursor_usage_archive (user_id, records_json, updated_at) VALUES (?, ?, ?)
-       ON CONFLICT(user_id) DO UPDATE SET records_json=excluded.records_json, updated_at=excluded.updated_at`,
-      [userId, JSON.stringify(tagged), updatedAt]
+      `INSERT INTO cursor_usage_archive (user_id, records_json, updated_at, backfill_before_ms) VALUES (?, ?, ?, ?)
+       ON CONFLICT(user_id) DO UPDATE SET records_json=excluded.records_json, updated_at=excluded.updated_at, backfill_before_ms=excluded.backfill_before_ms`,
+      [userId, JSON.stringify(tagged), updatedAt, resolvedBackfill]
     )
+    if (nextHist !== prevHist) {
+      this.getCloudSync()
+      this.fullResyncGen = (this.fullResyncGen || 0) + 1
+      this.db.run('UPDATE cloud_sync SET full_resync = 1 WHERE id = 1')
+    }
     this.persist()
   }
 

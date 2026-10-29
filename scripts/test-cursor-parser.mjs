@@ -157,6 +157,42 @@ try {
   const backfilledRecs = await cursor.parseFile(sqliteFile)
   assert.equal(backfilledRecs.length, 2, 'subsequent refresh after cold-start fallback must backfill 45d history')
 
+  // Historical backfill across an empty month: when full-history exports keep
+  // failing and the 30-to-60-day window is empty, backfillBeforeMs must advance
+  // across the empty month so the next refresh recovers usage at 75 days ago.
+  const seventyFiveDaysAgo = now - 75 * 86400000
+  let multiMonthSaved = []
+  configureCursorArchive({
+    load: () => multiMonthSaved,
+    save: (_user, rows) => { multiMonthSaved = JSON.parse(JSON.stringify(rows)) },
+  })
+  globalThis.fetch = async (url) => {
+    const u = String(url)
+    if (u.includes('/api/usage-summary')) return new Response('{}', { status: 200 })
+    const start = Number(new URL(u).searchParams.get('startDate'))
+    const end = Number(new URL(u).searchParams.get('endDate'))
+    if (start === 0) return new Response('gateway timeout', { status: 504 })
+    const lines = [
+      'Date,Kind,Model,Input (w/ Cache Write),Input (w/o Cache Write),Cache Read,Output Tokens,Total Tokens',
+    ]
+    if (oneDayAgo >= start && oneDayAgo <= end) {
+      lines.push(`"${new Date(oneDayAgo).toISOString()}","Included","claude-4.6-opus-max-thinking","0","400","0","200","600"`)
+    }
+    if (seventyFiveDaysAgo >= start && seventyFiveDaysAgo <= end) {
+      lines.push(`"${new Date(seventyFiveDaysAgo).toISOString()}","Included","claude-4.6-opus-max-thinking","0","700","0","300","1000"`)
+    }
+    return new Response(lines.join('\n'), { status: 200 })
+  }
+  const pass1 = await cursor.parseFile(sqliteFile)
+  assert.equal(pass1.length, 1, 'pass 1 fetches 0-30d window')
+  cursor.forceRefresh()
+  const pass2 = await cursor.parseFile(sqliteFile)
+  assert.equal(pass2.length, 1, 'pass 2 steps across empty 30-60d window without clearing backfillBeforeMs')
+  assert.ok(pass2[0].backfillBeforeMs > 0, 'backfillBeforeMs must stay positive after an empty 30-day window')
+  cursor.forceRefresh()
+  const pass3 = await cursor.parseFile(sqliteFile)
+  assert.equal(pass3.length, 2, 'pass 3 recovers 75d usage behind the empty month')
+
   console.log('cursor token reader & gap recovery: ok')
 } finally {
   globalThis.fetch = originalFetch
