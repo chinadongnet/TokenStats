@@ -716,6 +716,45 @@ try {
     throw new Error(`Expected hidden LiteLLM model not to be resurrected when localRecords is [], got ${JSON.stringify(curDevRecs)}`)
   }
 
+  // Verify retained local keyAlias usage is bounded by the winning remote bucket's totals
+  // when a server-side correction reduces the remote bucket below stale local alias totals.
+  db.saveCloudAccountSync({
+    currentKeyId: 'dev_a',
+    devices: [
+      { id: 'dev_a', name: 'Office PC', lastSyncAt: nowMs - 60000, isCurrent: true },
+      { id: 'dev_b', name: 'Home Mac', lastSyncAt: nowMs, isCurrent: false },
+    ],
+    snapshots: [
+      { keyId: 'dev_a', status: { cliMeta: { 'litellm:proxy1': { label: 'SharedProxy', baseUrl: 'https://litellm.example.com' } } } },
+      { keyId: 'dev_b', status: { cliMeta: { 'litellm:proxy1': { label: 'SharedProxy', baseUrl: 'https://litellm.example.com' } } } },
+    ],
+    hours: [
+      { keyId: 'dev_b', hour: oneDayHour, cli: 'litellm:proxy1', model: 'mimo-v2-pro', input: 50, output: 50, cacheRead: 0, cacheCreate: 0, reasoning: 0, total: 100, cost: 1.0, turns: 1 },
+    ],
+  })
+  const clampedRecs = db.recordsForDevice('account', [
+    {
+      ts: oneDayHour,
+      hour: oneDayHour,
+      cli: 'litellm:proxy1',
+      model: 'mimo-v2-pro',
+      input: 100,
+      output: 100,
+      cacheRead: 0,
+      cacheCreate: 0,
+      reasoning: 0,
+      total: 200,
+      cost: 2.0,
+      turns: 2,
+      sessionId: 'litellm',
+      project: 'team-key-a',
+    },
+  ])
+  const clampedTotal = clampedRecs.filter((r) => r.cli === 'litellm:proxy1').reduce((s, r) => s + r.total, 0)
+  if (clampedTotal !== 100) {
+    throw new Error(`Expected retained local alias usage to be bounded by winning remote bucket (100), got ${clampedTotal}`)
+  }
+
   // Verify changing cloud connection identity clears cached remote devices/usage,
   // and pullCloudAccount rejects stale responses if credentials change mid-flight.
   if (db.listCloudDevices().length === 0) {

@@ -1828,9 +1828,9 @@ export class UsageDb {
         rawModel || rawByIdDisplay.get(`${idKey}|${model}`) || model
 
       const keptLocal = []
+      const pendingAliasLocal = []
       const localCoveredServerDevIds = new Set()
       const localCoveredCurDevHours = new Set()
-      const localAliasDeduct = new Map()
       for (const r of local) {
         const rHour = floorHourLocal(r.ts)
         if (!isServerSourceCli(r.cli)) {
@@ -1847,38 +1847,21 @@ export class UsageDb {
           const cliAliases = owners.equivalentClisFor ? owners.equivalentClisFor(curKeyId || 'local', r.cli) : [canonCli]
           const rawM = rawModelFor(idKey, r.model, r.rawModel)
           const dispM = displayByIdRaw.get(`${idKey}|${rawM}`) || r.model
-          keptLocal.push({
+          const normalizedRec = {
             ...r,
             cli: canonCli,
             model: dispM,
             ...(rawM !== dispM ? { rawModel: rawM } : {}),
             ...(cliAliases.length > 1 ? { cliAliases } : {}),
             project: r.project === r.cli ? canonCli : r.project,
-          })
+          }
           if (curOwns) {
+            keptLocal.push(normalizedRec)
             if (curKeyId) localCoveredServerDevIds.add(`${idKey}|${curKeyId}`)
             localCoveredCurDevHours.add(`${rHour}|${r.cli}|${r.model}`)
           } else {
             const dk = `${serverSourceBucketMs(rHour)}|${canonCli}|${rawM}`
-            const prev = localAliasDeduct.get(dk) || {
-              input: 0,
-              output: 0,
-              cache_read: 0,
-              cache_create: 0,
-              reasoning: 0,
-              total: 0,
-              cost: 0,
-              turns: 0,
-            }
-            prev.input += r.input || 0
-            prev.output += r.output || 0
-            prev.cache_read += r.cacheRead || 0
-            prev.cache_create += r.cacheCreate || 0
-            prev.reasoning += r.reasoning || 0
-            prev.total += r.total || 0
-            prev.cost += r.cost != null ? r.cost : costFor(r)
-            prev.turns += r.turns || 1
-            localAliasDeduct.set(dk, prev)
+            pendingAliasLocal.push({ rec: normalizedRec, deductKey: dk })
           }
         }
       }
@@ -1888,6 +1871,7 @@ export class UsageDb {
          FROM cloud_usage_hourly ORDER BY hour`
       )
       const mergedCloud = new Map()
+      const bucketsByDeductKey = new Map()
       for (const r of rawCloud) {
         if (!keepCloudRow(r, 'account', owners)) continue
         if (isServerSourceCli(r.cli)) {
@@ -1924,6 +1908,12 @@ export class UsageDb {
             turns: 0,
           }
           mergedCloud.set(k, b)
+          let list = bucketsByDeductKey.get(deductKey)
+          if (!list) {
+            list = []
+            bucketsByDeductKey.set(deductKey, list)
+          }
+          list.push(b)
         } else {
           for (const c of eqClis) b.cliAliases.add(c)
         }
@@ -1937,24 +1927,49 @@ export class UsageDb {
         b.turns += r.turns || 0
       }
 
+      for (const { rec, deductKey } of pendingAliasLocal) {
+        const buckets = bucketsByDeductKey.get(deductKey)
+        if (!buckets || !buckets.length) continue
+        const takeFromBuckets = (bucketField, want) => {
+          let rem = want > 0 ? want : 0
+          let taken = 0
+          for (const b of buckets) {
+            if (rem <= 0) break
+            const avail = b[bucketField] || 0
+            if (avail <= 0) continue
+            const d = Math.min(avail, rem)
+            b[bucketField] -= d
+            rem -= d
+            taken += d
+          }
+          return taken
+        }
+        const recCost = rec.cost != null ? rec.cost : costFor(rec)
+        const input = takeFromBuckets('input', rec.input || 0)
+        const output = takeFromBuckets('output', rec.output || 0)
+        const cacheRead = takeFromBuckets('cache_read', rec.cacheRead || 0)
+        const cacheCreate = takeFromBuckets('cache_create', rec.cacheCreate || 0)
+        const reasoning = takeFromBuckets('reasoning', rec.reasoning || 0)
+        const total = takeFromBuckets('total', rec.total || 0)
+        const cost = takeFromBuckets('cost', recCost || 0)
+        const turns = takeFromBuckets('turns', rec.turns || 1)
+        if (total > 0 || cost > 0) {
+          keptLocal.push({
+            ...rec,
+            input,
+            output,
+            cacheRead,
+            cacheCreate,
+            reasoning,
+            total,
+            cost,
+            turns: turns || 1,
+          })
+        }
+      }
+
       const cloudRecs = []
       for (const b of mergedCloud.values()) {
-        const deduct = localAliasDeduct.get(b.deductKey)
-        if (deduct) {
-          const take = (field) => {
-            const d = Math.min(b[field], deduct[field])
-            b[field] -= d
-            deduct[field] -= d
-          }
-          take('input')
-          take('output')
-          take('cache_read')
-          take('cache_create')
-          take('reasoning')
-          take('total')
-          take('cost')
-          take('turns')
-        }
         if (b.total > 0 || b.cost > 0) {
           cloudRecs.push(toCloudRec({ ...b, cliAliases: [...b.cliAliases] }))
         }
