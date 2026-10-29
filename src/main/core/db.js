@@ -621,6 +621,11 @@ export class UsageDb {
     this.persist()
   }
 
+  cursorAccountHash() {
+    const r = this.rows('SELECT user_id FROM cursor_usage_archive LIMIT 1')[0]
+    return hashCursorAccount(r?.user_id)
+  }
+
   hasMigration(name) {
     return this.rows('SELECT name FROM applied_migrations WHERE name = ?', [name]).length > 0
   }
@@ -995,6 +1000,11 @@ export class UsageDb {
     const urlByLabel = new Map()
     const localCliByIdentity = new Map()
 
+    const localCursorAcc = this.cursorAccountHash()
+    if (localCursorAcc) {
+      metaByDevCli.set('local|cursor', { accountId: localCursorAcc })
+    }
+
     for (const p of localProviders) {
       const cli = 'litellm:' + p.id
       const baseUrl = normalizeLitellmBaseUrl(p.baseUrl)
@@ -1004,6 +1014,9 @@ export class UsageDb {
     }
     for (const d of devices) {
       if (d.isCurrent) {
+        if (localCursorAcc) {
+          metaByDevCli.set(`${d.id}|cursor`, { accountId: localCursorAcc })
+        }
         for (const p of localProviders) {
           const cli = 'litellm:' + p.id
           const baseUrl = normalizeLitellmBaseUrl(p.baseUrl)
@@ -1012,6 +1025,16 @@ export class UsageDb {
         }
       }
       for (const [cli, meta] of Object.entries(d.status?.cliMeta || {})) {
+        if (cli === 'cursor') {
+          const existing = metaByDevCli.get(`${d.id}|cursor`) || {}
+          const accountId = hashCursorAccount(
+            meta?.accountId || meta?.accountHash || meta?.userId || meta?.sub || existing.accountId
+          )
+          if (accountId) {
+            metaByDevCli.set(`${d.id}|cursor`, { accountId })
+          }
+          continue
+        }
         if (!cli.startsWith('litellm:')) continue
         const existing = metaByDevCli.get(`${d.id}|${cli}`) || {}
         const baseUrl = normalizeLitellmBaseUrl(meta?.baseUrl || existing.baseUrl)
@@ -1033,7 +1056,13 @@ export class UsageDb {
 
     const identityFor = (keyId, cli) => {
       if (!isServerSourceCli(cli)) return cli
-      if (cli === 'cursor') return 'cursor'
+      if (cli === 'cursor') {
+        const m =
+          (keyId && metaByDevCli.get(`${keyId}|cursor`)) ||
+          (keyId === 'local' ? metaByDevCli.get('local|cursor') : null)
+        if (m?.accountId) return `cursor:acct:${m.accountId}`
+        return keyId ? `cursor:dev:${keyId}` : 'cursor'
+      }
       const m = (keyId && metaByDevCli.get(`${keyId}|${cli}`)) || metaByDevCli.get(`local|${cli}`) || metaByDevCli.get(`*|${cli}`)
       const baseUrl = m?.baseUrl || (m?.label ? urlByLabel.get(m.label) : '')
       if (baseUrl) return `litellm:url:${baseUrl}`
@@ -1868,6 +1897,13 @@ function deterministicLitellmId(baseUrl) {
 
 function isServerSourceCli(cli) {
   return cli === 'cursor' || (typeof cli === 'string' && cli.startsWith('litellm:'))
+}
+
+function hashCursorAccount(raw) {
+  const s = String(raw || '').trim()
+  if (!s) return ''
+  if (/^[0-9a-f]{16,64}$/i.test(s)) return s.toLowerCase()
+  return crypto.createHash('sha256').update('cursor-account:' + s).digest('hex').slice(0, 24)
 }
 
 function serverSourceBucketMs(hour) {

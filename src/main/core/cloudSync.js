@@ -168,6 +168,10 @@ export function buildStatusSnapshot({ db, store, liveByCli, appVersion }) {
     .filter(Boolean)
 
   const cliMeta = Object.fromEntries(Object.entries(CLI_META).map(([k, v]) => [k, { label: v.label, color: v.color }]))
+  const cursorAccountId = typeof db.cursorAccountHash === 'function' ? db.cursorAccountHash() : ''
+  if (cursorAccountId && cliMeta.cursor) {
+    cliMeta.cursor = { ...cliMeta.cursor, accountId: cursorAccountId }
+  }
   for (const p of db.listLitellmProviders()) {
     if (p.enabled) {
       cliMeta['litellm:' + p.id] = {
