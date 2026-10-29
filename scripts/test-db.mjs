@@ -322,6 +322,97 @@ if (remoteSubAccStats[0]?.currentCycle?.tokens !== 100) {
   throw new Error(`Expected 100 attributed tokens for remote-bound LiteLLM subscription in account view, got ${remoteSubAccStats[0]?.currentCycle?.tokens}`)
 }
 
+// Verify model rename reconciliation when deducting local alias records against fresher remote owner
+db.saveModelSetting({ providerId: 'local-id', model: 'gpt-4o', visible: true, displayName: 'Friendly model' })
+const renamedLocalRecs = [
+  {
+    ts: nowHour,
+    cli: 'litellm:local-id',
+    model: 'Friendly model',
+    rawModel: 'gpt-4o',
+    project: 'team-key',
+    sessionId: 'l1',
+    input: 50,
+    output: 50,
+    cacheRead: 0,
+    cacheCreate: 0,
+    reasoning: 0,
+    total: 100,
+    cost: 1.0,
+    turns: 1,
+  },
+]
+const renamedAccRecs = db.recordsForDevice('account', renamedLocalRecs).filter((r) => String(r.cli).startsWith('litellm:'))
+const renamedAccTotal = renamedAccRecs.reduce((a, r) => a + r.total, 0)
+if (renamedAccTotal !== 100) {
+  throw new Error(`Expected 100 deduplicated LiteLLM tokens after model rename reconciliation, got ${renamedAccTotal}`)
+}
+
+// Verify archived history outside the winning device's covered range is preserved
+const oldHour = nowHour - 40 * 86400000
+db.ingest([])
+db.saveCloudAccountSync({
+  currentKeyId: 'dev-2',
+  devices: [
+    { id: 'dev-1', name: 'Desktop', lastSyncAt: 1000, revoked: false, isCurrent: false },
+    { id: 'dev-2', name: 'Laptop', lastSyncAt: 2000, revoked: false, isCurrent: true },
+  ],
+  snapshots: [
+    { keyId: 'dev-1', status: { cliMeta: { 'litellm:local-id': { label: 'Team Proxy', baseUrl: 'https://proxy.example.com/v1' } } } },
+    { keyId: 'dev-2', status: { cliMeta: { 'litellm:remote-id': { label: 'Team Proxy', baseUrl: 'https://proxy.example.com/v1' } } } },
+  ],
+  hours: [
+    { keyId: 'dev-1', hour: oldHour, cli: 'litellm:local-id', model: 'gpt-4o', input: 100, output: 100, total: 200, cost: 2.0, turns: 2 },
+    { keyId: 'dev-1', hour: nowHour, cli: 'litellm:local-id', model: 'gpt-4o', input: 50, output: 50, total: 100, cost: 1.0, turns: 1 },
+    { keyId: 'dev-2', hour: nowHour, cli: 'litellm:remote-id', model: 'gpt-4o', input: 50, output: 50, total: 100, cost: 1.0, turns: 1 },
+  ],
+})
+const histAccOv = db.cloudOverview('account')
+if (histAccOv.totals.all.total !== 300) {
+  throw new Error(`Expected archived history (200) + recent deduplicated (100) = 300, got ${histAccOv.totals.all.total}`)
+}
+
+// Verify non-whole-hour timezone bucket weighting (e.g., 10:30 UTC bucket with 10:45 UTC cutoff -> 75%)
+const halfHourStart = Date.UTC(2026, 9, 29, 10, 30, 0)
+const quarterPastCutoff = Date.UTC(2026, 9, 29, 10, 45, 0)
+db.saveCloudAccountSync({
+  currentKeyId: 'dev-tz',
+  devices: [{ id: 'dev-tz', name: 'Kolkata-PC', lastSyncAt: 3000, revoked: false, isCurrent: true }],
+  snapshots: [],
+  hours: [
+    { keyId: 'dev-tz', hour: halfHourStart, cli: 'claude', model: 'claude-4', input: 60, output: 40, total: 100, cost: 1.0, turns: 4 },
+  ],
+})
+const tzWeighted = db.cloudTotalsSince(quarterPastCutoff, 'account')
+if (tzWeighted.total.total !== 75) {
+  throw new Error(`Expected 75 weighted tokens for 10:30 UTC bucket at 10:45 UTC cutoff, got ${tzWeighted.total.total}`)
+}
+
+// Verify performSync discards in-flight responses if connection credentials change mid-request
+db.saveCloudSync({ endpoint: 'https://old.example.com', apiKey: 'ts_old', enabled: true, syncMinutes: 10 })
+try {
+  globalThis.fetch = async () => {
+    db.saveCloudSync({ endpoint: 'https://new.example.com', apiKey: 'ts_new', enabled: true, syncMinutes: 10 })
+    return new Response(
+      JSON.stringify({
+        accepted: 1,
+        subscriptionSync: {
+          status: 'pull',
+          cloudHash: 'old-hash',
+          cloudSubs: [{ id: 'leaked-old-sub', name: 'Leaked Plan', monthlyUsd: 99, startDate: todayIso, active: true, bindings: [{ cli: 'claude' }] }],
+        },
+      }),
+      { status: 200, headers: { 'content-type': 'application/json' } }
+    )
+  }
+  const staleConnRes = await performSync({ db, store: { dedupedRecords: () => [] }, liveByCli: {}, appVersion: '0.2.52' })
+  if (!staleConnRes.skipped || db.getSubscription('leaked-old-sub')) {
+    throw new Error('Expected sync response from old credentials to be discarded after connection change')
+  }
+} finally {
+  globalThis.fetch = origFetch
+}
+
 console.log('multi-device account overview, cross-device LiteLLM dedupe, keyAlias attribution & concurrent sync guard verified')
 
 fs.rmSync(dbPath, { force: true })

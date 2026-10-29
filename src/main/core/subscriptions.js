@@ -667,6 +667,7 @@ export function computeResetWindows(subs, records, nowMs = Date.now(), index = n
 
     return {
       id: sub.id,
+      groupId: sub.groupId || sub.id,
       name: sub.name,
       monthlyUsd: Number(sub.monthlyUsd) || 0,
       bindings: sub.bindings || [],

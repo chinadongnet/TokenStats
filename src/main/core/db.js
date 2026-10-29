@@ -1023,10 +1023,11 @@ export class UsageDb {
     }
 
     const rows = this.rows(
-      `SELECT DISTINCT h.cli, h.key_id, COALESCE(d.last_sync_at, 0) AS synced
+      `SELECT h.cli, h.key_id, MIN(h.hour) AS min_hour, MAX(h.hour) AS max_hour, COALESCE(d.last_sync_at, 0) AS synced
        FROM cloud_usage_hourly h
        JOIN cloud_devices d ON d.id = h.key_id
        WHERE d.revoked = 0
+       GROUP BY h.cli, h.key_id
        ORDER BY synced DESC, h.cli ASC`
     )
 
@@ -1066,6 +1067,7 @@ export class UsageDb {
 
     const owners = new Map()
     const canonicalCliByIdentity = new Map()
+    const devSpanByIdentity = new Map()
     for (const r of rows) {
       if (!isServerSourceCli(r.cli)) continue
       const idKey = identityFor(r.key_id, r.cli)
@@ -1077,9 +1079,53 @@ export class UsageDb {
       if (!owners.has(r.cli)) {
         owners.set(r.cli, owners.get(idKey))
       }
+      let devMap = devSpanByIdentity.get(idKey)
+      if (!devMap) {
+        devMap = new Map()
+        devSpanByIdentity.set(idKey, devMap)
+      }
+      const prev = devMap.get(r.key_id)
+      const minH = Number(r.min_hour)
+      const maxH = Number(r.max_hour)
+      if (!prev) {
+        devMap.set(r.key_id, { keyId: r.key_id, minHour: minH, maxHour: maxH, synced: Number(r.synced) || 0 })
+      } else {
+        if (minH < prev.minHour) prev.minHour = minH
+        if (maxH > prev.maxHour) prev.maxHour = maxH
+      }
+    }
+
+    // Build per-identity historical coverage segments: the freshest device owns
+    // [its minHour, +Infinity), and any older device whose archived history
+    // extends strictly earlier than the earliest covered hour so far owns the
+    // uncovered prefix [older.minHour, earliestCoveredSoFar).
+    const segmentsByIdentity = new Map()
+    for (const [idKey, devMap] of devSpanByIdentity.entries()) {
+      const ordered = [...devMap.values()].sort((a, b) => b.synced - a.synced)
+      const segs = []
+      let earliest = Infinity
+      for (const d of ordered) {
+        if (!segs.length) {
+          segs.push({ keyId: d.keyId, fromHour: d.minHour, toHour: Infinity })
+          earliest = d.minHour
+        } else if (d.minHour < earliest) {
+          segs.push({ keyId: d.keyId, fromHour: d.minHour, toHour: earliest })
+          earliest = d.minHour
+        }
+      }
+      segmentsByIdentity.set(idKey, segs)
     }
 
     owners.identityFor = identityFor
+    owners.ownerForHour = (idKey, hour) => {
+      const segs = segmentsByIdentity.get(idKey)
+      if (!segs || !segs.length) return owners.get(idKey) || null
+      const h = Number(hour)
+      for (const s of segs) {
+        if (h >= s.fromHour && h < s.toHour) return s.keyId
+      }
+      return segs[segs.length - 1].keyId
+    }
     owners.canonicalCliFor = (keyId, cli) => {
       if (!String(cli || '').startsWith('litellm:')) return cli
       const idKey = identityFor(keyId, cli)
@@ -1263,6 +1309,7 @@ export class UsageDb {
         cli,
         ...(Array.isArray(r.cliAliases) && r.cliAliases.length > 1 ? { cliAliases: r.cliAliases } : {}),
         model: r.model,
+        ...(r.rawModel && r.rawModel !== r.model ? { rawModel: r.rawModel } : {}),
         input: r.input || 0,
         output: r.output || 0,
         cacheRead: r.cache_read || 0,
@@ -1288,40 +1335,65 @@ export class UsageDb {
     if (eff === 'account') {
       const owners = this.cloudServerSourceOwners()
       const curKeyId = curDev?.id || null
-      const aliasServerIdentities = new Set()
-      for (const r of local) {
-        if (isServerSourceCli(r.cli) && r.project && r.project !== r.cli) {
-          aliasServerIdentities.add(owners.identityFor(curKeyId || 'local', r.cli))
+
+      // Reconcile local LiteLLM display renames with raw model IDs so local
+      // alias deductions match remote aggregates regardless of display settings.
+      const rawByIdDisplay = new Map()
+      const displayByIdRaw = new Map()
+      for (const s of this.rows(
+        'SELECT provider_id, model, display_name FROM litellm_model_settings WHERE display_name IS NOT NULL AND display_name != ""'
+      )) {
+        const cli = 'litellm:' + s.provider_id
+        const idKey = owners.identityFor(curKeyId || 'local', cli)
+        const disp = String(s.display_name).trim()
+        if (disp && s.model) {
+          rawByIdDisplay.set(`${idKey}|${disp}`, s.model)
+          displayByIdRaw.set(`${idKey}|${s.model}`, disp)
         }
       }
+      for (const r of local) {
+        if (isServerSourceCli(r.cli) && r.rawModel && r.model && r.rawModel !== r.model) {
+          const idKey = owners.identityFor(curKeyId || 'local', r.cli)
+          rawByIdDisplay.set(`${idKey}|${r.model}`, r.rawModel)
+          displayByIdRaw.set(`${idKey}|${r.rawModel}`, r.model)
+        }
+      }
+      const rawModelFor = (idKey, model, rawModel = null) =>
+        rawModel || rawByIdDisplay.get(`${idKey}|${model}`) || model
 
       const keptLocal = []
-      const localCoveredServerIdentities = new Set()
+      const localCoveredServerDevIds = new Set()
       const localCoveredCurDevHours = new Set()
       const localAliasDeduct = new Map()
       for (const r of local) {
+        const rHour = floorHourLocal(r.ts)
         if (!isServerSourceCli(r.cli)) {
           keptLocal.push(r)
-          localCoveredCurDevHours.add(`${floorHourLocal(r.ts)}|${r.cli}|${r.model}`)
+          localCoveredCurDevHours.add(`${rHour}|${r.cli}|${r.model}`)
           continue
         }
         const idKey = owners.identityFor(curKeyId || 'local', r.cli)
-        const curOwns = !curKeyId || owners.get(idKey) === curKeyId || !owners.has(idKey)
+        const ownerAtHour = owners.ownerForHour ? owners.ownerForHour(idKey, rHour) : owners.get(idKey)
+        const curOwns = !curKeyId || ownerAtHour === curKeyId || !owners.has(idKey)
         const hasAlias = Boolean(r.project && r.project !== r.cli)
         if (curOwns || hasAlias) {
           const canonCli = owners.canonicalCliFor ? owners.canonicalCliFor(curKeyId || 'local', r.cli) : r.cli
           const cliAliases = owners.equivalentClisFor ? owners.equivalentClisFor(curKeyId || 'local', r.cli) : [canonCli]
+          const rawM = rawModelFor(idKey, r.model, r.rawModel)
+          const dispM = displayByIdRaw.get(`${idKey}|${rawM}`) || r.model
           keptLocal.push({
             ...r,
             cli: canonCli,
+            model: dispM,
+            ...(rawM !== dispM ? { rawModel: rawM } : {}),
             ...(cliAliases.length > 1 ? { cliAliases } : {}),
             project: r.project === r.cli ? canonCli : r.project,
           })
           if (curOwns) {
-            localCoveredServerIdentities.add(idKey)
-            localCoveredCurDevHours.add(`${floorHourLocal(r.ts)}|${r.cli}|${r.model}`)
+            if (curKeyId) localCoveredServerDevIds.add(`${idKey}|${curKeyId}`)
+            localCoveredCurDevHours.add(`${rHour}|${r.cli}|${r.model}`)
           } else {
-            const dk = `${floorHourLocal(r.ts)}|${canonCli}|${r.model}`
+            const dk = `${rHour}|${canonCli}|${rawM}`
             const prev = localAliasDeduct.get(dk) || {
               input: 0,
               output: 0,
@@ -1354,20 +1426,24 @@ export class UsageDb {
         if (!keepCloudRow(r, 'account', owners)) continue
         if (isServerSourceCli(r.cli)) {
           const idKey = owners.identityFor(r.key_id, r.cli)
-          if (localCoveredServerIdentities.has(idKey)) continue
+          if (localCoveredServerDevIds.has(`${idKey}|${r.key_id}`)) continue
         } else if (curKeyId && r.key_id === curKeyId) {
           if (localCoveredCurDevHours.has(`${r.hour}|${r.cli}|${r.model}`)) continue
         }
+        const idKey = isServerSourceCli(r.cli) ? owners.identityFor(r.key_id, r.cli) : r.cli
         const cli = owners.canonicalCliFor ? owners.canonicalCliFor(r.key_id, r.cli) : r.cli
         const eqClis = owners.equivalentClisFor ? owners.equivalentClisFor(r.key_id, r.cli) : [cli]
-        const k = `${r.hour}|${cli}|${r.model}`
+        const rawM = isServerSourceCli(r.cli) ? rawModelFor(idKey, r.model) : r.model
+        const dispM = isServerSourceCli(r.cli) ? (displayByIdRaw.get(`${idKey}|${rawM}`) || r.model) : r.model
+        const k = `${r.hour}|${cli}|${rawM}`
         let b = mergedCloud.get(k)
         if (!b) {
           b = {
             hour: r.hour,
             cli,
             cliAliases: new Set(eqClis),
-            model: r.model,
+            model: dispM,
+            rawModel: rawM !== dispM ? rawM : null,
             input: 0,
             output: 0,
             cache_read: 0,
@@ -1420,27 +1496,26 @@ export class UsageDb {
   cloudTotalsSince(fromMs, deviceId = null, owners = null) {
     const eff = this.resolveDeviceId(deviceId)
     const HOUR_MS = 3600 * 1000
-    const firstHour = Math.floor(fromMs / HOUR_MS) * HOUR_MS
-    const headFrac = fromMs > 0 ? 1 - (fromMs - firstHour) / HOUR_MS : 1
+    const queryFromHour = fromMs > 0 ? fromMs - HOUR_MS : 0
 
     let rows
     if (eff === 'local') {
       rows = this.rows(
         `SELECT 'local' AS key_id, hour, cli, model, input, output, cache_read, cache_create, reasoning, total, cost, turns
-         FROM usage_hourly WHERE hour >= ?`,
-        [firstHour]
+         FROM usage_hourly WHERE hour > ?`,
+        [fromMs > 0 ? queryFromHour : -1]
       )
     } else if (eff === 'account') {
       rows = this.rows(
         `SELECT key_id, hour, cli, model, input, output, cache_read, cache_create, reasoning, total, cost, turns
-         FROM cloud_usage_hourly WHERE hour >= ?`,
-        [firstHour]
+         FROM cloud_usage_hourly WHERE hour > ?`,
+        [fromMs > 0 ? queryFromHour : -1]
       )
     } else {
       rows = this.rows(
         `SELECT key_id, hour, cli, model, input, output, cache_read, cache_create, reasoning, total, cost, turns
-         FROM cloud_usage_hourly WHERE key_id = ? AND hour >= ?`,
-        [eff, firstHour]
+         FROM cloud_usage_hourly WHERE key_id = ? AND hour > ?`,
+        [eff, fromMs > 0 ? queryFromHour : -1]
       )
     }
 
@@ -1461,9 +1536,10 @@ export class UsageDb {
     const total = blankBucket()
 
     for (const r of rows) {
+      if (fromMs > 0 && r.hour + HOUR_MS <= fromMs) continue
       if (eff === 'account' && !keepCloudRow(r, 'account', effOwners)) continue
       const cli = eff === 'account' && effOwners?.canonicalCliFor ? effOwners.canonicalCliFor(r.key_id, r.cli) : r.cli
-      const w = fromMs > 0 && r.hour === firstHour ? headFrac : 1
+      const w = fromMs > 0 && r.hour < fromMs ? (r.hour + HOUR_MS - fromMs) / HOUR_MS : 1
       addWeightedBucket(total, r, w)
       addWeightedBucket((perCli[cli] ||= blankBucket()), r, w)
       const mk = `${cli}|${r.model}`
@@ -1789,6 +1865,7 @@ function keepCloudRow(r, deviceId, owners) {
   if (deviceId && deviceId !== 'account') return r.key_id === deviceId
   if (isServerSourceCli(r.cli)) {
     const idKey = owners?.identityFor ? owners.identityFor(r.key_id, r.cli) : r.cli
+    if (owners?.ownerForHour) return owners.ownerForHour(idKey, r.hour) === r.key_id
     return owners.get(idKey) === r.key_id
   }
   return true

@@ -204,6 +204,16 @@ export async function performSync({
 }) {
   const cfg = db.getCloudSync()
   if (!cfg.enabled || !cfg.apiKey || !cfg.endpoint) return { ok: false, skipped: true }
+  const connEndpoint = normalizeEndpoint(cfg.endpoint)
+  const connApiKey = String(cfg.apiKey).trim()
+  const isSameConnection = () => {
+    const cur = db.getCloudSync()
+    return (
+      cur.enabled &&
+      normalizeEndpoint(cur.endpoint) === connEndpoint &&
+      String(cur.apiKey).trim() === connApiKey
+    )
+  }
 
   const now = Date.now()
   const full = fullOverride || cfg.fullResync
@@ -255,6 +265,13 @@ export async function performSync({
       sent += data.accepted || 0
       if (last && data.subscriptionSync) subscriptionSync = data.subscriptionSync
       if (last && data.accountSync) accountSync = data.accountSync
+      if (!isSameConnection()) {
+        return { ok: false, skipped: true, connectionChanged: true }
+      }
+    }
+
+    if (!isSameConnection()) {
+      return { ok: false, skipped: true, connectionChanged: true }
     }
 
     if (accountSync) {
@@ -317,7 +334,9 @@ export async function performSync({
     return { ok: true, sent, full, subscriptionSync, pulledSubscriptions, pulledAccount: !!accountSync }
   } catch (e) {
     const msg = e.name === 'AbortError' ? 'timeout' : String(e.message || e)
-    db.updateCloudSyncState({ lastError: msg }) // flag untouched — a failed full pass retries full
+    if (isSameConnection()) {
+      db.updateCloudSyncState({ lastError: msg }) // flag untouched — a failed full pass retries full
+    }
     return { ok: false, error: msg }
   }
 }
@@ -325,6 +344,16 @@ export async function performSync({
 export async function pullCloudAccount({ db }) {
   const cfg = db.getCloudSync()
   if (!cfg.enabled || !cfg.apiKey || !cfg.endpoint) return { ok: false, skipped: true }
+  const connEndpoint = normalizeEndpoint(cfg.endpoint)
+  const connApiKey = String(cfg.apiKey).trim()
+  const isSameConnection = () => {
+    const cur = db.getCloudSync()
+    return (
+      cur.enabled &&
+      normalizeEndpoint(cur.endpoint) === connEndpoint &&
+      String(cur.apiKey).trim() === connApiKey
+    )
+  }
   try {
     const data = await request(cfg.endpoint, '/api/account', { apiKey: cfg.apiKey })
     if (data?.accountSync) {

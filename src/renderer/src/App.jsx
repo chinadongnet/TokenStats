@@ -404,14 +404,26 @@ export default function App() {
   const monthlyTotal = subs.reduce((a, s) => a + (s.active ? Number(s.monthlyUsd) || 0 : 0), 0)
   const allTimePaidTotal =
     subStats.reduce((a, s) => a + (Number(s.totalPaid) || 0), 0) || monthlyTotal
-  const subPaidByName = useMemo(() => {
+  const subPaidByGroup = useMemo(() => {
     const m = new Map()
     for (const s of subStats) {
-      const k = String(s.name || '').toLowerCase()
-      m.set(k, (m.get(k) || 0) + (Number(s.totalPaid) || 0))
+      const paid = Number(s.totalPaid) || 0
+      const gKey = s.groupId || s.id
+      if (gKey) m.set(gKey, paid)
+      if (s.id) m.set(s.id, paid)
+      for (const p of s.periods || []) {
+        if (p?.id) m.set(p.id, paid)
+      }
     }
     return m
   }, [subStats])
+  const planPaidAllTime = (plan) => {
+    if (!plan) return 0
+    const gKey = plan.groupId || plan.id
+    if (gKey && subPaidByGroup.has(gKey)) return subPaidByGroup.get(gKey)
+    if (plan.id && subPaidByGroup.has(plan.id)) return subPaidByGroup.get(plan.id)
+    return Number(plan.monthlyUsd) || 0
+  }
 
   if (!snap) return <div className="loading">{t('app.scanning')}</div>
 
@@ -631,10 +643,10 @@ export default function App() {
                     plan's fee for the SAME span. A plan bound to several CLIs
                     shows its full share on each of their cards — the fee is not
                     split, since there's no meaningful way to attribute it. */}
-                {plan && (scope === 'all' ? (subPaidByName.get(String(plan.name || '').toLowerCase()) || plan.monthlyUsd) > 0 : plan.monthlyUsd > 0) && (() => {
+                {plan && (scope === 'all' ? planPaidAllTime(plan) > 0 : plan.monthlyUsd > 0) && (() => {
                   const fee =
                     scope === 'all'
-                      ? subPaidByName.get(String(plan.name || '').toLowerCase()) || plan.monthlyUsd
+                      ? planPaidAllTime(plan)
                       : scopeFee(plan.monthlyUsd, scope)
                   const pct = (d.cost / fee) * 100
                   const span = scopeSpan(scope, snap.ranges)
