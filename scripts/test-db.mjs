@@ -185,6 +185,58 @@ try {
 } finally {
   globalThis.fetch = origFetch
 }
+
+// Verify unidentified LiteLLM sources on different devices remain distinct
+db.ingest([])
+db.saveCloudAccountSync({
+  currentKeyId: 'dev-1',
+  devices: [
+    { id: 'dev-1', name: 'PC-1', lastSyncAt: 2000, revoked: false, isCurrent: true },
+    { id: 'dev-2', name: 'PC-2', lastSyncAt: 1000, revoked: false, isCurrent: false },
+  ],
+  snapshots: [],
+  hours: [
+    { keyId: 'dev-1', hour: nowHour, cli: 'litellm:proxy-a', model: 'gpt-4o', input: 60, output: 40, total: 100, cost: 1.0, turns: 1 },
+    { keyId: 'dev-2', hour: nowHour, cli: 'litellm:proxy-b', model: 'gpt-4o', input: 120, output: 80, total: 200, cost: 2.0, turns: 1 },
+  ],
+})
+const distinctProxiesAcc = db.cloudOverview('account')
+if (distinctProxiesAcc.totals.all.total !== 300) {
+  throw new Error(`Expected unidentified LiteLLM sources to stay distinct (300), got ${distinctProxiesAcc.totals.all.total}`)
+}
+
+// Verify saveCloudAccountSync preserves newer local usage ingested while /api/sync was in flight
+db.ingest([
+  {
+    ts: nowHour,
+    cli: 'claude',
+    model: 'claude-sonnet-4-5',
+    project: 'local-proj',
+    sessionId: 's1',
+    input: 120,
+    output: 80,
+    cacheRead: 0,
+    cacheCreate: 0,
+    reasoning: 0,
+    total: 200,
+    cost: 2.0,
+    turns: 2,
+  },
+])
+db.saveCloudAccountSync({
+  currentKeyId: 'dev-1',
+  devices: [{ id: 'dev-1', name: 'PC-1', lastSyncAt: 2000, revoked: false, isCurrent: true }],
+  snapshots: [],
+  hours: [
+    // Older submitted snapshot before the 200-token ingest landed
+    { keyId: 'dev-1', hour: nowHour, cli: 'claude', model: 'claude-sonnet-4-5', input: 60, output: 40, total: 100, cost: 1.0, turns: 1 },
+  ],
+})
+const postSyncAcc = db.cloudOverview('account')
+if (postSyncAcc.totals.all.total !== 200) {
+  throw new Error(`Expected mid-flight local ingest (200) to be preserved over stale sync response (100), got ${postSyncAcc.totals.all.total}`)
+}
+
 console.log('multi-device account overview, cross-device LiteLLM dedupe, keyAlias attribution & concurrent sync guard verified')
 
 fs.rmSync(dbPath, { force: true })

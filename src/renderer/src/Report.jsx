@@ -63,6 +63,20 @@ export default function Report() {
   const [requests, setRequests] = useState({ rows: [], count: 0 })
   const [exporting, setExporting] = useState(false)
   const [copied, setCopied] = useState(false)
+  const [deviceView, setDeviceView] = useState(null)
+
+  const isLocalDeviceView =
+    !deviceView?.hasCloudData ||
+    deviceView.selectedDevice === 'local' ||
+    Boolean(deviceView.currentKeyId && deviceView.selectedDevice === deviceView.currentKeyId)
+
+  useEffect(() => {
+    if (!isLocalDeviceView) {
+      if (view === 'requests') setView('charts')
+      if (breakdown === 'project') setBreakdown('model')
+      if (dayBreakdown === 'project') setDayBreakdown('model')
+    }
+  }, [isLocalDeviceView, view, breakdown, dayBreakdown])
 
   const today = floorDay(Date.now())
   const { fromMs, toMs } = useMemo(() => {
@@ -93,9 +107,19 @@ export default function Report() {
     setPlanBd(bd)
   }
 
+  useEffect(() => {
+    window.api.devicesGet?.().then((v) => v && setDeviceView(v))
+  }, [])
   useEffect(() => { load() }, [day, fromMs, toMs])
-  useEffect(() => window.api.onReportUpdated(() => load()), [day, fromMs, toMs])
-  useEffect(() => (window.api.onDeviceView ? window.api.onDeviceView(() => { load(); loadProviders() }) : () => {}), [day, fromMs, toMs])
+  useEffect(() => window.api.onReportUpdated(() => {
+    window.api.devicesGet?.().then((v) => v && setDeviceView(v))
+    load()
+  }), [day, fromMs, toMs])
+  useEffect(() => (window.api.onDeviceView ? window.api.onDeviceView((v) => {
+    if (v) setDeviceView(v)
+    load()
+    loadProviders()
+  }) : () => {}), [day, fromMs, toMs])
 
   async function loadProviders() {
     const [localList, snap] = await Promise.all([
@@ -240,7 +264,7 @@ export default function Report() {
           <div className="seg">
             <button className={view === 'charts' ? 'on' : ''} onClick={() => setView('charts')}>{t('rep.charts')}</button>
             <button className={view === 'hour' ? 'on' : ''} onClick={() => setView('hour')}>{t('rep.byHour')}</button>
-            <button className={view === 'requests' ? 'on' : ''} onClick={() => setView('requests')}>{t('rep.logs')}</button>
+            {isLocalDeviceView && <button className={view === 'requests' ? 'on' : ''} onClick={() => setView('requests')}>{t('rep.logs')}</button>}
             <button className={view === 'subs' ? 'on' : ''} onClick={() => setView('subs')}>{t('rep.tokenPlans')}</button>
           </div>
           {view === 'charts' && (
@@ -306,6 +330,7 @@ export default function Report() {
         projects={shownDayProjects}
         CLI={CLI}
         label={dayLabel(day)}
+        allowProjects={isLocalDeviceView}
       />
       </>
       )}
@@ -346,6 +371,7 @@ export default function Report() {
         CLI={CLI}
         label={fmtRange(fromMs, toMs)}
         plans={planBd}
+        allowProjects={isLocalDeviceView}
       />
       </>
       )}
@@ -370,7 +396,7 @@ function Tile({ label, value, sub, accent }) {
 // By-plan / by-model / by-project token+cost breakdown, shared by the Charts
 // and By-hour tabs. `plans` (subs:breakdown data) is only passed on the Charts
 // tab — plan fees are monthly, so a per-day plan grouping isn't meaningful.
-function Breakdown({ mode, setMode, models, projects, CLI, label, plans }) {
+function Breakdown({ mode, setMode, models, projects, CLI, label, plans, allowProjects = true }) {
   const maxModel = Math.max(1, ...models.map((m) => m.total))
   const maxProject = Math.max(1, ...projects.map((p) => p.total))
   return (
@@ -379,7 +405,7 @@ function Breakdown({ mode, setMode, models, projects, CLI, label, plans }) {
         <div className="seg">
           {plans && <button className={mode === 'plan' ? 'on' : ''} onClick={() => setMode('plan')}>{t('rep.byPlan')}</button>}
           <button className={mode === 'model' ? 'on' : ''} onClick={() => setMode('model')}>{t('rep.byModel')}</button>
-          <button className={mode === 'project' ? 'on' : ''} onClick={() => setMode('project')}>{t('rep.byProject')}</button>
+          {allowProjects && <button className={mode === 'project' ? 'on' : ''} onClick={() => setMode('project')}>{t('rep.byProject')}</button>}
         </div>
         <span className="card-sub">{label}</span>
       </div>

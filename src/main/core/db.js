@@ -872,6 +872,49 @@ export class UsageDb {
           ])
         }
         hStmt.free()
+
+        // If local usage was ingested while /api/sync was in flight, the
+        // returned accountSync snapshot still carries the older submitted
+        // totals for this device. Overlay any newer/higher rows from the
+        // local usage_hourly table for the current device so account and
+        // current-device views never regress behind local ingests.
+        const curDev = accountSync.devices.find(
+          (d) => d && d.id && (d.isCurrent || (accountSync.currentKeyId && d.id === accountSync.currentKeyId))
+        )
+        if (curDev?.id) {
+          const localRows = this.rows(
+            'SELECT hour, cli, model, input, output, cache_read, cache_create, reasoning, total, cost, turns FROM usage_hourly'
+          )
+          if (localRows.length) {
+            const lStmt = this.db.prepare(
+              `INSERT INTO cloud_usage_hourly
+                 (key_id, hour, cli, model, input, output, cache_read, cache_create, reasoning, total, cost, turns)
+               VALUES (?,?,?,?,?,?,?,?,?,?,?,?)
+               ON CONFLICT(key_id, hour, cli, model) DO UPDATE SET
+                 input=excluded.input, output=excluded.output, cache_read=excluded.cache_read,
+                 cache_create=excluded.cache_create, reasoning=excluded.reasoning,
+                 total=excluded.total, cost=excluded.cost, turns=excluded.turns
+               WHERE excluded.total >= cloud_usage_hourly.total`
+            )
+            for (const r of localRows) {
+              lStmt.run([
+                curDev.id,
+                r.hour,
+                r.cli,
+                r.model,
+                r.input,
+                r.output,
+                r.cache_read,
+                r.cache_create,
+                r.reasoning,
+                r.total,
+                r.cost,
+                r.turns,
+              ])
+            }
+            lStmt.free()
+          }
+        }
       }
       this.db.run('COMMIT')
     } catch (err) {
@@ -942,8 +985,10 @@ export class UsageDb {
   // device that has rows for that source is counted — identical to tokenstat-web.
   // Because two devices configuring the same LiteLLM proxy may have generated
   // distinct random UUIDs (`litellm:<uuid-A>` vs `litellm:<uuid-B>`), resolve
-  // a shared cross-device source identity (by normalized baseUrl, provider label,
-  // or per-device slot) before selecting the winning owner device.
+  // a shared cross-device source identity (by normalized baseUrl or provider
+  // label when metadata establishes they are the same source) before selecting
+  // the winning owner device. Unidentified LiteLLM sources retain their own
+  // CLI identity so unrelated proxies are never collapsed.
   cloudServerSourceOwners() {
     const localProviders = this.listLitellmProviders()
     const devices = this.listCloudDevices()
@@ -986,27 +1031,6 @@ export class UsageDb {
        ORDER BY synced DESC, h.cli ASC`
     )
 
-    // Assign stable per-device slot indices for any unlabelled litellm:* CLIs so
-    // two devices each polling a single LiteLLM proxy without cliMeta snapshots
-    // still share the same cross-device identity ('litellm:slot:0').
-    const unlabelledByDev = new Map()
-    for (const r of rows) {
-      if (!String(r.cli || '').startsWith('litellm:')) continue
-      const m = metaByDevCli.get(`${r.key_id}|${r.cli}`) || metaByDevCli.get(`local|${r.cli}`)
-      if (m?.baseUrl || m?.label) continue
-      let list = unlabelledByDev.get(r.key_id)
-      if (!list) {
-        list = []
-        unlabelledByDev.set(r.key_id, list)
-      }
-      if (!list.includes(r.cli)) list.push(r.cli)
-    }
-    const unlabelledSlot = new Map()
-    for (const [keyId, list] of unlabelledByDev.entries()) {
-      list.sort()
-      list.forEach((cli, idx) => unlabelledSlot.set(`${keyId}|${cli}`, `litellm:slot:${idx}`))
-    }
-
     const identityFor = (keyId, cli) => {
       if (!isServerSourceCli(cli)) return cli
       if (cli === 'cursor') return 'cursor'
@@ -1014,8 +1038,7 @@ export class UsageDb {
       const baseUrl = m?.baseUrl || (m?.label ? urlByLabel.get(m.label) : '')
       if (baseUrl) return `litellm:url:${baseUrl}`
       if (m?.label) return `litellm:label:${m.label}`
-      if (keyId && unlabelledSlot.has(`${keyId}|${cli}`)) return unlabelledSlot.get(`${keyId}|${cli}`)
-      return 'litellm:slot:0'
+      return cli
     }
 
     for (const p of localProviders) {

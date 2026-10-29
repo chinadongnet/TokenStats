@@ -46,7 +46,7 @@ contextBridge.exposeInMainWorld('api', {
   reportDaily: (fromMs, toMs, deviceId) => ipcRenderer.invoke('report:daily', fromMs, toMs, deviceId),
   reportModels: (fromMs, toMs, deviceId) => ipcRenderer.invoke('report:models', fromMs, toMs, deviceId),
   reportRequests: (opts) => ipcRenderer.invoke('report:requests', opts),
-  reportProjects: (fromMs, toMs) => ipcRenderer.invoke('report:projects', fromMs, toMs),
+  reportProjects: (fromMs, toMs, deviceId) => ipcRenderer.invoke('report:projects', fromMs, toMs, deviceId),
   reportSpan: (deviceId) => ipcRenderer.invoke('report:span', deviceId),
   // opts: { which: 'report' | 'popup', mode: 'save' | 'copy' }
   exportPng: (opts) => ipcRenderer.invoke('export-png', opts),

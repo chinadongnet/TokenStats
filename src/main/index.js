@@ -247,11 +247,30 @@ async function init() {
   ipcMain.handle('report:models', (_e, fromMs, toMs, deviceId) => db?.models(fromMs, toMs, deviceId) ?? [])
   ipcMain.handle('report:span', (_e, deviceId) => db?.span(deviceId) ?? { min: null, max: null })
   // Per-request log is served live from the store (not the hourly DB) so it
-  // reflects the exact deduplicated records that drive the totals.
-  ipcMain.handle('report:requests', (_e, opts) => store?.requestLog(opts) ?? { rows: [], count: 0 })
+  // reflects the exact deduplicated records that drive the totals. Only
+  // available when viewing this machine ('local' or the current device).
+  ipcMain.handle('report:requests', (_e, opts) => {
+    if (db) {
+      const eff = db.resolveDeviceId(opts?.deviceId)
+      const curKeyId = db.getDeviceViewState().currentKeyId
+      if (eff !== 'local' && !(curKeyId && eff === curKeyId)) {
+        return { rows: [], count: 0, localOnly: true }
+      }
+    }
+    return store?.requestLog(opts) ?? { rows: [], count: 0 }
+  })
   // Per-project totals are also served live from the store (the hourly DB has
-  // no project dimension).
-  ipcMain.handle('report:projects', (_e, fromMs, toMs) => store?.projectStats({ fromMs, toMs }) ?? [])
+  // no project dimension), so remote/account views return empty.
+  ipcMain.handle('report:projects', (_e, fromMs, toMs, deviceId) => {
+    if (db) {
+      const eff = db.resolveDeviceId(deviceId)
+      const curKeyId = db.getDeviceViewState().currentKeyId
+      if (eff !== 'local' && !(curKeyId && eff === curKeyId)) {
+        return []
+      }
+    }
+    return store?.projectStats({ fromMs, toMs }) ?? []
+  })
   ipcMain.handle('export-png', (_e, opts) => exportPng(opts))
 
   // LiteLLM multi-provider Settings CRUD (see core/db.js's litellm_providers /
