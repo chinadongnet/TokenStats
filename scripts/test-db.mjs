@@ -4,7 +4,7 @@ import os from 'node:os'
 import path from 'node:path'
 import fs from 'node:fs'
 import { Store } from '../src/main/core/store.js'
-import { UsageDb, floorDayLocal } from '../src/main/core/db.js'
+import { UsageDb, floorDayLocal, floorHourLocal } from '../src/main/core/db.js'
 
 const dbPath = path.join(os.tmpdir(), 'aimon-test-usage.sqlite')
 fs.rmSync(dbPath, { force: true })
@@ -738,6 +738,64 @@ try {
     }
   } finally {
     globalThis.fetch = origFetch
+  }
+
+  // Verify local-time caches in db.js, store.js, and subscriptions.js invalidate when timezone changes.
+  const prevTz = process.env.TZ
+  try {
+    const recTs = Date.UTC(2026, 9, 29, 23, 45, 0) // 2026-10-29 23:45:00 UTC -> 2026-10-30 05:15:00 Asia/Kolkata
+    const nowNoonUtc = Date.UTC(2026, 9, 30, 12, 0, 0)
+    const tzRec = [{
+      ts: recTs,
+      cli: 'claude',
+      model: 'claude-sonnet-4-6',
+      input: 100,
+      output: 100,
+      cacheRead: 0,
+      cacheCreate: 0,
+      reasoning: 0,
+      total: 200,
+      cost: 1.0,
+      turns: 1,
+      sessionId: 'tz-sess',
+      project: 'tz-proj',
+    }]
+    const tzSub = [{
+      id: 'sub-tz',
+      groupId: 'sub-tz',
+      name: 'Claude TZ',
+      monthlyUsd: 20,
+      startDate: '2026-10-30',
+      active: true,
+      bindings: [{ cli: 'claude' }],
+    }]
+    const tzStore = new Store()
+    tzStore.files.set('tz-file', { parser: { cli: 'claude', roots: [] }, size: 1, mtimeMs: 1, state: {}, records: tzRec })
+
+    process.env.TZ = 'UTC'
+    const dayUtc = floorDayLocal(recTs)
+    const hourUtc = floorHourLocal(recTs)
+    const snapUtc = tzStore.snapshot(nowNoonUtc)
+    const subUtc = computeAllSubscriptionStats(tzSub, tzRec, nowNoonUtc)
+
+    process.env.TZ = 'Asia/Kolkata'
+    const dayIst = floorDayLocal(recTs)
+    const hourIst = floorHourLocal(recTs)
+    const snapIst = tzStore.snapshot(nowNoonUtc)
+    const subIst = computeAllSubscriptionStats(tzSub, tzRec, nowNoonUtc)
+
+    if (dayUtc === dayIst || hourUtc === hourIst) {
+      throw new Error(`Expected floorDayLocal/floorHourLocal to update on TZ change, got day ${dayUtc} vs ${dayIst}, hour ${hourUtc} vs ${hourIst}`)
+    }
+    if (snapUtc.totals.today.total !== 0 || snapIst.totals.today.total !== 200) {
+      throw new Error(`Expected store.snapshot today total to flip from 0 (UTC) to 200 (Asia/Kolkata), got ${snapUtc.totals.today.total} vs ${snapIst.totals.today.total}`)
+    }
+    if ((subUtc[0]?.totalTokens || 0) !== 0 || (subIst[0]?.totalTokens || 0) !== 200) {
+      throw new Error(`Expected subscription stats to flip from 0 (UTC) to 200 (Asia/Kolkata), got ${subUtc[0]?.totalTokens} vs ${subIst[0]?.totalTokens}`)
+    }
+  } finally {
+    if (prevTz === undefined) delete process.env.TZ
+    else process.env.TZ = prevTz
   }
 }
 

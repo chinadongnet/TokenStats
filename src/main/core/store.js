@@ -372,8 +372,14 @@ export class Store extends EventEmitter {
   // are byte-identical so the choice is immaterial); records without a key
   // (Codex, Antigravity) always pass through.
   dedupedRecords() {
+    const tzKey = currentTzKey()
     const prev = this._dedupedMemo
-    if (prev && prev.filesSize === this.files.size && prev.historySize === this.history.size) {
+    if (
+      prev &&
+      prev.tzKey === tzKey &&
+      prev.filesSize === this.files.size &&
+      prev.historySize === this.history.size
+    ) {
       let same = true
       let i = 0
       for (const [file, entry] of this.files.entries()) {
@@ -412,6 +418,7 @@ export class Store extends EventEmitter {
     }
     const result = dedupe(this.allRecords())
     this._dedupedMemo = {
+      tzKey,
       filesSize: this.files.size,
       historySize: this.history.size,
       filesStamp,
@@ -486,6 +493,7 @@ export class Store extends EventEmitter {
 
   // Build the snapshot consumed by the UI.
   snapshot(nowMs = Date.now()) {
+    const tzKey = currentTzKey()
     const records = this.dedupedRecords()
     const now = new Date(nowMs)
     const todayKey = dayKey(now.getTime())
@@ -497,6 +505,7 @@ export class Store extends EventEmitter {
       .join('\n')
     if (
       this._snapshotMemo &&
+      this._snapshotMemo.tzKey === tzKey &&
       this._snapshotMemo.records === records &&
       this._snapshotMemo.todayKey === todayKey &&
       this._snapshotMemo.pollerStamp === pollerStamp
@@ -655,6 +664,7 @@ export class Store extends EventEmitter {
       providers: this.pollers.map((p) => ({ id: p.cli, label: p.meta.label, color: p.meta.color })),
     }
     this._snapshotMemo = {
+      tzKey,
       records,
       todayKey,
       pollerStamp,
@@ -810,7 +820,37 @@ function sumCli(perCli) {
 // Memoized by 15-minute bucket (900,000 ms), the finest timezone offset
 // granularity on Earth, so 60k+ records share ~3k cached Date conversions.
 const _dayKeyCache = new Map()
+const _hourStartCache = new Map()
+const _tzProbeA = new Date(1704067200000)
+const _tzProbeB = new Date(1719792000000)
+let _tzEnv = undefined
+let _tzOffA = 0
+let _tzOffB = 0
+let _tzKey = ''
+
+function currentTzKey() {
+  const env = process.env.TZ || ''
+  _tzProbeA.setTime(1704067200000)
+  _tzProbeB.setTime(1719792000000)
+  const offA = _tzProbeA.getTimezoneOffset()
+  const offB = _tzProbeB.getTimezoneOffset()
+  if (env !== _tzEnv || offA !== _tzOffA || offB !== _tzOffB) {
+    _tzEnv = env
+    _tzOffA = offA
+    _tzOffB = offB
+    let iana = ''
+    try {
+      iana = Intl.DateTimeFormat().resolvedOptions().timeZone || ''
+    } catch {}
+    _tzKey = `${env}|${offA}|${offB}|${iana}`
+    _dayKeyCache.clear()
+    _hourStartCache.clear()
+  }
+  return _tzKey
+}
+
 function dayKey(ms) {
+  currentTzKey()
   const q = Math.floor(ms / 900000)
   let k = _dayKeyCache.get(q)
   if (k !== undefined) return k
@@ -824,8 +864,8 @@ function dayKey(ms) {
   return k
 }
 
-const _hourStartCache = new Map()
 function hourStartLocal(ms) {
+  currentTzKey()
   const q = Math.floor(ms / 900000)
   let h = _hourStartCache.get(q)
   if (h !== undefined) return h

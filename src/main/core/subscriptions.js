@@ -37,7 +37,37 @@ export const ROLLING_PERIOD_MS = { '5h': 5 * 3600 * 1000 }
 const WEEK_MS = 7 * 86400 * 1000
 
 const _monthInfoCache = new Map()
+const _dayStartSubCache = new Map()
+const _tzProbeA = new Date(1704067200000)
+const _tzProbeB = new Date(1719792000000)
+let _tzEnv = undefined
+let _tzOffA = 0
+let _tzOffB = 0
+let _tzKey = ''
+
+function currentTzKey() {
+  const env = process.env.TZ || ''
+  _tzProbeA.setTime(1704067200000)
+  _tzProbeB.setTime(1719792000000)
+  const offA = _tzProbeA.getTimezoneOffset()
+  const offB = _tzProbeB.getTimezoneOffset()
+  if (env !== _tzEnv || offA !== _tzOffA || offB !== _tzOffB) {
+    _tzEnv = env
+    _tzOffA = offA
+    _tzOffB = offB
+    let iana = ''
+    try {
+      iana = Intl.DateTimeFormat().resolvedOptions().timeZone || ''
+    } catch {}
+    _tzKey = `${env}|${offA}|${offB}|${iana}`
+    _monthInfoCache.clear()
+    _dayStartSubCache.clear()
+  }
+  return _tzKey
+}
+
 function monthInfoLocal(ms) {
+  currentTzKey()
   const q = Math.floor(ms / 900000)
   let info = _monthInfoCache.get(q)
   if (info !== undefined) return info
@@ -50,8 +80,8 @@ function monthInfoLocal(ms) {
   return info
 }
 
-const _dayStartSubCache = new Map()
 function dayStartLocalMs(ms) {
+  currentTzKey()
   const q = Math.floor(ms / 900000)
   let ds = _dayStartSubCache.get(q)
   if (ds !== undefined) return ds
@@ -310,6 +340,7 @@ function hasPlanRecordBetween(idx, aMs, bMs) {
 // live window belonging to no plan needs. Callers that build it once and hand
 // it to both avoid a second full planAssigner sweep per popup refresh.
 export function planRecordIndex(subs, records, nowMs = Date.now()) {
+  const tzKey = currentTzKey()
   const recs = records || []
   const len = recs.length
   const first = len ? recs[0] : null
@@ -318,6 +349,7 @@ export function planRecordIndex(subs, records, nowMs = Date.now()) {
   const subsJson = JSON.stringify(subs || [])
   if (
     _planIndexMemo &&
+    _planIndexMemo.tzKey === tzKey &&
     _planIndexMemo.recs === recs &&
     _planIndexMemo.len === len &&
     _planIndexMemo.first === first &&
@@ -351,7 +383,7 @@ export function planRecordIndex(subs, records, nowMs = Date.now()) {
   unplanned.sort((a, b) => a.ts - b.ts)
   const value = { entries, byPlan, byCli, unplanned, tsMin, tsMax }
   const sample = len <= 256 ? recs.slice() : null
-  _planIndexMemo = { recs, len, first, last, sample, dayStart, subsJson, value }
+  _planIndexMemo = { tzKey, recs, len, first, last, sample, dayStart, subsJson, value }
   return value
 }
 

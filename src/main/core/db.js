@@ -260,12 +260,14 @@ export class UsageDb {
 
   // Rebuild the hourly table from the full record set, then persist to disk.
   ingest(records) {
+    const tzKey = currentTzKey()
     if (
       Array.isArray(records) &&
       this._lastIngestedInputRef === records &&
       this._lastIngestedRecords &&
       this._lastIngestedRecords.length === records.length &&
-      this._lastIngestMutationSeq === this._mutationSeq
+      this._lastIngestMutationSeq === this._mutationSeq &&
+      this._lastIngestTzKey === tzKey
     ) {
       return this._lastIngestBucketCount || 0
     }
@@ -438,6 +440,7 @@ export class UsageDb {
     this._lastIngestCurDevId = curDev?.id || null
     this._lastIngestBucketCount = buckets.size
     this._lastIngestMutationSeq = this._mutationSeq
+    this._lastIngestTzKey = tzKey
     return buckets.size
   }
 
@@ -837,11 +840,12 @@ export class UsageDb {
     const archiveMeta = this.rows('SELECT user_id, updated_at, LENGTH(records_json) AS json_len FROM cursor_usage_archive ORDER BY updated_at DESC')
     if (!archiveMeta.length) return null
     if (!this._cursorArchiveIndexCache) this._cursorArchiveIndexCache = new Map()
+    const tzKey = currentTzKey()
     let bestUserId = null
     let bestScore = 0
     for (const a of archiveMeta) {
       let idx = this._cursorArchiveIndexCache.get(a.user_id)
-      if (!idx || idx.updatedAt !== a.updated_at || idx.jsonLen !== a.json_len) {
+      if (!idx || idx.updatedAt !== a.updated_at || idx.jsonLen !== a.json_len || idx.tzKey !== tzKey) {
         const row = this.rows('SELECT records_json FROM cursor_usage_archive WHERE user_id = ?', [a.user_id])[0]
         let parsed = []
         try {
@@ -863,6 +867,7 @@ export class UsageDb {
         idx = {
           updatedAt: a.updated_at,
           jsonLen: a.json_len,
+          tzKey,
           length: parsed.length,
           aDedupKeys,
           aExactKeys,
@@ -912,11 +917,13 @@ export class UsageDb {
     if (this._activeCursorUserId) {
       return hashCursorAccount(this._activeCursorUserId)
     }
+    const tzKey = currentTzKey()
     if (
       !Array.isArray(records) &&
       this._cursorHashMemo &&
       this._cursorHashMemo.seq === this._mutationSeq &&
-      this._cursorHashMemo.lastIngested === this._lastIngestedRecords
+      this._cursorHashMemo.lastIngested === this._lastIngestedRecords &&
+      this._cursorHashMemo.tzKey === tzKey
     ) {
       return this._cursorHashMemo.hash
     }
@@ -941,6 +948,7 @@ export class UsageDb {
     this._cursorHashMemo = {
       seq: this._mutationSeq,
       lastIngested: this._lastIngestedRecords,
+      tzKey,
       hash,
     }
     return hash
@@ -1706,6 +1714,7 @@ export class UsageDb {
   // Preserves original local records (and their LiteLLM keyAlias in `project`)
   // for the current device and in merged account statistics.
   recordsForDevice(deviceId = null, localRecords = null) {
+    const tzKey = currentTzKey()
     const eff = this.resolveDeviceId(deviceId)
     const local = this._resolveLocalRecords(localRecords)
     if (eff === 'local') return local
@@ -1713,6 +1722,7 @@ export class UsageDb {
     if (
       memo &&
       memo.seq === this._mutationSeq &&
+      memo.tzKey === tzKey &&
       memo.eff === eff &&
       memo.localRef === local &&
       memo.localLen === (local ? local.length : 0) &&
@@ -1723,6 +1733,7 @@ export class UsageDb {
     const cacheAndReturn = (result) => {
       this._recordsForDeviceMemo = {
         seq: this._mutationSeq,
+        tzKey,
         eff,
         localRef: local,
         localLen: local ? local.length : 0,
@@ -2226,7 +2237,37 @@ export class UsageDb {
 }
 
 const _floorHourCache = new Map()
+const _floorDayCache = new Map()
+const _tzProbeA = new Date(1704067200000)
+const _tzProbeB = new Date(1719792000000)
+let _tzEnv = undefined
+let _tzOffA = 0
+let _tzOffB = 0
+let _tzKey = ''
+
+function currentTzKey() {
+  const env = process.env.TZ || ''
+  _tzProbeA.setTime(1704067200000)
+  _tzProbeB.setTime(1719792000000)
+  const offA = _tzProbeA.getTimezoneOffset()
+  const offB = _tzProbeB.getTimezoneOffset()
+  if (env !== _tzEnv || offA !== _tzOffA || offB !== _tzOffB) {
+    _tzEnv = env
+    _tzOffA = offA
+    _tzOffB = offB
+    let iana = ''
+    try {
+      iana = Intl.DateTimeFormat().resolvedOptions().timeZone || ''
+    } catch {}
+    _tzKey = `${env}|${offA}|${offB}|${iana}`
+    _floorHourCache.clear()
+    _floorDayCache.clear()
+  }
+  return _tzKey
+}
+
 export function floorHourLocal(ts) {
+  currentTzKey()
   const q = Math.floor(ts / 900000)
   let h = _floorHourCache.get(q)
   if (h !== undefined) return h
@@ -2238,8 +2279,8 @@ export function floorHourLocal(ts) {
   return h
 }
 
-const _floorDayCache = new Map()
 export function floorDayLocal(ts) {
+  currentTzKey()
   const q = Math.floor(ts / 900000)
   let day = _floorDayCache.get(q)
   if (day !== undefined) return day
