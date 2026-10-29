@@ -704,6 +704,17 @@ try {
   if (cursorReset.windows?.[0]?.remainingPercent !== 65) {
     throw new Error(`Expected newer device's Cursor quota (65%) to win over older device (90%), got ${JSON.stringify(cursorReset)}`)
   }
+
+  // Verify an explicitly empty local record set (e.g. when all LiteLLM models are hidden)
+  // is treated as authoritative rather than resurrected from litellm_usage.
+  const provHide = db.upsertLitellmProvider({ name: 'HideTest', baseUrl: 'https://hide.example.com', apiKey: 'sk-h', color: '#10b981', enabled: true })
+  db.saveLitellmUsage(provHide.id, [{ dedupKey: 'hide-1', day: '2026-10-28', ts: oneDayHour, model: 'hidden-m', keyAlias: 'k1', input: 100, output: 0, cacheRead: 0, cacheCreate: 0, total: 100, cost: 0.1, turns: 1 }], '2026-10-01')
+  db.saveModelSetting({ providerId: provHide.id, model: 'hidden-m', visible: false, displayName: null })
+  db.ingest([])
+  const curDevRecs = db.recordsForDevice('dev_a', [])
+  if (curDevRecs.some((r) => r.cli === 'litellm:' + provHide.id)) {
+    throw new Error(`Expected hidden LiteLLM model not to be resurrected when localRecords is [], got ${JSON.stringify(curDevRecs)}`)
+  }
 }
 
 console.log('multi-device account overview, cross-device LiteLLM dedupe, keyAlias attribution & concurrent sync guard verified')

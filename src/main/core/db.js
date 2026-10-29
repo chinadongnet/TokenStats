@@ -1602,8 +1602,8 @@ export class UsageDb {
   }
 
   _resolveLocalRecords(localRecords = null) {
-    if (Array.isArray(localRecords) && localRecords.length) return localRecords
-    if (Array.isArray(this._lastIngestedRecords) && this._lastIngestedRecords.length) {
+    if (Array.isArray(localRecords)) return localRecords
+    if (Array.isArray(this._lastIngestedRecords)) {
       return this._lastIngestedRecords
     }
     const aliasRows = this.rows(
@@ -1633,22 +1633,35 @@ export class UsageDb {
         project: r.root.slice('alias:'.length),
       })
     }
+    const hiddenLitellm = new Set()
+    const renamedLitellm = new Map()
+    for (const s of this.rows('SELECT provider_id, model, visible, display_name FROM litellm_model_settings')) {
+      const key = `${s.provider_id}|${s.model}`
+      if (s.visible === 0) hiddenLitellm.add(key)
+      else if (s.display_name && String(s.display_name).trim()) {
+        renamedLitellm.set(key, String(s.display_name).trim())
+      }
+    }
     const litellmRows = this.rows(
       `SELECT provider_id, ts, model, key_alias, input, output, cache_read, cache_create, total, cost, turns
        FROM litellm_usage
        ORDER BY ts`
     )
     for (const r of litellmRows) {
+      const settingKey = `${r.provider_id}|${r.model}`
+      if (hiddenLitellm.has(settingKey)) continue
       const cli = 'litellm:' + r.provider_id
+      const effModel = renamedLitellm.get(settingKey) || r.model
       const hour = floorHourLocal(r.ts)
-      const hKey = `${hour}|${cli}|${r.model}`
+      const hKey = `${hour}|${cli}|${effModel}`
       if (aliasCovered.has(hKey)) continue
       aliasCovered.add(hKey)
       out.push({
         ts: r.ts,
         hour,
         cli,
-        model: r.model,
+        model: effModel,
+        ...(effModel !== r.model ? { rawModel: r.model } : {}),
         input: r.input || 0,
         output: r.output || 0,
         cacheRead: r.cache_read || 0,
