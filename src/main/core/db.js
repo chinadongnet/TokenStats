@@ -237,6 +237,7 @@ export class UsageDb {
 
   // Rebuild the hourly table from the full record set, then persist to disk.
   ingest(records) {
+    this._lastIngestedRecords = Array.isArray(records) ? records.map((r) => ({ ...r })) : []
     const buckets = new Map() // key: hour|cli|model
     const rootBuckets = new Map() // key: hour|cli|root|model
     for (const r of records) {
@@ -258,11 +259,16 @@ export class UsageDb {
       b.cost += cost
       b.turns += turns
 
-      if (r.root) {
-        const rKey = hour + '|' + r.cli + '|' + r.root + '|' + r.model
+      const effRoot =
+        r.root ||
+        (typeof r.cli === 'string' && r.cli.startsWith('litellm:') && r.project && r.project !== r.cli
+          ? 'alias:' + r.project
+          : null)
+      if (effRoot) {
+        const rKey = hour + '|' + r.cli + '|' + effRoot + '|' + r.model
         let rb = rootBuckets.get(rKey)
         if (!rb) {
-          rb = { hour, cli: r.cli, root: r.root, model: r.model, input: 0, output: 0, cacheRead: 0, cacheCreate: 0, reasoning: 0, total: 0, cost: 0, turns: 0, parts: [] }
+          rb = { hour, cli: r.cli, root: effRoot, model: r.model, input: 0, output: 0, cacheRead: 0, cacheCreate: 0, reasoning: 0, total: 0, cost: 0, turns: 0, parts: [] }
           rootBuckets.set(rKey, rb)
         }
         rb.input += r.input
@@ -344,12 +350,19 @@ export class UsageDb {
     return r ? mapProviderRow(r) : null
   }
 
-  // id absent -> insert a new provider (uuid generated here); id present -> update in place.
+  // id absent -> insert a new provider (deterministic id from baseUrl so
+  // configuring the same LiteLLM proxy on multiple devices shares the same
+  // cross-device CLI identity); id present -> update in place.
   upsertLitellmProvider({ id, name, baseUrl, apiKey, color, syncMinutes, enabled }) {
     const now = Date.now()
     const existing = id ? this.getLitellmProvider(id) : null
+    let resolvedId = existing ? id : id || null
+    if (!resolvedId) {
+      const candidate = deterministicLitellmId(baseUrl)
+      resolvedId = !this.getLitellmProvider(candidate) ? candidate : crypto.randomUUID()
+    }
     const row = {
-      id: existing ? id : id || crypto.randomUUID(),
+      id: resolvedId,
       name,
       baseUrl,
       apiKey,
@@ -726,7 +739,10 @@ export class UsageDb {
         const periods = RESET_PERIODS.filter((p) =>
           (Array.isArray(cs.resetPeriods) ? cs.resetPeriods : prev?.resetPeriods || []).includes(p)
         )
-        const srcAnchors = cs.resetAnchors && Object.keys(cs.resetAnchors).length ? cs.resetAnchors : prev?.resetAnchors || {}
+        const srcAnchors =
+          cs.resetAnchors && typeof cs.resetAnchors === 'object' && !Array.isArray(cs.resetAnchors)
+            ? cs.resetAnchors
+            : prev?.resetAnchors || {}
         const anchors = {}
         for (const p of periods) {
           const v = srcAnchors && srcAnchors[p]
@@ -924,17 +940,109 @@ export class UsageDb {
   // report identical account-wide numbers on every device where they're enabled.
   // In the merged 'account' view, only the most recently synced non-revoked
   // device that has rows for that source is counted — identical to tokenstat-web.
+  // Because two devices configuring the same LiteLLM proxy may have generated
+  // distinct random UUIDs (`litellm:<uuid-A>` vs `litellm:<uuid-B>`), resolve
+  // a shared cross-device source identity (by normalized baseUrl, provider label,
+  // or per-device slot) before selecting the winning owner device.
   cloudServerSourceOwners() {
+    const localProviders = this.listLitellmProviders()
+    const devices = this.listCloudDevices()
+    const metaByDevCli = new Map()
+    const urlByLabel = new Map()
+    const localCliByIdentity = new Map()
+
+    for (const p of localProviders) {
+      const cli = 'litellm:' + p.id
+      const baseUrl = normalizeLitellmBaseUrl(p.baseUrl)
+      const label = String(p.name || '').trim().toLowerCase()
+      if (baseUrl && label) urlByLabel.set(label, baseUrl)
+      metaByDevCli.set(`local|${cli}`, { baseUrl, label })
+    }
+    for (const d of devices) {
+      if (d.isCurrent) {
+        for (const p of localProviders) {
+          const cli = 'litellm:' + p.id
+          const baseUrl = normalizeLitellmBaseUrl(p.baseUrl)
+          const label = String(p.name || '').trim().toLowerCase()
+          metaByDevCli.set(`${d.id}|${cli}`, { baseUrl, label })
+        }
+      }
+      for (const [cli, meta] of Object.entries(d.status?.cliMeta || {})) {
+        if (!cli.startsWith('litellm:')) continue
+        const existing = metaByDevCli.get(`${d.id}|${cli}`) || {}
+        const baseUrl = normalizeLitellmBaseUrl(meta?.baseUrl || existing.baseUrl)
+        const label = String(meta?.label || existing.label || '').trim().toLowerCase()
+        if (baseUrl && label) urlByLabel.set(label, baseUrl)
+        metaByDevCli.set(`${d.id}|${cli}`, { baseUrl, label })
+        if (!metaByDevCli.has(`*|${cli}`)) metaByDevCli.set(`*|${cli}`, { baseUrl, label })
+      }
+    }
+
     const rows = this.rows(
       `SELECT DISTINCT h.cli, h.key_id, COALESCE(d.last_sync_at, 0) AS synced
        FROM cloud_usage_hourly h
        JOIN cloud_devices d ON d.id = h.key_id
        WHERE d.revoked = 0
-       ORDER BY synced DESC`
+       ORDER BY synced DESC, h.cli ASC`
     )
-    const owners = new Map()
+
+    // Assign stable per-device slot indices for any unlabelled litellm:* CLIs so
+    // two devices each polling a single LiteLLM proxy without cliMeta snapshots
+    // still share the same cross-device identity ('litellm:slot:0').
+    const unlabelledByDev = new Map()
     for (const r of rows) {
-      if (isServerSourceCli(r.cli) && !owners.has(r.cli)) owners.set(r.cli, r.key_id)
+      if (!String(r.cli || '').startsWith('litellm:')) continue
+      const m = metaByDevCli.get(`${r.key_id}|${r.cli}`) || metaByDevCli.get(`local|${r.cli}`)
+      if (m?.baseUrl || m?.label) continue
+      let list = unlabelledByDev.get(r.key_id)
+      if (!list) {
+        list = []
+        unlabelledByDev.set(r.key_id, list)
+      }
+      if (!list.includes(r.cli)) list.push(r.cli)
+    }
+    const unlabelledSlot = new Map()
+    for (const [keyId, list] of unlabelledByDev.entries()) {
+      list.sort()
+      list.forEach((cli, idx) => unlabelledSlot.set(`${keyId}|${cli}`, `litellm:slot:${idx}`))
+    }
+
+    const identityFor = (keyId, cli) => {
+      if (!isServerSourceCli(cli)) return cli
+      if (cli === 'cursor') return 'cursor'
+      const m = (keyId && metaByDevCli.get(`${keyId}|${cli}`)) || metaByDevCli.get(`local|${cli}`) || metaByDevCli.get(`*|${cli}`)
+      const baseUrl = m?.baseUrl || (m?.label ? urlByLabel.get(m.label) : '')
+      if (baseUrl) return `litellm:url:${baseUrl}`
+      if (m?.label) return `litellm:label:${m.label}`
+      if (keyId && unlabelledSlot.has(`${keyId}|${cli}`)) return unlabelledSlot.get(`${keyId}|${cli}`)
+      return 'litellm:slot:0'
+    }
+
+    for (const p of localProviders) {
+      const cli = 'litellm:' + p.id
+      const idKey = identityFor('local', cli)
+      if (!localCliByIdentity.has(idKey)) localCliByIdentity.set(idKey, cli)
+    }
+
+    const owners = new Map()
+    const canonicalCliByIdentity = new Map()
+    for (const r of rows) {
+      if (!isServerSourceCli(r.cli)) continue
+      const idKey = identityFor(r.key_id, r.cli)
+      if (!owners.has(idKey)) {
+        owners.set(idKey, r.key_id)
+        canonicalCliByIdentity.set(idKey, localCliByIdentity.get(idKey) || r.cli)
+      }
+      if (!owners.has(r.cli)) {
+        owners.set(r.cli, owners.get(idKey))
+      }
+    }
+
+    owners.identityFor = identityFor
+    owners.canonicalCliFor = (keyId, cli) => {
+      if (!String(cli || '').startsWith('litellm:')) return cli
+      const idKey = identityFor(keyId, cli)
+      return localCliByIdentity.get(idKey) || canonicalCliByIdentity.get(idKey) || cli
     }
     return owners
   }
@@ -972,12 +1080,13 @@ export class UsageDb {
     const merged = new Map()
     for (const r of raw) {
       if (!keepCloudRow(r, 'account', owners)) continue
-      const k = `${r.hour}|${r.cli}|${r.model}`
+      const cli = owners.canonicalCliFor ? owners.canonicalCliFor(r.key_id, r.cli) : r.cli
+      const k = `${r.hour}|${cli}|${r.model}`
       let b = merged.get(k)
       if (!b) {
         b = {
           hour: r.hour,
-          cli: r.cli,
+          cli,
           model: r.model,
           input: 0,
           output: 0,
@@ -1002,25 +1111,206 @@ export class UsageDb {
     return [...merged.values()].sort((a, b) => a.hour - b.hour)
   }
 
-  // Synthetic record objects from cloudFilteredRows for subscription cycle /
-  // plan breakdown / timeline calculations when viewing 'account' or a remote device.
-  recordsForDevice(deviceId = null) {
-    return this.cloudFilteredRows(deviceId).map((r) => ({
-      ts: r.hour,
-      hour: r.hour,
-      cli: r.cli,
-      model: r.model,
-      input: r.input || 0,
-      output: r.output || 0,
-      cacheRead: r.cache_read || 0,
-      cacheCreate: r.cache_create || 0,
-      reasoning: r.reasoning || 0,
-      total: r.total || 0,
-      cost: r.cost || 0,
-      turns: r.turns || 1,
-      sessionId: 'cloud',
-      project: r.cli,
-    }))
+  _resolveLocalRecords(localRecords = null) {
+    if (Array.isArray(localRecords) && localRecords.length) return localRecords
+    if (Array.isArray(this._lastIngestedRecords) && this._lastIngestedRecords.length) {
+      return this._lastIngestedRecords
+    }
+    const aliasRows = this.rows(
+      `SELECT hour, cli, root, model, input, output, cache_read, cache_create, reasoning, total, cost, turns
+       FROM usage_root_hourly
+       WHERE root LIKE 'alias:%'
+       ORDER BY hour`
+    )
+    const aliasCovered = new Set()
+    const out = []
+    for (const r of aliasRows) {
+      aliasCovered.add(`${r.hour}|${r.cli}|${r.model}`)
+      out.push({
+        ts: r.hour,
+        hour: r.hour,
+        cli: r.cli,
+        model: r.model,
+        input: r.input || 0,
+        output: r.output || 0,
+        cacheRead: r.cache_read || 0,
+        cacheCreate: r.cache_create || 0,
+        reasoning: r.reasoning || 0,
+        total: r.total || 0,
+        cost: r.cost || 0,
+        turns: r.turns || 1,
+        sessionId: 'local',
+        project: r.root.slice('alias:'.length),
+      })
+    }
+    const litellmRows = this.rows(
+      `SELECT provider_id, ts, model, key_alias, input, output, cache_read, cache_create, total, cost, turns
+       FROM litellm_usage
+       ORDER BY ts`
+    )
+    for (const r of litellmRows) {
+      const cli = 'litellm:' + r.provider_id
+      const hour = floorHourLocal(r.ts)
+      const hKey = `${hour}|${cli}|${r.model}`
+      if (aliasCovered.has(hKey)) continue
+      aliasCovered.add(hKey)
+      out.push({
+        ts: r.ts,
+        hour,
+        cli,
+        model: r.model,
+        input: r.input || 0,
+        output: r.output || 0,
+        cacheRead: r.cache_read || 0,
+        cacheCreate: r.cache_create || 0,
+        reasoning: 0,
+        total: r.total || 0,
+        cost: r.cost || 0,
+        turns: r.turns || 1,
+        sessionId: 'litellm',
+        project: r.key_alias || cli,
+      })
+    }
+    const hourlyRows = this.rows(
+      `SELECT hour, cli, model, input, output, cache_read, cache_create, reasoning, total, cost, turns
+       FROM usage_hourly
+       ORDER BY hour`
+    )
+    for (const r of hourlyRows) {
+      if (aliasCovered.has(`${r.hour}|${r.cli}|${r.model}`)) continue
+      out.push({
+        ts: r.hour,
+        hour: r.hour,
+        cli: r.cli,
+        model: r.model,
+        input: r.input || 0,
+        output: r.output || 0,
+        cacheRead: r.cache_read || 0,
+        cacheCreate: r.cache_create || 0,
+        reasoning: r.reasoning || 0,
+        total: r.total || 0,
+        cost: r.cost || 0,
+        turns: r.turns || 1,
+        sessionId: 'local',
+        project: r.cli,
+      })
+    }
+    return out
+  }
+
+  // Record objects for subscription cycle / plan breakdown / timeline calculations
+  // when viewing 'local', the current device, 'account', or a remote device.
+  // Preserves original local records (and their LiteLLM keyAlias in `project`)
+  // for the current device and in merged account statistics.
+  recordsForDevice(deviceId = null, localRecords = null) {
+    const eff = this.resolveDeviceId(deviceId)
+    const local = this._resolveLocalRecords(localRecords)
+    if (eff === 'local') return local
+
+    const curDev = this.rows('SELECT id FROM cloud_devices WHERE is_current = 1 LIMIT 1')[0]
+    const toCloudRec = (r, cliOverride = null) => {
+      const cli = cliOverride || r.cli
+      return {
+        ts: r.hour,
+        hour: r.hour,
+        cli,
+        model: r.model,
+        input: r.input || 0,
+        output: r.output || 0,
+        cacheRead: r.cache_read || 0,
+        cacheCreate: r.cache_create || 0,
+        reasoning: r.reasoning || 0,
+        total: r.total || 0,
+        cost: r.cost || 0,
+        turns: r.turns || 1,
+        sessionId: 'cloud',
+        project: cli,
+      }
+    }
+
+    if (curDev?.id && eff === curDev.id) {
+      if (!local.length) return this.cloudFilteredRows(eff).map((r) => toCloudRec(r))
+      const coveredHours = new Set(local.map((r) => `${floorHourLocal(r.ts)}|${r.cli}|${r.model}`))
+      const extraCloud = this.cloudFilteredRows(eff)
+        .filter((r) => !coveredHours.has(`${r.hour}|${r.cli}|${r.model}`))
+        .map((r) => toCloudRec(r))
+      return [...local, ...extraCloud]
+    }
+
+    if (eff === 'account') {
+      const owners = this.cloudServerSourceOwners()
+      const curKeyId = curDev?.id || null
+      const aliasServerIdentities = new Set()
+      for (const r of local) {
+        if (isServerSourceCli(r.cli) && r.project && r.project !== r.cli) {
+          aliasServerIdentities.add(owners.identityFor(curKeyId || 'local', r.cli))
+        }
+      }
+
+      const keptLocal = []
+      const localCoveredServerIdentities = new Set()
+      const localCoveredCurDevHours = new Set()
+      for (const r of local) {
+        if (!isServerSourceCli(r.cli)) {
+          keptLocal.push(r)
+          localCoveredCurDevHours.add(`${floorHourLocal(r.ts)}|${r.cli}|${r.model}`)
+          continue
+        }
+        const idKey = owners.identityFor(curKeyId || 'local', r.cli)
+        const curOwns = !curKeyId || owners.get(idKey) === curKeyId || !owners.has(idKey)
+        if (curOwns || aliasServerIdentities.has(idKey)) {
+          keptLocal.push(r)
+          localCoveredServerIdentities.add(idKey)
+          localCoveredCurDevHours.add(`${floorHourLocal(r.ts)}|${r.cli}|${r.model}`)
+        }
+      }
+
+      const rawCloud = this.rows(
+        `SELECT key_id, hour, cli, model, input, output, cache_read, cache_create, reasoning, total, cost, turns
+         FROM cloud_usage_hourly ORDER BY hour`
+      )
+      const mergedCloud = new Map()
+      for (const r of rawCloud) {
+        if (!keepCloudRow(r, 'account', owners)) continue
+        if (isServerSourceCli(r.cli)) {
+          const idKey = owners.identityFor(r.key_id, r.cli)
+          if (localCoveredServerIdentities.has(idKey)) continue
+        } else if (curKeyId && r.key_id === curKeyId) {
+          if (localCoveredCurDevHours.has(`${r.hour}|${r.cli}|${r.model}`)) continue
+        }
+        const cli = owners.canonicalCliFor ? owners.canonicalCliFor(r.key_id, r.cli) : r.cli
+        const k = `${r.hour}|${cli}|${r.model}`
+        let b = mergedCloud.get(k)
+        if (!b) {
+          b = {
+            hour: r.hour,
+            cli,
+            model: r.model,
+            input: 0,
+            output: 0,
+            cache_read: 0,
+            cache_create: 0,
+            reasoning: 0,
+            total: 0,
+            cost: 0,
+            turns: 0,
+          }
+          mergedCloud.set(k, b)
+        }
+        b.input += r.input || 0
+        b.output += r.output || 0
+        b.cache_read += r.cache_read || 0
+        b.cache_create += r.cache_create || 0
+        b.reasoning += r.reasoning || 0
+        b.total += r.total || 0
+        b.cost += r.cost || 0
+        b.turns += r.turns || 0
+      }
+
+      return [...keptLocal, ...[...mergedCloud.values()].map((r) => toCloudRec(r))]
+    }
+
+    return this.cloudFilteredRows(eff).map((r) => toCloudRec(r))
   }
 
   // Exact replica of tokenstat-web/src/lib/usage.js#totalsSince so the desktop
@@ -1070,11 +1360,12 @@ export class UsageDb {
 
     for (const r of rows) {
       if (eff === 'account' && !keepCloudRow(r, 'account', effOwners)) continue
+      const cli = eff === 'account' && effOwners?.canonicalCliFor ? effOwners.canonicalCliFor(r.key_id, r.cli) : r.cli
       const w = fromMs > 0 && r.hour === firstHour ? headFrac : 1
       addWeightedBucket(total, r, w)
-      addWeightedBucket((perCli[r.cli] ||= blankBucket()), r, w)
-      const mk = `${r.cli}|${r.model}`
-      const mb = (perModel[mk] ||= { cli: r.cli, model: r.model, ...blankBucket() })
+      addWeightedBucket((perCli[cli] ||= blankBucket()), r, w)
+      const mk = `${cli}|${r.model}`
+      const mb = (perModel[mk] ||= { cli, model: r.model, ...blankBucket() })
       addWeightedBucket(mb, r, w)
     }
     roundWeightedBucket(total)
@@ -1117,8 +1408,17 @@ export class UsageDb {
       if (p.enabled) providerMap.set('litellm:' + p.id, { id: 'litellm:' + p.id, label: p.name, color: p.color })
     }
     for (const [cliId, meta] of Object.entries(status?.cliMeta || {})) {
+      if (cliId.startsWith('litellm:')) {
+        const canonId = eff === 'account' && owners?.canonicalCliFor ? owners.canonicalCliFor(null, cliId) : cliId
+        if (!providerMap.has(canonId)) {
+          providerMap.set(canonId, { id: canonId, label: meta.label || canonId, color: meta.color || '#f59e0b' })
+        }
+      }
+    }
+    for (const cliId of Object.keys(allScope.perCli || {})) {
       if (cliId.startsWith('litellm:') && !providerMap.has(cliId)) {
-        providerMap.set(cliId, { id: cliId, label: meta.label || cliId, color: meta.color || '#f59e0b' })
+        const meta = status?.cliMeta?.[cliId]
+        providerMap.set(cliId, { id: cliId, label: meta?.label || cliId, color: meta?.color || '#f59e0b' })
       }
     }
 
@@ -1365,13 +1665,30 @@ function mapSubscriptionRow(r) {
   }
 }
 
+function normalizeLitellmBaseUrl(raw) {
+  let s = String(raw || '').trim().replace(/\/+$/, '').toLowerCase()
+  if (!s) return ''
+  if (!/^https?:\/\//i.test(s)) s = 'https://' + s
+  return s
+}
+
+function deterministicLitellmId(baseUrl) {
+  const normUrl = normalizeLitellmBaseUrl(baseUrl)
+  if (!normUrl) return crypto.randomUUID()
+  const h = crypto.createHash('sha256').update('litellm-provider:' + normUrl).digest('hex')
+  return `${h.slice(0, 8)}-${h.slice(8, 12)}-4${h.slice(13, 16)}-8${h.slice(17, 20)}-${h.slice(20, 32)}`
+}
+
 function isServerSourceCli(cli) {
   return cli === 'cursor' || (typeof cli === 'string' && cli.startsWith('litellm:'))
 }
 
 function keepCloudRow(r, deviceId, owners) {
   if (deviceId && deviceId !== 'account') return r.key_id === deviceId
-  if (isServerSourceCli(r.cli)) return owners.get(r.cli) === r.key_id
+  if (isServerSourceCli(r.cli)) {
+    const idKey = owners?.identityFor ? owners.identityFor(r.key_id, r.cli) : r.cli
+    return owners.get(idKey) === r.key_id
+  }
   return true
 }
 

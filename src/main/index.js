@@ -635,8 +635,81 @@ function buildEffectiveSnapshot(baseSnap) {
 function recordsForView(deviceId = null) {
   if (!db || !store) return []
   const eff = db.resolveDeviceId(deviceId)
-  if (eff === 'local') return store.dedupedRecords()
-  return db.recordsForDevice(eff)
+  const localRecs = store.dedupedRecords()
+  if (eff === 'local') return localRecs
+  return db.recordsForDevice(eff, localRecs)
+}
+
+function mergeCloudResetsIntoEntries(baseEntries, cloudResets, { preferExistingLive = false } = {}) {
+  const usedCloud = new Set()
+  const entryClis = (item) =>
+    new Set(
+      (item?.bindings || [])
+        .map((b) => b?.cli)
+        .concat(item?.clis || [])
+        .filter(Boolean)
+    )
+  const findMatchingCloud = (entry) => {
+    const targetName = String(entry.name || '').toLowerCase()
+    const byExactName = cloudResets.find(
+      (cr) => !usedCloud.has(cr) && String(cr.name || cr.planName || '').toLowerCase() === targetName
+    )
+    if (byExactName) return byExactName
+    const eClis = entryClis(entry)
+    if (!eClis.size) return null
+    return (
+      cloudResets.find((cr) => {
+        if (usedCloud.has(cr) || Number(cr.monthlyUsd) > 0) return false
+        for (const c of entryClis(cr)) {
+          if (eClis.has(c)) return true
+        }
+        return false
+      }) || null
+    )
+  }
+
+  const out = baseEntries.map((e) => {
+    const cr = findMatchingCloud(e)
+    if (preferExistingLive && (e.windows || []).some((w) => w.source === 'live')) {
+      if (cr) usedCloud.add(cr)
+      return e
+    }
+    if (cr && Array.isArray(cr.windows) && cr.windows.length) {
+      usedCloud.add(cr)
+      return { ...e, windows: cr.windows, renewal: cr.renewal || e.renewal }
+    }
+    return e
+  })
+
+  const liveCoveredClis = new Set()
+  for (const e of out) {
+    if ((e.windows || []).some((w) => w.source === 'live')) {
+      for (const c of entryClis(e)) liveCoveredClis.add(c)
+    }
+  }
+
+  for (const cr of cloudResets) {
+    if (usedCloud.has(cr)) continue
+    const hasLiveWindows = Array.isArray(cr.windows) && cr.windows.length > 0
+    if (!hasLiveWindows) continue
+    const crClis = [...entryClis(cr)]
+    if (preferExistingLive && crClis.length > 0 && crClis.every((c) => liveCoveredClis.has(c))) {
+      continue
+    }
+    const bindings =
+      Array.isArray(cr.bindings) && cr.bindings.length
+        ? cr.bindings
+        : crClis.map((cli) => ({ cli, models: null }))
+    out.push({
+      id: cr.id || `live:${crClis[0] || String(cr.name || cr.planName || 'remote').toLowerCase()}`,
+      name: cr.name || cr.planName || 'Plan',
+      monthlyUsd: Number(cr.monthlyUsd) || 0,
+      bindings,
+      windows: cr.windows,
+      renewal: cr.renewal || null,
+    })
+  }
+  return out
 }
 
 function computeResetsForView(deviceId = null) {
@@ -657,28 +730,15 @@ function computeResetsForView(deviceId = null) {
 
   const cloudSnap = db.cloudOverview(eff, now)
   const cloudResets = cloudSnap?.cloudResets || []
-  const byName = new Map(cloudResets.map((r) => [String(r.name || r.planName || '').toLowerCase(), r]))
 
   if (eff === 'account') {
     const mergedLocal = mergeLiveLimits(entries, buildLiveByCli(), now, labels, index)
-    return mergedLocal.map((e) => {
-      if ((e.windows || []).some((w) => w.source === 'live')) return e
-      const cr = byName.get(String(e.name || '').toLowerCase())
-      if (cr && Array.isArray(cr.windows) && cr.windows.length) {
-        return { ...e, windows: cr.windows, renewal: cr.renewal || e.renewal }
-      }
-      return e
-    })
+    return mergeCloudResetsIntoEntries(mergedLocal, cloudResets, { preferExistingLive: true })
   }
 
-  // Specific remote device: overlay that device's synced live quota windows
-  return entries.map((e) => {
-    const cr = byName.get(String(e.name || '').toLowerCase())
-    if (cr && Array.isArray(cr.windows) && cr.windows.length) {
-      return { ...e, windows: cr.windows, renewal: cr.renewal || e.renewal }
-    }
-    return e
-  })
+  // Specific remote device: overlay that device's synced live quota windows and
+  // append any remote-only synthetic live quota entries.
+  return mergeCloudResetsIntoEntries(entries, cloudResets, { preferExistingLive: false })
 }
 
 function broadcastDeviceView() {

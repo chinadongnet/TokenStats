@@ -169,7 +169,13 @@ export function buildStatusSnapshot({ db, store, liveByCli, appVersion }) {
 
   const cliMeta = Object.fromEntries(Object.entries(CLI_META).map(([k, v]) => [k, { label: v.label, color: v.color }]))
   for (const p of db.listLitellmProviders()) {
-    if (p.enabled) cliMeta['litellm:' + p.id] = { label: p.name, color: p.color }
+    if (p.enabled) {
+      cliMeta['litellm:' + p.id] = {
+        label: p.name,
+        color: p.color,
+        baseUrl: normalizeEndpoint(p.baseUrl).toLowerCase(),
+      }
+    }
   }
 
   const plans = subs
@@ -194,6 +200,7 @@ export async function performSync({
   appVersion,
   fullOverride = false,
   resolveSubscriptionsStrategy = null,
+  _retryingSubs = false,
 }) {
   const cfg = db.getCloudSync()
   if (!cfg.enabled || !cfg.apiKey || !cfg.endpoint) return { ok: false, skipped: true }
@@ -215,6 +222,7 @@ export async function performSync({
   }
   const status = buildStatusSnapshot({ db, store, liveByCli, appVersion })
   const subscriptions = status.subscriptions
+  const submittedSubsFingerprint = JSON.stringify(subscriptions)
 
   try {
     // Batched: the first batch carries replaceFrom (clearing the window server-
@@ -261,21 +269,51 @@ export async function performSync({
     const clearFull = cfg.fullResync && (db.fullResyncGen || 0) === genAtStart
     if (clearFull) syncPatch.fullResync = false
 
+    const currentSubs = serializeSubscriptionsForCloud(db.listSubscriptions())
+    const subsChangedMidFlight = JSON.stringify(currentSubs) !== submittedSubsFingerprint
+
     if (subscriptionSync) {
       if (subscriptionSync.status === 'synced') {
         syncPatch.subsBaseHash = subscriptionSync.cloudHash || null
         syncPatch.subsConflict = null
       } else if (subscriptionSync.status === 'pull' && Array.isArray(subscriptionSync.cloudSubs)) {
-        db.replaceAllSubscriptions(subscriptionSync.cloudSubs)
-        syncPatch.subsBaseHash = subscriptionSync.cloudHash || null
-        syncPatch.subsConflict = null
-        pulledSubscriptions = true
+        if (subsChangedMidFlight) {
+          // User saved/deleted/merged a subscription locally while the sync
+          // request was in flight. Never overwrite those persisted edits with a
+          // pull computed against the older snapshot; surface a conflict instead.
+          subscriptionSync = {
+            status: 'conflict',
+            cloudHash: subscriptionSync.cloudHash || null,
+            cloudSubs: subscriptionSync.cloudSubs,
+            localSubs: currentSubs,
+          }
+          syncPatch.subsConflict = subscriptionSync
+        } else {
+          db.replaceAllSubscriptions(subscriptionSync.cloudSubs)
+          syncPatch.subsBaseHash = subscriptionSync.cloudHash || null
+          syncPatch.subsConflict = null
+          pulledSubscriptions = true
+        }
       } else if (subscriptionSync.status === 'conflict') {
+        if (subsChangedMidFlight) {
+          subscriptionSync = { ...subscriptionSync, localSubs: currentSubs }
+        }
         syncPatch.subsConflict = subscriptionSync
       }
     }
 
     db.updateCloudSyncState(syncPatch)
+    if (subsChangedMidFlight && subscriptionSync?.status === 'synced' && !_retryingSubs) {
+      return await performSync({
+        db,
+        store,
+        liveByCli,
+        appVersion,
+        fullOverride: false,
+        resolveSubscriptionsStrategy: null,
+        _retryingSubs: true,
+      })
+    }
     return { ok: true, sent, full, subscriptionSync, pulledSubscriptions, pulledAccount: !!accountSync }
   } catch (e) {
     const msg = e.name === 'AbortError' ? 'timeout' : String(e.message || e)

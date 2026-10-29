@@ -95,21 +95,49 @@ export default function Report() {
 
   useEffect(() => { load() }, [day, fromMs, toMs])
   useEffect(() => window.api.onReportUpdated(() => load()), [day, fromMs, toMs])
+  useEffect(() => (window.api.onDeviceView ? window.api.onDeviceView(() => { load(); loadProviders() }) : () => {}), [day, fromMs, toMs])
 
   async function loadProviders() {
-    setProviders(await window.api.litellmListProviders())
+    const [localList, snap] = await Promise.all([
+      window.api.litellmListProviders(),
+      window.api.getSnapshot ? window.api.getSnapshot() : Promise.resolve(null),
+    ])
+    const byId = new Map()
+    for (const p of localList || []) {
+      const cliId = String(p.id || '').startsWith('litellm:') ? p.id : 'litellm:' + p.id
+      byId.set(cliId, { id: cliId, label: p.name || p.label || cliId, color: p.color || '#f59e0b' })
+    }
+    for (const p of snap?.providers || []) {
+      const cliId = String(p.id || '').startsWith('litellm:') ? p.id : 'litellm:' + p.id
+      if (!byId.has(cliId)) {
+        byId.set(cliId, { id: cliId, label: p.label || p.name || cliId, color: p.color || '#f59e0b' })
+      }
+    }
+    setProviders([...byId.values()])
   }
   useEffect(() => { loadProviders() }, [])
   useEffect(() => window.api.onReportUpdated(() => loadProviders()), [])
 
-  // 5 fixed built-in CLIs + whatever LiteLLM providers currently exist.
+  // 5 fixed built-in CLIs + local & remote LiteLLM providers + any dynamic CLI
+  // present in the active device view's usage rows.
   const { CLI, ORDER } = useMemo(() => {
-    const dyn = providers.map((p) => ({ id: 'litellm:' + p.id, label: p.name, color: p.color }))
+    const dynMap = new Map()
+    for (const p of providers) {
+      const cliId = String(p.id || '').startsWith('litellm:') ? p.id : 'litellm:' + p.id
+      dynMap.set(cliId, { id: cliId, label: p.label || p.name || cliId, color: p.color || '#f59e0b' })
+    }
+    for (const row of [...daily, ...hourly, ...models, ...dayModels]) {
+      const cliId = row?.cli
+      if (cliId && !FIXED_CLI[cliId] && !dynMap.has(cliId)) {
+        dynMap.set(cliId, { id: cliId, label: FALLBACK_META(cliId).label, color: '#f59e0b' })
+      }
+    }
+    const dyn = [...dynMap.values()]
     return {
       CLI: { ...FIXED_CLI, ...Object.fromEntries(dyn.map((p) => [p.id, { label: p.label, color: p.color }])) },
       ORDER: [...FIXED_ORDER, ...dyn.map((p) => p.id)],
     }
-  }, [providers])
+  }, [providers, daily, hourly, models, dayModels])
 
   // A provider added after this window opened should default to "shown".
   useEffect(() => {
