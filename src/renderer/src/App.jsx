@@ -22,6 +22,11 @@ const FALLBACK_META = (id) => ({ label: id.startsWith('litellm:') ? '(deleted pr
 // glance to a Chinese reader; "2.5亿" does.
 const compact = (n) => fmtCount(n)
 const usd = (n) => (n || 0).toFixed(2)
+const floorDay = (ms) => {
+  const d = new Date(ms)
+  d.setHours(0, 0, 0, 0)
+  return d.getTime()
+}
 // Short reset-window label (5h / wk / mo), localized. Mirrors the period keys in
 // core/subscriptions.js's RESET_PERIODS (renderer can't import from main).
 const resetLabel = (period) => t('reset.' + period)
@@ -374,9 +379,28 @@ export default function App() {
   // locally from each window's `end`, so a window expiring while idle flips to
   // "no open window" on its own without another IPC round-trip.
   useEffect(() => {
-    const h = setInterval(() => setNow(Date.now()), 30000)
-    return () => clearInterval(h)
+    const tick = () => setNow(Date.now())
+    const h = setInterval(tick, 30000)
+    window.addEventListener('focus', tick)
+    return () => {
+      clearInterval(h)
+      window.removeEventListener('focus', tick)
+    }
   }, [])
+
+  // If the local calendar day rolled over while idle, refetch snapshot & stats
+  // so the Today tab and quota windows immediately reflect the new day.
+  const snapDayStart = snap?.ranges?.dayStart
+  useEffect(() => {
+    if (snapDayStart != null && floorDay(now) !== snapDayStart) {
+      window.api.getSnapshot().then((s) => {
+        if (s) setSnap(s)
+        if (s?.deviceView) setDeviceView(s.deviceView)
+      })
+      window.api.subsResets().then(setResets)
+      window.api.subsStats().then((r) => setSubStats(r || []))
+    }
+  }, [now, snapDayStart])
 
   // Screenshot the popup itself. The menu must be gone from the frame first,
   // so give React a beat to re-render before asking main to capture.

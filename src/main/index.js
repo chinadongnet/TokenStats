@@ -3,7 +3,7 @@ import path from 'node:path'
 import fs from 'node:fs'
 import { fileURLToPath } from 'node:url'
 import { Store } from './core/store.js'
-import { UsageDb } from './core/db.js'
+import { UsageDb, floorDayLocal } from './core/db.js'
 import { CLI_META, ensureConfigFile, CONFIG_FILE, loadLanguage, saveLanguage } from './core/paths.js'
 import { createLitellmPoller, listModels } from './core/parsers/litellm.js'
 import { codexResetWindows } from './core/parsers/codex.js'
@@ -33,6 +33,7 @@ let cyclesWin = null
 let store = null
 let db = null
 let lastSnapshot = null
+let lastDayStart = floorDayLocal(Date.now())
 let lastIngest = 0
 let ingestTimer = null
 // Label/color for active LiteLLM provider pseudo-CLI ids (litellm:<id>), kept
@@ -110,7 +111,8 @@ async function init() {
     for (const w of BrowserWindow.getAllWindows()) w.webContents.send('language', lang)
     // The right-click menu is rebuilt on demand, but the tooltip string is not —
     // without this it keeps the old language until the next store snapshot.
-    if (lastSnapshot) updateTray(lastSnapshot)
+    const snap = currentBaseSnapshot()
+    if (snap) updateTray(buildEffectiveSnapshot(snap))
     return lang
   })
 
@@ -156,7 +158,7 @@ async function init() {
 
   // Register IPC before the (slow) initial scan so the renderer never races a
   // missing handler. snapshot() safely returns whatever has been parsed so far.
-  ipcMain.handle('get-snapshot', () => buildEffectiveSnapshot(lastSnapshot || (store ? store.snapshot() : null)))
+  ipcMain.handle('get-snapshot', () => buildEffectiveSnapshot(currentBaseSnapshot()))
   ipcMain.handle('devices:get', () =>
     db ? db.getDeviceViewState() : { selectedDevice: 'local', hasCloudData: false, currentKeyId: null, devices: [] }
   )
@@ -461,13 +463,22 @@ async function init() {
   // 15-min refresh. Fire-and-forget; a snapshot after it lands shows the data.
   primeClaudeLimits()
     .then(() => {
-      if (win && !win.isDestroyed() && lastSnapshot) {
-        win.webContents.send('snapshot', buildEffectiveSnapshot(lastSnapshot))
+      const snap = currentBaseSnapshot()
+      if (win && !win.isDestroyed() && snap) {
+        win.webContents.send('snapshot', buildEffectiveSnapshot(snap))
       }
     })
     .catch(() => {})
   refreshAgyLimits()
   setInterval(() => refreshAgyLimits(), 20000)
+  setInterval(() => {
+    const todayStart = floorDayLocal(Date.now())
+    if (todayStart !== lastDayStart) {
+      lastDayStart = todayStart
+      broadcastSnapshot()
+      notifyReportUpdated()
+    }
+  }, 15000)
   if (process.env.AIMON_AUTO_REPORT) openReport() // dev/test convenience
   if (process.env.AIMON_AUTO_CYCLES) openCycles()
   if ('AIMON_SET_AUTOLAUNCH' in process.env) setAutoLaunch(process.env.AIMON_SET_AUTOLAUNCH === '1') // headless toggle
@@ -477,8 +488,9 @@ function refreshAgyLimits(force = false) {
   if (!getAgyQuotaState().enabled) return
   primeAgyLimits({ force })
     .then(() => {
-      if (win && !win.isDestroyed() && lastSnapshot) {
-        win.webContents.send('snapshot', buildEffectiveSnapshot(lastSnapshot))
+      const snap = currentBaseSnapshot()
+      if (win && !win.isDestroyed() && snap) {
+        win.webContents.send('snapshot', buildEffectiveSnapshot(snap))
       }
     })
     .catch(() => {})
@@ -588,8 +600,9 @@ function ingestNow() {
   let sent = false
   try {
     db.ingest(store.dedupedRecords())
-    if (lastSnapshot) {
-      const eff = buildEffectiveSnapshot(lastSnapshot)
+    const snap = currentBaseSnapshot()
+    if (snap) {
+      const eff = buildEffectiveSnapshot(snap)
       if (win && !win.isDestroyed()) win.webContents.send('snapshot', eff)
       updateTray(eff)
       sent = true
@@ -640,8 +653,17 @@ function refreshLitellmPollers() {
 function watchAgyMirror() {
   fs.watchFile(AGY_MIRROR_PATH, { interval: 20000 }, (cur, prev) => {
     if (cur.mtimeMs === prev.mtimeMs) return
-    if (win && !win.isDestroyed() && lastSnapshot) win.webContents.send('snapshot', buildEffectiveSnapshot(lastSnapshot))
+    const snap = currentBaseSnapshot()
+    if (win && !win.isDestroyed() && snap) win.webContents.send('snapshot', buildEffectiveSnapshot(snap))
   })
+}
+
+function currentBaseSnapshot() {
+  if (store) {
+    lastSnapshot = store.snapshot()
+    return lastSnapshot
+  }
+  return lastSnapshot
 }
 
 function buildEffectiveSnapshot(baseSnap) {
@@ -822,8 +844,9 @@ function broadcastDeviceView() {
   for (const w of BrowserWindow.getAllWindows()) {
     if (!w.isDestroyed()) w.webContents.send('device-view', state)
   }
-  if (lastSnapshot) {
-    const eff = buildEffectiveSnapshot(lastSnapshot)
+  const snap = currentBaseSnapshot()
+  if (snap) {
+    const eff = buildEffectiveSnapshot(snap)
     if (win && !win.isDestroyed()) win.webContents.send('snapshot', eff)
     updateTray(eff)
   }
@@ -835,8 +858,7 @@ function broadcastDeviceView() {
 // file-watch/poll-timer trigger).
 function broadcastSnapshot() {
   if (!store) return
-  const s = store.snapshot()
-  lastSnapshot = s
+  const s = currentBaseSnapshot()
   if (!scheduleIngest()) {
     const eff = buildEffectiveSnapshot(s)
     if (win && !win.isDestroyed()) win.webContents.send('snapshot', eff)
@@ -882,6 +904,7 @@ function createWindow() {
 
 function openReport() {
   if (reportWin && !reportWin.isDestroyed()) {
+    if (!ingestNow()) notifyReportUpdated()
     reportWin.show()
     reportWin.focus()
     return
@@ -950,6 +973,7 @@ function openSettings() {
 
 function openCycles() {
   if (cyclesWin && !cyclesWin.isDestroyed()) {
+    if (!ingestNow()) notifyReportUpdated()
     cyclesWin.show()
     cyclesWin.focus()
     return
@@ -1087,6 +1111,12 @@ function toggleWindow() {
 }
 
 function showWindow() {
+  const snap = currentBaseSnapshot()
+  if (snap) {
+    const eff = buildEffectiveSnapshot(snap)
+    if (win && !win.isDestroyed()) win.webContents.send('snapshot', eff)
+    updateTray(eff)
+  }
   sizeWindow()
   positionWindow()
   win.show()

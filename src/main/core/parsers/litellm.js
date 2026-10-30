@@ -37,6 +37,10 @@ function isoDate(d) {
   return d.toISOString().slice(0, 10)
 }
 
+function localIsoDate(d) {
+  return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`
+}
+
 async function fetchPage(baseUrl, apiKey, startDate, endDate, page) {
   const url = `${baseUrl}/user/daily/activity?start_date=${startDate}&end_date=${endDate}&page=${page}`
   const res = await fetch(url, { headers: { Authorization: `Bearer ${apiKey}` } })
@@ -53,7 +57,9 @@ async function fetchRawRecords(baseUrl, apiKey) {
   const end = new Date()
   const start = new Date(end.getTime() - (LOOKBACK_DAYS - 1) * 86400000)
   const startDate = isoDate(start)
-  const endDate = isoDate(end)
+  const utcEnd = isoDate(end)
+  const locEnd = localIsoDate(end)
+  const endDate = locEnd > utcEnd ? locEnd : utcEnd
 
   const dayResults = []
   let page = 1
