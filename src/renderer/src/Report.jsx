@@ -49,7 +49,9 @@ export default function Report() {
   // provider added after this window opened still defaults to "shown".
   const [brands, setBrands] = useState(() => new Set(FIXED_ORDER))
   const [providers, setProviders] = useState([]) // dynamic LiteLLM providers
-  const [day, setDay] = useState(floorDay(Date.now()))
+  const [today, setToday] = useState(() => floorDay(Date.now()))
+  const [day, setDay] = useState(() => floorDay(Date.now()))
+  const prevTodayRef = useRef(today)
   const [dayBreakdown, setDayBreakdown] = useState('model') // model | project
   const [span, setSpan] = useState({ min: null, max: null })
   const [hourly, setHourly] = useState([])
@@ -78,7 +80,27 @@ export default function Report() {
     }
   }, [isLocalDeviceView, view, breakdown, dayBreakdown])
 
-  const today = floorDay(Date.now())
+  function syncToday() {
+    const nextToday = floorDay(Date.now())
+    if (nextToday !== prevTodayRef.current) {
+      const prevToday = prevTodayRef.current
+      prevTodayRef.current = nextToday
+      setToday(nextToday)
+      setDay((curDay) => (curDay === prevToday ? nextToday : curDay))
+      return true
+    }
+    return false
+  }
+
+  useEffect(() => {
+    const h = setInterval(syncToday, 30000)
+    window.addEventListener('focus', syncToday)
+    return () => {
+      clearInterval(h)
+      window.removeEventListener('focus', syncToday)
+    }
+  }, [])
+
   const { fromMs, toMs } = useMemo(() => {
     const to = today + DAY
     if (range === '7d') return { fromMs: today - 6 * DAY, toMs: to }
@@ -113,11 +135,11 @@ export default function Report() {
   useEffect(() => { load() }, [day, fromMs, toMs])
   useEffect(() => window.api.onReportUpdated(() => {
     window.api.devicesGet?.().then((v) => v && setDeviceView(v))
-    load()
+    if (!syncToday()) load()
   }), [day, fromMs, toMs])
   useEffect(() => (window.api.onDeviceView ? window.api.onDeviceView((v) => {
     if (v) setDeviceView(v)
-    load()
+    if (!syncToday()) load()
     loadProviders()
   }) : () => {}), [day, fromMs, toMs])
 

@@ -1106,7 +1106,7 @@ export class UsageDb {
         const id = cs.id || prev?.id || crypto.randomUUID()
         const groupId = cs.groupId || prev?.groupId || id
         const active = cs.active !== false ? 1 : 0
-        const endDate = active ? null : cs.endDate || prev?.endDate || new Date().toISOString().slice(0, 10)
+        const endDate = active ? null : cs.endDate || prev?.endDate || localDateIso(now)
         const createdAt = Number(cs.createdAt) || prev?.createdAt || now
         const updatedAt = Number(cs.updatedAt) || now
         this.db.run(
@@ -2056,10 +2056,12 @@ export class UsageDb {
     const eff = deviceId ? this.resolveDeviceId(deviceId) : viewState.selectedDevice
     if (!viewState.hasCloudData || eff === 'local') return null
 
+    const tzKey = currentTzKey()
     const nowKey = explicitNow ? `exact:${now}` : `bucket:${Math.floor(now / 1000)}`
     if (
       this._cloudOverviewMemo &&
       this._cloudOverviewMemo.seq === this._mutationSeq &&
+      this._cloudOverviewMemo.tzKey === tzKey &&
       this._cloudOverviewMemo.eff === eff &&
       this._cloudOverviewMemo.activeCursorUserId === this._activeCursorUserId &&
       this._cloudOverviewMemo.lastIngested === this._lastIngestedRecords &&
@@ -2069,10 +2071,18 @@ export class UsageDb {
     }
 
     const owners = eff === 'account' ? this.cloudServerSourceOwners() : null
+    // Day and week are local calendar-aligned; month is the latest 30 local
+    // calendar days (including today), matching store.snapshot().
+    const midnight = new Date(now)
+    midnight.setHours(0, 0, 0, 0)
+    const weekStartDate = new Date(midnight)
+    weekStartDate.setDate(weekStartDate.getDate() - ((midnight.getDay() + 6) % 7))
+    const monthStartDate = new Date(midnight)
+    monthStartDate.setDate(monthStartDate.getDate() - 29)
     const ranges = {
-      dayStart: now - 24 * 3600 * 1000,
-      weekStart: now - 7 * 24 * 3600 * 1000,
-      monthStart: now - 30 * 24 * 3600 * 1000,
+      dayStart: midnight.getTime(),
+      weekStart: weekStartDate.getTime(),
+      monthStart: monthStartDate.getTime(),
     }
     const dayScope = this.cloudTotalsSince(ranges.dayStart, eff, owners)
     const weekScope = this.cloudTotalsSince(ranges.weekStart, eff, owners)
@@ -2175,6 +2185,7 @@ export class UsageDb {
     }
     this._cloudOverviewMemo = {
       seq: this._mutationSeq,
+      tzKey,
       eff,
       activeCursorUserId: this._activeCursorUserId,
       lastIngested: this._lastIngestedRecords,
@@ -2328,6 +2339,11 @@ export function floorDayLocal(ts) {
   if (_floorDayCache.size > 50000) _floorDayCache.clear()
   _floorDayCache.set(q, day)
   return day
+}
+
+function localDateIso(ms = Date.now()) {
+  const d = new Date(ms)
+  return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`
 }
 
 function mapProviderRow(r) {

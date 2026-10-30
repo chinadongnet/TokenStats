@@ -518,7 +518,9 @@ export class Store extends EventEmitter {
     const midnight = new Date(now)
     midnight.setHours(0, 0, 0, 0)
     // Week starts Monday (ISO), the common convention in both UI languages.
-    const weekStart = midnight.getTime() - ((midnight.getDay() + 6) % 7) * 86400000
+    const weekStartDate = new Date(midnight)
+    weekStartDate.setDate(weekStartDate.getDate() - ((midnight.getDay() + 6) % 7))
+    const weekStart = weekStartDate.getTime()
     const monthStartDate = new Date(midnight)
     monthStartDate.setDate(monthStartDate.getDate() - 29)
     const monthStart = monthStartDate.getTime()

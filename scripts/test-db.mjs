@@ -823,18 +823,36 @@ try {
     const hourUtc = floorHourLocal(recTs)
     const snapUtc = tzStore.snapshot(nowNoonUtc)
     const subUtc = computeAllSubscriptionStats(tzSub, tzRec, nowNoonUtc)
+    db.saveCloudAccountSync({
+      currentKeyId: 'dev-tz',
+      devices: [{ id: 'dev-tz', name: 'TZ-PC', lastSyncAt: nowNoonUtc, revoked: false, isCurrent: true }],
+      snapshots: [],
+      hours: [{ keyId: 'dev-tz', hour: Math.floor(recTs / 3600000) * 3600000, cli: 'claude', model: 'claude-sonnet-4-6', input: 100, output: 100, total: 200, cost: 1.0, turns: 1 }],
+    })
+    const cloudOvUtc = db.cloudOverview('account', nowNoonUtc)
 
     process.env.TZ = 'Asia/Kolkata'
     const dayIst = floorDayLocal(recTs)
     const hourIst = floorHourLocal(recTs)
     const snapIst = tzStore.snapshot(nowNoonUtc)
     const subIst = computeAllSubscriptionStats(tzSub, tzRec, nowNoonUtc)
+    const cloudOvIst = db.cloudOverview('account', nowNoonUtc)
 
     if (dayUtc === dayIst || hourUtc === hourIst) {
       throw new Error(`Expected floorDayLocal/floorHourLocal to update on TZ change, got day ${dayUtc} vs ${dayIst}, hour ${hourUtc} vs ${hourIst}`)
     }
     if (snapUtc.totals.today.total !== 0 || snapIst.totals.today.total !== 200) {
       throw new Error(`Expected store.snapshot today total to flip from 0 (UTC) to 200 (Asia/Kolkata), got ${snapUtc.totals.today.total} vs ${snapIst.totals.today.total}`)
+    }
+    if (cloudOvUtc.totals.today.total !== 0 || cloudOvIst.totals.today.total !== 200) {
+      throw new Error(`Expected cloudOverview today total to align to local midnight and flip from 0 (UTC) to 200 (Asia/Kolkata), got ${cloudOvUtc.totals.today.total} vs ${cloudOvIst.totals.today.total}`)
+    }
+    if (
+      cloudOvIst.ranges.dayStart !== snapIst.ranges.dayStart ||
+      cloudOvIst.ranges.weekStart !== snapIst.ranges.weekStart ||
+      cloudOvIst.ranges.monthStart !== snapIst.ranges.monthStart
+    ) {
+      throw new Error(`Expected cloudOverview ranges ${JSON.stringify(cloudOvIst.ranges)} to match store.snapshot ranges ${JSON.stringify(snapIst.ranges)}`)
     }
     if ((subUtc[0]?.totalTokens || 0) !== 0 || (subIst[0]?.totalTokens || 0) !== 200) {
       throw new Error(`Expected subscription stats to flip from 0 (UTC) to 200 (Asia/Kolkata), got ${subUtc[0]?.totalTokens} vs ${subIst[0]?.totalTokens}`)
