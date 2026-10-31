@@ -1,5 +1,5 @@
 import React, { useEffect, useState } from 'react'
-import { t, useLang, LANGS } from './i18n.js'
+import { fmtCount, t, useLang, LANGS } from './i18n.js'
 
 // Mirrors paths.js's LITELLM_DEFAULT_COLOR / parsers/litellm.js's DEFAULT_SYNC_MINUTES —
 // the renderer can't import from the main process, so these literals stay in sync by hand.
@@ -69,13 +69,7 @@ const emptySubDraft = () => ({
   resetAnchors: {},
 })
 
-const compact = (n) => {
-  n = Number(n) || 0
-  if (n >= 1e9) return (n / 1e9).toFixed(2) + 'B'
-  if (n >= 1e6) return (n / 1e6).toFixed(2) + 'M'
-  if (n >= 1e3) return (n / 1e3).toFixed(1) + 'K'
-  return String(Math.round(n))
-}
+const compact = (n) => fmtCount(n)
 const usd = (n) => (Number(n) || 0).toFixed(2)
 const shortDate = (ms) => new Date(ms).toLocaleDateString(undefined, { month: 'short', day: 'numeric' })
 

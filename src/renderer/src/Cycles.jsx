@@ -1,11 +1,7 @@
 import React, { useEffect, useRef, useState } from 'react'
-import { t, useLang } from './i18n.js'
+import { fmtCount, t, useLang } from './i18n.js'
 
-const compact = (n) => {
-  n = Number(n) || 0
-  for (const [unit, scale] of [['B', 1e9], ['M', 1e6], ['K', 1e3]]) if (n >= scale) return (n / scale).toFixed(2) + unit
-  return Math.round(n).toLocaleString()
-}
+const compact = (n) => fmtCount(n)
 const money = (n) => '$' + (Number(n) || 0).toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })
 const ratio = (cost, fee) => fee > 0 ? (cost / fee).toFixed(2) + '×' : '—'
 const date = (ms) => {
@@ -176,8 +172,14 @@ export function SubscriptionDashboard({ embedded = false, renderOverviewExtra })
   }
   const plan = data?.plans.find((p) => p.id === selected)
   return <div className={embedded ? 'cycles-view cycles-embedded' : 'report cycles-view'} ref={view}>
-    <header className="cd-header">
-      <div className="rep-title"><span className="logo" /> {t(embedded ? 'rep.tokenPlans' : 'cyc.title')}</div>
+    <header className={'cd-header' + (embedded ? ' cd-header-embedded' : '')}>
+      {embedded ? (
+        <div className="cd-embedded-left">
+          <DeviceSwitchSeg />
+        </div>
+      ) : (
+        <div className="rep-title"><span className="logo" /> {t('cyc.title')}</div>
+      )}
       <div style={{ display: 'flex', alignItems: 'center', gap: 10 }}>
         {!embedded && <DeviceSwitchSeg />}
         <span>{data ? t('cd.updated', { time: new Date(data.asOf).toLocaleTimeString() }) : ''}</span>
