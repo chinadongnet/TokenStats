@@ -1,5 +1,5 @@
 import React, { useEffect, useMemo, useRef, useState } from 'react'
-import { t, useLang } from './i18n.js'
+import { fmtCount, t, useLang } from './i18n.js'
 import { SubscriptionDashboard, DeviceSwitchSeg } from './Cycles.jsx'
 
 // The 5 fixed built-in CLIs. LiteLLM providers are NOT listed here — they're
@@ -21,7 +21,8 @@ const metaFor = (CLI, id) => CLI[id] || FALLBACK_META(id)
 
 const DAY = 86400000
 const floorDay = (ms) => { const d = new Date(ms); d.setHours(0, 0, 0, 0); return d.getTime() }
-const compact = (n) => {
+const compact = (n) => fmtCount(n)
+const compactUsd = (n) => {
   n = Number(n) || 0
   if (n >= 1e9) return (n / 1e9).toFixed(2) + 'B'
   if (n >= 1e6) return (n / 1e6).toFixed(2) + 'M'
@@ -245,7 +246,9 @@ export default function Report() {
     let total = 0, cost = 0, turns = 0
     for (const m of shownModels) { total += m.total; cost += m.cost; turns += m.turns }
     const activeDays = dayData.filter((d) => d.total > 0).length
-    return { total, cost, turns, activeDays }
+    const peakDay = dayData.reduce((best, d) => (d.total > (best?.total || 0) ? d : best), null)
+    const dailyAvg = activeDays > 0 ? total / activeDays : 0
+    return { total, cost, turns, activeDays, peakDay, dailyAvg }
   }, [shownModels, dayData])
 
   const shownProjects = useMemo(() => projects.filter((p) => brands.has(p.cli)), [projects, brands])
@@ -263,7 +266,8 @@ export default function Report() {
     let total = 0, cost = 0, turns = 0
     for (const m of shownDayModels) { total += m.total; cost += m.cost; turns += m.turns }
     const activeHours = hourData.filter((h) => h.total > 0).length
-    return { total, cost, turns, activeHours }
+    const peakHour = hourData.reduce((best, h) => (h.total > (best?.total || 0) ? h : best), null)
+    return { total, cost, turns, activeHours, peakHour }
   }, [shownDayModels, hourData])
 
   async function doExport(mode) {
@@ -277,27 +281,22 @@ export default function Report() {
     } finally { setExporting(false) }
   }
 
+  const scopeBadge = view === 'charts' ? fmtRange(fromMs, toMs) : view === 'subs' ? null : dayLabel(day)
+
   return (
     <div className="report">
       <header className="rep-head">
-        <div className="rep-title"><span className="logo" /> {t('rep.title')}</div>
-        <div className="rep-actions" style={{ flexWrap: 'wrap' }}>
-          <DeviceSwitchSeg />
-          <div className="seg">
-            <button className={view === 'charts' ? 'on' : ''} onClick={() => setView('charts')}>{t('rep.charts')}</button>
-            <button className={view === 'hour' ? 'on' : ''} onClick={() => setView('hour')}>{t('rep.byHour')}</button>
-            {isLocalDeviceView && <button className={view === 'requests' ? 'on' : ''} onClick={() => setView('requests')}>{t('rep.logs')}</button>}
-            <button className={view === 'subs' ? 'on' : ''} onClick={() => setView('subs')}>{t('rep.tokenPlans')}</button>
-          </div>
-          {view === 'charts' && (
-            <div className="seg">
-              {['7d', '30d', 'all'].map((r) => (
-                <button key={r} className={range === r ? 'on' : ''} onClick={() => setRange(r)}>
-                  {r === 'all' ? t('common.all') : t('rep.last', { r })}
-                </button>
-              ))}
-            </div>
-          )}
+        <div className="rep-brand">
+          <div className="rep-title"><span className="logo" /> {t('rep.title')}</div>
+          {scopeBadge && <span className="rep-scope-badge">{scopeBadge}</span>}
+        </div>
+        <nav className="seg rep-view-tabs">
+          <button className={view === 'charts' ? 'on' : ''} onClick={() => setView('charts')}>{t('rep.charts')}</button>
+          <button className={view === 'hour' ? 'on' : ''} onClick={() => setView('hour')}>{t('rep.byHour')}</button>
+          {isLocalDeviceView && <button className={view === 'requests' ? 'on' : ''} onClick={() => setView('requests')}>{t('rep.logs')}</button>}
+          <button className={view === 'subs' ? 'on' : ''} onClick={() => setView('subs')}>{t('rep.tokenPlans')}</button>
+        </nav>
+        <div className="rep-actions">
           <button className="btn" disabled={exporting} onClick={() => doExport('copy')}>
             {copied ? t('rep.copied') : t('rep.copy')}
           </button>
@@ -307,6 +306,48 @@ export default function Report() {
         </div>
       </header>
 
+      {view !== 'subs' && (
+        <div className="rep-toolbar">
+          <div className="rep-toolbar-left">
+            <DeviceSwitchSeg />
+            {(view === 'charts' || view === 'hour') && (
+              <Legend
+                brands={brands}
+                onToggle={toggleBrand}
+                onReset={() => setBrands(new Set(ORDER))}
+                CLI={CLI}
+                ORDER={ORDER}
+              />
+            )}
+            {view === 'requests' && (
+              <select className="sel" value={reqCli} onChange={(e) => setReqCli(e.target.value)}>
+                <option value="all">{t('rep.allProviders')}</option>
+                {ORDER.map((c) => <option key={c} value={c}>{metaFor(CLI, c).label}</option>)}
+              </select>
+            )}
+          </div>
+          <div className="rep-toolbar-right">
+            {view === 'charts' && (
+              <div className="seg">
+                {['7d', '30d', 'all'].map((r) => (
+                  <button key={r} className={range === r ? 'on' : ''} onClick={() => setRange(r)}>
+                    {r === 'all' ? t('common.all') : t('rep.last', { r })}
+                  </button>
+                ))}
+              </div>
+            )}
+            {(view === 'hour' || view === 'requests') && (
+              <div className="daynav">
+                <button className="btn" onClick={() => setDay(day - DAY)}>‹</button>
+                <span className="daynav-cur">{dayLabel(day)}</span>
+                <button className="btn" onClick={() => setDay(today)} disabled={day === today}>{t('common.today')}</button>
+                <button className="btn" onClick={() => setDay(Math.min(today, day + DAY))} disabled={day >= today}>›</button>
+              </div>
+            )}
+          </div>
+        </div>
+      )}
+
       {view === 'subs' && <SubsView CLI={CLI} />}
 
       {view === 'requests' && (
@@ -314,35 +355,44 @@ export default function Report() {
           rows={requests.rows}
           count={requests.count}
           day={day}
-          today={today}
-          setDay={setDay}
-          reqCli={reqCli}
-          setReqCli={setReqCli}
           CLI={CLI}
-          ORDER={ORDER}
         />
       )}
 
       {view === 'hour' && (
       <>
-      <div className="tiles">
-        <Tile label={day === today ? t('rep.todaysTokens') : t('rep.tokens')} value={compact(daySummary.total)} sub={dayLabel(day)} />
-        <Tile label={t('rep.estCost')} value={usd(daySummary.cost)} sub={t('rep.roughEstimate')} accent="#7ee0b8" />
+      <div className="tiles tiles-4">
+        <Tile
+          label={day === today ? t('rep.todaysTokens') : t('rep.tokens')}
+          value={compact(daySummary.total)}
+          title={num(daySummary.total)}
+          sub={dayLabel(day)}
+          primary
+        />
+        <Tile label={t('rep.estCost')} value={'$' + usd(daySummary.cost)} sub={t('rep.roughEstimate')} accent="#7ee0b8" />
         <Tile label={t('rep.turns')} value={daySummary.turns.toLocaleString()} sub={t('rep.modelResponses')} />
         <Tile label={t('rep.activeHours')} value={String(daySummary.activeHours)} sub={t('rep.withUsage')} />
       </div>
 
-      <Legend brands={brands} onToggle={toggleBrand} CLI={CLI} ORDER={ORDER} />
       <section className="card">
         <div className="card-head">
           <h3>{t('rep.byHourTitle', { label: dayLabel(day) })}</h3>
-          <div className="daynav">
-            <button className="btn" onClick={() => setDay(day - DAY)}>‹</button>
-            <button className="btn" onClick={() => setDay(today)} disabled={day === today}>{t('common.today')}</button>
-            <button className="btn" onClick={() => setDay(Math.min(today, day + DAY))} disabled={day >= today}>›</button>
-          </div>
+          {daySummary.peakHour && daySummary.peakHour.total > 0 && (
+            <div className="card-badges">
+              <span className="card-badge">
+                {t('rep.peakHour')} <b>{daySummary.peakHour.label}:00</b> · <b>{compact(daySummary.peakHour.total)}</b>
+              </span>
+            </div>
+          )}
         </div>
-        <StackedBars data={hourData} xLabel={(h) => (h % 3 === 0 ? h + ':00' : '')} height={260} CLI={CLI} ORDER={ORDER} />
+        <StackedBars
+          data={hourData}
+          xLabel={(h) => (h % 3 === 0 ? h + ':00' : '')}
+          tipLabel={(h) => `${h}:00`}
+          height={250}
+          CLI={CLI}
+          ORDER={ORDER}
+        />
       </section>
 
       <Breakdown
@@ -359,8 +409,14 @@ export default function Report() {
 
       {view === 'charts' && (
       <>
-      <div className="tiles">
-        <Tile label={t('rep.tokensRange')} value={compact(summary.total)} sub={fmtRange(fromMs, toMs)} />
+      <div className="tiles tiles-5">
+        <Tile
+          label={t('rep.tokensRange')}
+          value={compact(summary.total)}
+          title={num(summary.total)}
+          sub={fmtRange(fromMs, toMs)}
+          primary
+        />
         <Tile label={t('rep.estCost')} value={'$' + usd(summary.cost)} sub={t('rep.usageWorthEst')} accent="#7ee0b8" />
         <Tile
           label={t('rep.planFees')}
@@ -372,13 +428,26 @@ export default function Report() {
         <Tile label={t('rep.activeDays')} value={String(summary.activeDays)} sub={t('rep.withUsage')} />
       </div>
 
-      <Legend brands={brands} onToggle={toggleBrand} CLI={CLI} ORDER={ORDER} />
-
       <section className="card">
-        <div className="card-head"><h3>{t('rep.dailyTrend', { label: fmtRange(fromMs, toMs) })}</h3></div>
+        <div className="card-head">
+          <h3>{t('rep.dailyTrend', { label: fmtRange(fromMs, toMs) })}</h3>
+          {summary.activeDays > 0 && (
+            <div className="card-badges">
+              <span className="card-badge">
+                {t('rep.dailyAvg')} <b>{compact(summary.dailyAvg)}</b>
+              </span>
+              {summary.peakDay && summary.peakDay.total > 0 && (
+                <span className="card-badge">
+                  {t('rep.peakDay')} <b>{compact(summary.peakDay.total)}</b> ({dayLabel(summary.peakDay.label)})
+                </span>
+              )}
+            </div>
+          )}
+        </div>
         <StackedBars
           data={dayData}
           xLabel={(d, i) => (dayData.length <= 14 || i % Math.ceil(dayData.length / 12) === 0 ? dayLabel(d) : '')}
+          tipLabel={(d) => dayLabel(d)}
           height={210}
           CLI={CLI}
           ORDER={ORDER}
@@ -405,11 +474,11 @@ export default function Report() {
   )
 }
 
-function Tile({ label, value, sub, accent }) {
+function Tile({ label, value, title, sub, accent, primary }) {
   return (
-    <div className="tile">
+    <div className={'tile' + (primary ? ' primary' : '')}>
       <div className="tile-label">{label}</div>
-      <div className="tile-value" style={accent ? { color: accent } : null}>{value}</div>
+      <div className="tile-value" title={title || String(value)} style={accent ? { color: accent } : null}>{value}</div>
       <div className="tile-sub">{sub}</div>
     </div>
   )
@@ -420,7 +489,15 @@ function Tile({ label, value, sub, accent }) {
 // tab — plan fees are monthly, so a per-day plan grouping isn't meaningful.
 function Breakdown({ mode, setMode, models, projects, CLI, label, plans, allowProjects = true }) {
   const maxModel = Math.max(1, ...models.map((m) => m.total))
+  const totalModelTokens = Math.max(1, models.reduce((a, m) => a + m.total, 0))
   const maxProject = Math.max(1, ...projects.map((p) => p.total))
+  const totalProjectTokens = Math.max(1, projects.reduce((a, p) => a + p.total, 0))
+  const countBadge =
+    mode === 'model'
+      ? t('rep.modelsCount', { n: models.length })
+      : mode === 'project'
+        ? t('rep.projectsCount', { n: projects.length })
+        : null
   return (
     <section className="card">
       <div className="card-head">
@@ -429,35 +506,80 @@ function Breakdown({ mode, setMode, models, projects, CLI, label, plans, allowPr
           <button className={mode === 'model' ? 'on' : ''} onClick={() => setMode('model')}>{t('rep.byModel')}</button>
           {allowProjects && <button className={mode === 'project' ? 'on' : ''} onClick={() => setMode('project')}>{t('rep.byProject')}</button>}
         </div>
-        <span className="card-sub">{label}</span>
+        <div className="card-badges">
+          {countBadge && <span className="card-badge">{countBadge}</span>}
+          <span className="card-sub">{label}</span>
+        </div>
       </div>
       {mode === 'plan' && plans ? (
         <PlanBreakdown bd={plans} CLI={CLI} />
       ) : mode !== 'project' ? (
         <div className="models">
-          {models.length === 0 && <div className="empty">{t('rep.noUsageRange')}</div>}
-          {models.map((m) => (
-            <div className="mrow" key={m.cli + m.model}>
-              <span className="dot" style={{ background: metaFor(CLI, m.cli).color }} />
-              <span className="mname" title={m.model}>{m.model}</span>
-              <div className="mtrack"><div className="mfill" style={{ width: (100 * m.total) / maxModel + '%', background: metaFor(CLI, m.cli).color }} /></div>
-              <span className="mtok">{compact(m.total)}</span>
-              <span className="mcost">{usd(m.cost)}</span>
-            </div>
-          ))}
+          {models.length === 0 ? (
+            <div className="empty">{t('rep.noUsageRange')}</div>
+          ) : (
+            <>
+              <div className="mrow mhead">
+                <span />
+                <span>{t('rep.modelCol')}</span>
+                <span>{t('rep.shareCol')}</span>
+                <span className="r">{t('rep.shareCol')}</span>
+                <span className="r">{t('rep.tokensCol')}</span>
+                <span className="r">{t('rep.estCost')}</span>
+              </div>
+              {models.map((m) => {
+                const meta = metaFor(CLI, m.cli)
+                const pct = (100 * m.total) / totalModelTokens
+                return (
+                  <div className="mrow" key={m.cli + m.model}>
+                    <span className="dot" style={{ background: meta.color }} />
+                    <div className="mname-wrap">
+                      <span className="mname" title={m.model}>{m.model}</span>
+                      <span className="mmeta">{meta.label} · {m.turns.toLocaleString()} {t('rep.turns')}</span>
+                    </div>
+                    <div className="mtrack"><div className="mfill" style={{ width: (100 * m.total) / maxModel + '%', background: meta.color }} /></div>
+                    <span className="mpct">{pct >= 10 ? Math.round(pct) : pct.toFixed(1)}%</span>
+                    <span className="mtok" title={num(m.total)}>{compact(m.total)}</span>
+                    <span className="mcost">${usd(m.cost)}</span>
+                  </div>
+                )
+              })}
+            </>
+          )}
         </div>
       ) : (
         <div className="models">
-          {projects.length === 0 && <div className="empty">{t('rep.noUsageRange')}</div>}
-          {projects.slice(0, 15).map((p) => (
-            <div className="mrow" key={p.cli + p.project}>
-              <span className="dot" style={{ background: metaFor(CLI, p.cli).color }} />
-              <span className="mname" title={p.project + ' · ' + metaFor(CLI, p.cli).label + ' · ' + p.turns + ' ' + t('rep.turns')}>{p.project}</span>
-              <div className="mtrack"><div className="mfill" style={{ width: (100 * p.total) / maxProject + '%', background: metaFor(CLI, p.cli).color }} /></div>
-              <span className="mtok">{compact(p.total)}</span>
-              <span className="mcost">{usd(p.cost)}</span>
-            </div>
-          ))}
+          {projects.length === 0 ? (
+            <div className="empty">{t('rep.noUsageRange')}</div>
+          ) : (
+            <>
+              <div className="mrow mhead">
+                <span />
+                <span>{t('rep.projectCol')}</span>
+                <span>{t('rep.shareCol')}</span>
+                <span className="r">{t('rep.shareCol')}</span>
+                <span className="r">{t('rep.tokensCol')}</span>
+                <span className="r">{t('rep.estCost')}</span>
+              </div>
+              {projects.slice(0, 15).map((p) => {
+                const meta = metaFor(CLI, p.cli)
+                const pct = (100 * p.total) / totalProjectTokens
+                return (
+                  <div className="mrow" key={p.cli + p.project}>
+                    <span className="dot" style={{ background: meta.color }} />
+                    <div className="mname-wrap">
+                      <span className="mname" title={p.project}>{p.project}</span>
+                      <span className="mmeta">{meta.label} · {p.turns.toLocaleString()} {t('rep.turns')}</span>
+                    </div>
+                    <div className="mtrack"><div className="mfill" style={{ width: (100 * p.total) / maxProject + '%', background: meta.color }} /></div>
+                    <span className="mpct">{pct >= 10 ? Math.round(pct) : pct.toFixed(1)}%</span>
+                    <span className="mtok" title={num(p.total)}>{compact(p.total)}</span>
+                    <span className="mcost">${usd(p.cost)}</span>
+                  </div>
+                )
+              })}
+            </>
+          )}
         </div>
       )}
     </section>
@@ -483,6 +605,7 @@ function PlanBreakdown({ bd, CLI }) {
         const color = isPlan ? metaFor(CLI, b.bindings?.[0]?.cli).color : '#5b6172'
         const share = Math.round((100 * b.cost) / totalCost)
         const val = isPlan && b.fees > 0 ? Math.round((100 * b.cost) / b.fees) : null
+        const bucketTokens = Math.max(1, b.models.reduce((a, m) => a + m.total, 0))
         return (
           <div className="plan-block" key={b.id || 'unplanned'}>
             <div className="prow">
@@ -492,6 +615,7 @@ function PlanBreakdown({ bd, CLI }) {
                 {isPlan && !b.active && <span className="muted small"> {t('rep.endedTag')}</span>}
               </span>
               <span className="pmeta">
+                <b title={num(b.tokens || 0)}>{compact(b.tokens || 0)}</b> ·{' '}
                 {isPlan && <>{t('rep.fees')} <b>${usd(b.fees)}</b> · </>}
                 {t('rep.worth')} <b className="mcost">${usd(b.cost)}</b>
                 {val != null && <> · {t('rep.value')} <b style={{ color: val >= 100 ? '#7ee0b8' : '#e0c97e' }}>{val}%</b></>}
@@ -504,15 +628,23 @@ function PlanBreakdown({ bd, CLI }) {
             </div>
             <div className="models pmodels">
               {b.models.length === 0 && <div className="empty mini">{t('rep.noUsageRange')}</div>}
-              {b.models.map((m) => (
-                <div className="mrow" key={m.cli + m.model}>
-                  <span className="dot sm" style={{ background: metaFor(CLI, m.cli).color }} />
-                  <span className="mname" title={m.model + ' · ' + metaFor(CLI, m.cli).label + ' · ' + m.turns + ' ' + t('rep.turns')}>{m.model}</span>
-                  <div className="mtrack"><div className="mfill" style={{ width: (100 * m.total) / maxModel + '%', background: metaFor(CLI, m.cli).color }} /></div>
-                  <span className="mtok">{compact(m.total)}</span>
-                  <span className="mcost">{usd(m.cost)}</span>
-                </div>
-              ))}
+              {b.models.map((m) => {
+                const meta = metaFor(CLI, m.cli)
+                const pct = (100 * m.total) / bucketTokens
+                return (
+                  <div className="mrow" key={m.cli + m.model}>
+                    <span className="dot sm" style={{ background: meta.color }} />
+                    <div className="mname-wrap">
+                      <span className="mname" title={m.model}>{m.model}</span>
+                      <span className="mmeta">{meta.label} · {m.turns.toLocaleString()} {t('rep.turns')}</span>
+                    </div>
+                    <div className="mtrack"><div className="mfill" style={{ width: (100 * m.total) / maxModel + '%', background: meta.color }} /></div>
+                    <span className="mpct">{pct >= 10 ? Math.round(pct) : pct.toFixed(1)}%</span>
+                    <span className="mtok" title={num(m.total)}>{compact(m.total)}</span>
+                    <span className="mcost">${usd(m.cost)}</span>
+                  </div>
+                )
+              })}
             </div>
           </div>
         )
@@ -521,9 +653,15 @@ function PlanBreakdown({ bd, CLI }) {
   )
 }
 
-function Legend({ brands, onToggle, CLI, ORDER }) {
+function Legend({ brands, onToggle, onReset, CLI, ORDER }) {
+  const isFiltered = brands.size < ORDER.length
   return (
     <div className="legend">
+      {isFiltered && onReset && (
+        <button type="button" className="leg leg-reset" onClick={onReset}>
+          {t('rep.resetFilter')} ({brands.size}/{ORDER.length})
+        </button>
+      )}
       {ORDER.map((c) => {
         const on = brands.has(c)
         const meta = metaFor(CLI, c)
@@ -783,7 +921,7 @@ function PlanTimeline({ CLI }) {
                         <title>
                           {p.name + '\n' + dayLabel(c.start) + ' – ' + dayLabel(c.end - 1) + '\n' + t('rep.feeWord') + ' $' + usd(c.fee) +
                             ' · ' + t('rep.usageWorthWord') + ' $' + usd(c.cost) + (val != null ? ' (' + val + '%)' : '') +
-                            '\n' + compact(c.tokens) + ' tokens'}
+                            '\n' + compact(c.tokens) + ' ' + t('common.tokens')}
                         </title>
                       </rect>
                       {w > 52 && (
@@ -810,7 +948,7 @@ function PlanTimeline({ CLI }) {
             if (bx + bw < padL || bx > W - padR) return null
             let yCur = yTok(0)
             const total = Object.values(d.perPlan).reduce((a, s) => a + s.tokens, 0)
-            const tip = dayLabel(d.day) + ' — ' + compact(total) + ' tokens\n' +
+            const tip = dayLabel(d.day) + ' — ' + compact(total) + ' ' + t('common.tokens') + '\n' +
               stackOrder.filter((k) => d.perPlan[k]).map((k) => nameOf[k] + ': ' + compact(d.perPlan[k].tokens) + ' ($' + usd(d.perPlan[k].cost) + ')').join('\n')
             return (
               <g key={d.day}>
@@ -841,7 +979,7 @@ function PlanTimeline({ CLI }) {
           <div className="sub-totals" style={{ margin: '10px 0' }}>
             <span>{t('rep.inViewFees')} <b>${usd(inViewFees)}</b></span>
             <span>{t('rep.usageWorthInline')} <b className="mcost">${usd(data.totalCost)}</b></span>
-            <span><b>{compact(plans.reduce((a, p) => a + p.tokens, 0) + (data.unplanned?.tokens || 0))}</b> tokens</span>
+            <span><b>{compact(plans.reduce((a, p) => a + p.tokens, 0) + (data.unplanned?.tokens || 0))}</b> {t('common.tokens')}</span>
           </div>
           <PlanBreakdown bd={data} CLI={CLI} />
         </>
@@ -964,7 +1102,7 @@ function PairedBars({ data, height = 220 }) {
       {ticks.map((t, i) => (
         <g key={i}>
           <line x1={padL} x2={W - padR} y1={y(t)} y2={y(t)} className="grid" />
-          <text x={padL - 8} y={y(t) + 4} className="ytick" textAnchor="end">${compact(t)}</text>
+          <text x={padL - 8} y={y(t) + 4} className="ytick" textAnchor="end">${compactUsd(t)}</text>
         </g>
       ))}
       {data.map((d, i) => {
@@ -989,8 +1127,7 @@ function PairedBars({ data, height = 220 }) {
 }
 
 // Per-request log table for a single local day, optionally filtered by CLI.
-function RequestLog({ rows, count, day, today, setDay, reqCli, setReqCli, CLI, ORDER }) {
-  const DAY = 86400000
+function RequestLog({ rows, count, day, CLI }) {
   const totals = useMemo(() => {
     let total = 0, noCache = 0, cost = 0
     for (const r of rows) { total += r.total; noCache += r.total - r.cacheRead; cost += r.cost }
@@ -998,77 +1135,95 @@ function RequestLog({ rows, count, day, today, setDay, reqCli, setReqCli, CLI, O
   }, [rows])
 
   return (
-    <section className="card">
-      <div className="card-head">
-        <h3>{t('rep.logsTitle', { label: dayLabel(day) })}</h3>
-        <div className="rep-actions">
-          <select className="sel" value={reqCli} onChange={(e) => setReqCli(e.target.value)}>
-            <option value="all">{t('rep.allProviders')}</option>
-            {ORDER.map((c) => <option key={c} value={c}>{metaFor(CLI, c).label}</option>)}
-          </select>
-          <div className="daynav">
-            <button className="btn" onClick={() => setDay(day - DAY)}>‹</button>
-            <button className="btn" onClick={() => setDay(today)} disabled={day === today}>{t('common.today')}</button>
-            <button className="btn" onClick={() => setDay(Math.min(today, day + DAY))} disabled={day >= today}>›</button>
+    <>
+      <div className="tiles tiles-4">
+        <Tile
+          label={t('rep.logsTitle', { label: dayLabel(day) })}
+          value={count.toLocaleString()}
+          sub={count === 1 ? t('rep.request') : t('rep.requestsWord')}
+          primary
+        />
+        <Tile
+          label={t('rep.total')}
+          value={compact(totals.total)}
+          title={num(totals.total)}
+          sub={t('common.tokens')}
+        />
+        <Tile
+          label={t('rep.totalMinusR')}
+          value={compact(totals.noCache)}
+          title={num(totals.noCache)}
+          sub={t('rep.totalMinusRTip')}
+          accent="#e0c97e"
+        />
+        <Tile
+          label={t('rep.estCost')}
+          value={'$' + usd(totals.cost)}
+          sub={t('rep.roughEstimate')}
+          accent="#7ee0b8"
+        />
+      </div>
+
+      <section className="card">
+        <div className="card-head">
+          <h3>{t('rep.logsTitle', { label: dayLabel(day) })}</h3>
+          <div className="reqsum" style={{ margin: 0 }}>
+            {t('rep.requests', { count: count.toLocaleString(), unit: count === 1 ? t('rep.request') : t('rep.requestsWord'), tokens: compact(totals.total), noCache: compact(totals.noCache), cost: '$' + usd(totals.cost) })}
+            {rows.length < count && <span className="reqclip"> {t('rep.showingFirst', { n: rows.length.toLocaleString() })}</span>}
           </div>
         </div>
-      </div>
 
-      <div className="reqsum">
-        {t('rep.requests', { count: count.toLocaleString(), unit: count === 1 ? t('rep.request') : t('rep.requestsWord'), tokens: compact(totals.total), noCache: compact(totals.noCache), cost: usd(totals.cost) })}
-        {rows.length < count && <span className="reqclip"> {t('rep.showingFirst', { n: rows.length.toLocaleString() })}</span>}
-      </div>
-
-      <div className="reqwrap">
-        <table className="reqtable">
-          <thead>
-            <tr>
-              <th>{t('rep.time')}</th>
-              <th>{t('rep.provider')}</th>
-              <th>{t('rep.modelCol')}</th>
-              <th>{t('rep.session')}</th>
-              <th className="r">{t('rep.input')}</th>
-              <th className="r">{t('rep.output')}</th>
-              <th className="r">{t('rep.total')}</th>
-              <th className="r" title={t('rep.totalMinusRTip')}>{t('rep.totalMinusR')}</th>
-              <th className="r">{t('rep.cost')}</th>
-            </tr>
-          </thead>
-          <tbody>
-            {rows.length === 0 && (
-              <tr><td colSpan={9} className="empty">{t('rep.noRequestsDay')}</td></tr>
-            )}
-            {rows.map((r, i) => (
-              <tr key={i}>
-                <td className="mono">{timeLabel(r.ts)}</td>
-                <td><span className="dot" style={{ background: metaFor(CLI, r.cli).color }} /> {metaFor(CLI, r.cli).label}</td>
-                <td className="mono" title={r.model}>{r.model}</td>
-                <td className="sess" title={(r.project || '') + ' · ' + (r.sessionId || '')}>
-                  {r.project || (r.sessionId ? r.sessionId.slice(0, 8) : '—')}
-                </td>
-                <td className="r">
-                  {num(r.input)}
-                  {(r.cacheRead > 0 || r.cacheCreate > 0) && (
-                    <div className="rwsub">R{compact(r.cacheRead)}·W{compact(r.cacheCreate)}</div>
-                  )}
-                </td>
-                <td className="r">{num(r.output)}</td>
-                <td className="r tot">{num(r.total)}</td>
-                <td className="r nocache">{num(r.total - r.cacheRead)}</td>
-                <td className="r cost">{usd4(r.cost)}</td>
+        <div className="reqwrap">
+          <table className="reqtable">
+            <thead>
+              <tr>
+                <th>{t('rep.time')}</th>
+                <th>{t('rep.provider')}</th>
+                <th>{t('rep.modelCol')}</th>
+                <th>{t('rep.session')}</th>
+                <th className="r">{t('rep.input')}</th>
+                <th className="r">{t('rep.output')}</th>
+                <th className="r">{t('rep.total')}</th>
+                <th className="r" title={t('rep.totalMinusRTip')}>{t('rep.totalMinusR')}</th>
+                <th className="r">{t('rep.cost')}</th>
               </tr>
-            ))}
-          </tbody>
-        </table>
-      </div>
-    </section>
+            </thead>
+            <tbody>
+              {rows.length === 0 && (
+                <tr><td colSpan={9} className="empty">{t('rep.noRequestsDay')}</td></tr>
+              )}
+              {rows.map((r, i) => (
+                <tr key={i}>
+                  <td className="mono">{timeLabel(r.ts)}</td>
+                  <td><span className="dot" style={{ background: metaFor(CLI, r.cli).color }} /> {metaFor(CLI, r.cli).label}</td>
+                  <td className="mono" title={r.model}>{r.model}</td>
+                  <td className="sess" title={(r.project || '') + ' · ' + (r.sessionId || '')}>
+                    {r.project || (r.sessionId ? r.sessionId.slice(0, 8) : '—')}
+                  </td>
+                  <td className="r" title={num(r.input)}>
+                    {compact(r.input)}
+                    {(r.cacheRead > 0 || r.cacheCreate > 0) && (
+                      <div className="rwsub">R{compact(r.cacheRead)}·W{compact(r.cacheCreate)}</div>
+                    )}
+                  </td>
+                  <td className="r" title={num(r.output)}>{compact(r.output)}</td>
+                  <td className="r tot" title={num(r.total)}>{compact(r.total)}</td>
+                  <td className="r nocache" title={num(r.total - r.cacheRead)}>{compact(r.total - r.cacheRead)}</td>
+                  <td className="r cost">${usd4(r.cost)}</td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+      </section>
+    </>
   )
 }
 
 // Stacked vertical bar chart (SVG). data: [{label, segs:{cli:val}, total}].
-function StackedBars({ data, xLabel = () => '', height = 210, CLI, ORDER }) {
+function StackedBars({ data, xLabel = () => '', tipLabel = (l) => String(l), height = 210, CLI, ORDER }) {
   const W = 920, H = height
-  const padL = 54, padR = 14, padT = 12, padB = 28
+  const padL = 64, padR = 14, padT = 14, padB = 28
   const innerW = W - padL - padR, innerH = H - padT - padB
   const max = Math.max(1, ...data.map((d) => d.total))
   const ticks = niceTicks(max, 4)
@@ -1089,6 +1244,11 @@ function StackedBars({ data, xLabel = () => '', height = 210, CLI, ORDER }) {
       {data.map((d, i) => {
         const cx = padL + slot * i + slot / 2
         let yCursor = y(0)
+        const activeClis = ORDER.filter((cli) => (d.segs[cli] || 0) > 0)
+        const tip = d.total > 0
+          ? `${tipLabel(d.label, i)} — ${compact(d.total)} (${num(d.total)})\n` +
+            activeClis.map((cli) => `${metaFor(CLI, cli).label}: ${compact(d.segs[cli])}`).join('\n')
+          : null
         return (
           <g key={i}>
             {ORDER.map((cli) => {
@@ -1098,6 +1258,11 @@ function StackedBars({ data, xLabel = () => '', height = 210, CLI, ORDER }) {
               yCursor -= h
               return <rect key={cli} x={cx - bw / 2} y={yCursor} width={bw} height={h} fill={metaFor(CLI, cli).color} rx="1.5" />
             })}
+            {tip && (
+              <rect x={cx - slot / 2} y={padT} width={slot} height={innerH} fill="transparent">
+                <title>{tip}</title>
+              </rect>
+            )}
             <text x={cx} y={H - 9} className="xtick" textAnchor="middle">{xLabel(d.label, i)}</text>
           </g>
         )
