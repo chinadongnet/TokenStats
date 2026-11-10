@@ -448,7 +448,14 @@ export class UsageDb {
     this._mutationSeq = (this._mutationSeq || 0) + 1
     const data = Buffer.from(this.db.export())
     fs.mkdirSync(path.dirname(this.dbPath), { recursive: true })
-    fs.writeFileSync(this.dbPath, data)
+    const tmpPath = `${this.dbPath}.${process.pid}.tmp`
+    fs.writeFileSync(tmpPath, data)
+    try {
+      fs.renameSync(tmpPath, this.dbPath)
+    } catch {
+      fs.writeFileSync(this.dbPath, data)
+      try { fs.unlinkSync(tmpPath) } catch {}
+    }
   }
 
   // ---- LiteLLM provider settings (multi-provider Settings UI) -------------
