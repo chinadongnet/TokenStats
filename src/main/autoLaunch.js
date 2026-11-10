@@ -1,5 +1,7 @@
 import { app } from 'electron'
 import path from 'node:path'
+import fs from 'node:fs'
+import { loadAutoLaunch, saveAutoLaunch } from './core/paths.js'
 
 // Lives outside core/ because it imports electron (see CLAUDE.md Architecture).
 
@@ -7,26 +9,67 @@ const APP_ID = 'com.tokenstats.app'
 // Run value names written by pre-rename builds (4986930 TokenStatus -> TokenStats).
 const LEGACY_RUN_NAMES = ['com.tokenstatus.app']
 
-// The login item's identity. Packaged: the installed exe, no args. Dev: electron
-// plus this project path, so the entry actually launches the app.
+function installedWindowsExe() {
+  if (process.platform !== 'win32') return null
+  const localAppData = process.env.LOCALAPPDATA
+  if (!localAppData) return null
+  const candidate = path.join(localAppData, 'Programs', 'tokenstats', 'TokenStats.exe')
+  return fs.existsSync(candidate) ? candidate : null
+}
+
+// The login item's identity. Packaged: the installed exe, no args. Dev: if the
+// installed Windows exe exists on disk, target it so toggling in dev doesn't
+// repoint autostart at electron.exe; otherwise fall back to electron + project path.
 //
 // get and set MUST agree on this. On Windows getLoginItemSettings matches an
 // existing entry by path+args, while setLoginItemSettings writes/deletes by
 // registry value name — so passing different path/args to the two makes the
 // tray checkbox report a state the app never wrote.
 function loginItemOpts() {
-  return app.isPackaged
-    ? { path: process.execPath, args: [] }
-    : { path: process.execPath, args: [path.resolve(process.argv[1] || '.')] }
+  const installed = installedWindowsExe()
+  if (installed) {
+    return { path: installed, args: [] }
+  }
+  if (app.isPackaged) {
+    return { path: process.execPath, args: [] }
+  }
+  return { path: process.execPath, args: [path.resolve(process.argv[1] || '.')] }
 }
 
 export function isAutoLaunch() {
-  return app.getLoginItemSettings(loginItemOpts()).openAtLogin
+  return Boolean(app.getLoginItemSettings(loginItemOpts()).openAtLogin)
 }
 
-// Toggle "start with Windows" — writes/removes an HKCU\...\Run registry entry.
+// Toggle "start with Windows" — writes/removes an HKCU\...\Run registry entry
+// and persists the user's choice in ~/.tokenstats/config.json.
 export function setAutoLaunch(enabled) {
-  app.setLoginItemSettings({ ...loginItemOpts(), openAtLogin: enabled, name: APP_ID })
+  const on = Boolean(enabled)
+  app.setLoginItemSettings({ ...loginItemOpts(), openAtLogin: on, name: APP_ID })
+  const actual = isAutoLaunch()
+  saveAutoLaunch(actual)
+  return actual
+}
+
+// Reconcile the OS login item with ~/.tokenstats/config.json on startup.
+// If the user has never configured autoLaunch (null in config.json), default to
+// enabled when running the packaged app (or when the installed exe is present)
+// so a tray monitor doesn't silently fail to start after a reboot.
+export function ensureAutoLaunch() {
+  if (!app.isPackaged && !installedWindowsExe()) return
+  try {
+    const saved = loadAutoLaunch()
+    if (typeof saved === 'boolean') {
+      app.setLoginItemSettings({ ...loginItemOpts(), openAtLogin: saved, name: APP_ID })
+      return
+    }
+    if (isAutoLaunch()) {
+      saveAutoLaunch(true)
+      return
+    }
+    setAutoLaunch(true)
+  } catch (e) {
+    console.error('auto-launch init failed:', e)
+  }
 }
 
 // One-time cleanup of the Run value left behind by the TokenStatus -> TokenStats

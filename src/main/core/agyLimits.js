@@ -3,12 +3,50 @@ import fs from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
 
-const REFRESH_MS = 20000
+const REFRESH_MS = 20000 // between successful scrapes
+const RETRY_BASE_MS = 60 * 1000 // exponential backoff base on failure
+const AUTH_BACKOFF_MS = 5 * 60 * 1000 // minimum cooldown when agy enters login flow
+const MAX_BACKOFF_MS = 15 * 60 * 1000 // cap backoff at 15 minutes
+const RUN_TIMEOUT_MS = 30 * 1000 // one scrape; high-latency networks can exceed 15s
 const MAX_AGE_MS = 60000
+
+// When `agy --print /usage` encounters a proxy/network error while verifying
+// stored credentials, agy's internal `waitForAuth` can mistake it for an
+// unauthenticated state ("No valid authentication found (...). Starting login...")
+// and invoke `rundll32 url.dll,FileProtocolHandler https://accounts.google.com/...`
+// to open the system browser.
+// Setting ANTIGRAVITY_VSCODE_HOST=1 (and ANTIGRAVITY_REMOTE_OOB_AUTH=1) instructs
+// agy's auth package to emit `ANTIGRAVITY_OPEN_URL: <url>` to stdout instead of
+// spawning `rundll32` / opening a browser window. We also watch stdout/stderr and
+// immediately kill the process tree if login output is detected.
+const LOGIN_PROMPT_RE = /ANTIGRAVITY_OPEN_URL:|No valid authentication found|Starting login\.\.\.|Enter the authorization code:/i
+
 let latest = null
 let inFlight = null
-let attemptedAt = 0
+let nextAt = 0
+let fails = 0
 let versionChecked = null
+
+function headlessAgyEnv() {
+  return {
+    ...process.env,
+    ANTIGRAVITY_VSCODE_HOST: '1',
+    ANTIGRAVITY_REMOTE_OOB_AUTH: '1',
+  }
+}
+
+function killTree(child) {
+  if (!child) return
+  try {
+    if (process.platform === 'win32' && child.pid) {
+      execFile('taskkill', ['/PID', String(child.pid), '/T', '/F'], { windowsHide: true }, () => {})
+    } else {
+      child.kill('SIGKILL')
+    }
+  } catch {
+    // already exited
+  }
+}
 
 export function supportsAgyQuotaJson(version) {
   const parts = String(version).match(/\b(\d+)\.(\d+)\.(\d+)\b/)
@@ -54,35 +92,103 @@ export function agyLiveWindows() {
 
 export function primeAgyLimits({ force = false } = {}) {
   if (inFlight) return inFlight
-  if (!force && Date.now() - attemptedAt < REFRESH_MS) return Promise.resolve(agyLiveWindows())
-  attemptedAt = Date.now()
+  if (!force && Date.now() < nextAt) return Promise.resolve(agyLiveWindows())
+  nextAt = Date.now() + REFRESH_MS
   const installed = path.join(os.homedir(), 'AppData', 'Local', 'agy', 'bin', 'agy.exe')
   const command = process.platform === 'win32' && fs.existsSync(installed) ? installed : 'agy'
+  const env = headlessAgyEnv()
   // Older releases treated /usage in print mode as an agent prompt. Query
   // only versions verified to support the built-in JSON command.
   if (!versionChecked) versionChecked = new Promise((resolve) => {
-    execFile(command, ['--version'], { windowsHide: true, timeout: 5000, encoding: 'utf8' }, (error, stdout) => {
+    execFile(command, ['--version'], { windowsHide: true, timeout: 5000, encoding: 'utf8', env }, (error, stdout) => {
       resolve(!error && supportsAgyQuotaJson(stdout))
     })
   })
   inFlight = versionChecked.then((supported) => new Promise((resolve) => {
     if (!supported) { resolve(agyLiveWindows()); return }
-    execFile(command, ['--print', '/usage', '--output-format', 'json'], {
-      windowsHide: true, timeout: 15000, maxBuffer: 1024 * 1024, encoding: 'utf8',
-    }, (error, stdout) => {
-      if (!error) {
-        try {
-          const result = JSON.parse(stdout.trim())
-          if (result.status !== 'SUCCESS' || !Array.isArray(result.command?.data?.groups)) throw new Error('Invalid quota response')
-          latest = { at: Date.now(), windows: parseAgyQuota(result) }
-        } catch {
-          console.warn('[agyLimits] invalid /usage JSON; keeping recent quota only')
-        }
-      } else {
-        console.warn('[agyLimits] /usage failed:', error.killed ? 'timeout' : error.code || 'process error')
-      }
+    let settled = false
+    let abortedForAuth = false
+    let streamBuf = ''
+    let timer = null
+    let child = null
+    const recordFailure = (reason, isAuth = false) => {
+      fails += 1
+      const base = isAuth ? AUTH_BACKOFF_MS : RETRY_BASE_MS
+      const delay = Math.min(MAX_BACKOFF_MS, base * Math.pow(2, Math.min(fails - 1, 4)))
+      nextAt = Date.now() + delay
+      console.warn(`[agyLimits] /usage failed (${reason}, ${fails}x); next retry in ${Math.round(delay / 1000)}s`)
+    }
+    const finish = () => {
+      if (settled) return
+      settled = true
+      if (timer) clearTimeout(timer)
       resolve(agyLiveWindows())
-    })
+    }
+    try {
+      child = execFile(command, ['--print', '/usage', '--output-format', 'json'], {
+        windowsHide: true,
+        timeout: RUN_TIMEOUT_MS,
+        maxBuffer: 1024 * 1024,
+        encoding: 'utf8',
+        cwd: os.tmpdir(),
+        env,
+      }, (error, stdout, stderr) => {
+        if (abortedForAuth || settled) {
+          finish()
+          return
+        }
+        const combined = `${stdout || ''}\n${stderr || ''}`
+        if (LOGIN_PROMPT_RE.test(combined)) {
+          killTree(child)
+          recordFailure('auth-login-suppressed', true)
+          finish()
+          return
+        }
+        if (!error) {
+          try {
+            const jsonLine = String(stdout || '')
+              .split(/\r?\n/)
+              .map((l) => l.trim())
+              .find((l) => l.startsWith('{') && l.endsWith('}')) || String(stdout || '').trim()
+            const result = JSON.parse(jsonLine)
+            if (result.status !== 'SUCCESS' || !Array.isArray(result.command?.data?.groups)) {
+              throw new Error('Invalid quota response')
+            }
+            fails = 0
+            latest = { at: Date.now(), windows: parseAgyQuota(result) }
+            nextAt = Date.now() + REFRESH_MS
+          } catch {
+            recordFailure('invalid-json')
+          }
+        } else {
+          if (error.killed) killTree(child)
+          recordFailure(error.killed ? 'timeout' : error.code || 'process-error')
+        }
+        finish()
+      })
+      const inspectChunk = (chunk) => {
+        if (abortedForAuth || settled) return
+        streamBuf = (streamBuf + String(chunk)).slice(-2048)
+        if (LOGIN_PROMPT_RE.test(streamBuf)) {
+          abortedForAuth = true
+          killTree(child)
+          recordFailure('auth-login-suppressed', true)
+          finish()
+        }
+      }
+      child.stdout?.on('data', inspectChunk)
+      child.stderr?.on('data', inspectChunk)
+    } catch {
+      recordFailure('spawn-error')
+      finish()
+      return
+    }
+    timer = setTimeout(() => {
+      if (settled) return
+      killTree(child)
+      recordFailure('timeout')
+      finish()
+    }, RUN_TIMEOUT_MS + 2000)
   })).finally(() => { inFlight = null })
   return inFlight
 }

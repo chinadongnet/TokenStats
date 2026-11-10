@@ -130,6 +130,36 @@ export function saveLanguage(lang) {
   return l
 }
 
+// Auto-launch ("Start at login") preference persisted in config.json so it
+// survives installer upgrades and stays in sync between the tray menu and Settings.
+// Returns true/false when explicitly configured, or null if not set yet.
+export function loadAutoLaunch() {
+  try {
+    const cfg = JSON.parse(fs.readFileSync(CONFIG_FILE, 'utf8'))
+    return typeof cfg.autoLaunch === 'boolean' ? cfg.autoLaunch : null
+  } catch {
+    return null
+  }
+}
+
+export function saveAutoLaunch(enabled) {
+  const on = Boolean(enabled)
+  try {
+    let cfg = {}
+    try {
+      cfg = JSON.parse(fs.readFileSync(CONFIG_FILE, 'utf8'))
+    } catch {
+      // no/invalid file yet — write a fresh one below
+    }
+    cfg.autoLaunch = on
+    fs.mkdirSync(path.dirname(CONFIG_FILE), { recursive: true })
+    fs.writeFileSync(CONFIG_FILE, JSON.stringify(cfg, null, 2))
+  } catch {
+    // best-effort; ignore if the dir isn't writable
+  }
+  return on
+}
+
 // Default color for the LiteLLM Settings UI's "add provider" form and for the
 // one-time config.json migration — the single canonical source other than the
 // (necessarily duplicated) literal copies in App.jsx/Report.jsx/Settings.jsx.

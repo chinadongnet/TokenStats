@@ -123,6 +123,10 @@ export default function Settings() {
   const [expanded, setExpanded] = useState(null) // providerId whose model list is shown
   const [modelsByProvider, setModelsByProvider] = useState({}) // id -> {loading, error, rows}
 
+  // Auto-launch (start at login) state
+  const [autoLaunch, setAutoLaunch] = useState(null) // null = loading; else boolean
+  const [autoLaunchBusy, setAutoLaunchBusy] = useState(false)
+
   // Antigravity (agy) live-quota integration state
   const [agy, setAgy] = useState(null) // null = loading; else getAgyQuotaState()
   const [agyBusy, setAgyBusy] = useState(false)
@@ -152,6 +156,28 @@ export default function Settings() {
   }
   useEffect(() => { loadSubs() }, [])
   useEffect(() => window.api.onReportUpdated(() => loadSubs()), [])
+
+  async function loadAutoLaunch() {
+    if (!window.api.autoLaunchGet) return
+    try {
+      const res = await window.api.autoLaunchGet()
+      setAutoLaunch(!!res?.enabled)
+    } catch {
+      setAutoLaunch(false)
+    }
+  }
+  useEffect(() => { loadAutoLaunch() }, [])
+  useEffect(() => window.api.onReportUpdated(() => loadAutoLaunch()), [])
+
+  async function toggleAutoLaunch(on) {
+    setAutoLaunchBusy(true)
+    try {
+      const res = await window.api.autoLaunchSet(on)
+      setAutoLaunch(!!res?.enabled)
+    } finally {
+      setAutoLaunchBusy(false)
+    }
+  }
 
   useEffect(() => { window.api.agyGetState().then(setAgy) }, [])
   async function toggleAgy(on) {
@@ -452,6 +478,24 @@ export default function Settings() {
           <div className="field grow">
             <label>&nbsp;</label>
             <div className="muted small" style={{ marginTop: 7 }}>{t('set.languageHint')}</div>
+          </div>
+        </div>
+        <div className="field-row" style={{ alignItems: 'center', marginTop: 4 }}>
+          <div className="field shrink" style={{ width: 200 }}>
+            <label>{t('set.autoLaunch')}</label>
+            <label className="check" style={{ marginTop: 7 }}>
+              <input
+                type="checkbox"
+                checked={!!autoLaunch}
+                disabled={autoLaunchBusy || autoLaunch === null}
+                onChange={(e) => toggleAutoLaunch(e.target.checked)}
+              />
+              {t('set.autoLaunchOn')}
+            </label>
+          </div>
+          <div className="field grow">
+            <label>&nbsp;</label>
+            <div className="muted small" style={{ marginTop: 7 }}>{t('set.autoLaunchHint')}</div>
           </div>
         </div>
         <div className="field-row" style={{ alignItems: 'flex-start', marginTop: 4 }}>

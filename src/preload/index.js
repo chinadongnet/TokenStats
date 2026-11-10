@@ -37,6 +37,10 @@ contextBridge.exposeInMainWorld('api', {
     return () => ipcRenderer.removeListener('update:progress', handler)
   },
 
+  // Auto-launch (start at login) toggle
+  autoLaunchGet: () => ipcRenderer.invoke('autolaunch:get'),
+  autoLaunchSet: (on) => ipcRenderer.invoke('autolaunch:set', on),
+
   // Antigravity (agy) live-quota integration toggle
   agyGetState: () => ipcRenderer.invoke('agy:get-state'),
   agySetEnabled: (on) => ipcRenderer.invoke('agy:set-enabled', on),

@@ -12,7 +12,7 @@ import { claudeResetWindows, primeClaudeLimits } from './core/claudeLimits.js'
 import { primeAgyLimits } from './core/agyLimits.js'
 import { computeCycleDashboard, computeAllSubscriptionStats, computePlanBreakdown, computePlanTimeline, computeResetWindows, mergeLiveLimits, planRecordIndex } from './core/subscriptions.js'
 import { migrateLegacyLitellmConfig } from './core/migrateLitellm.js'
-import { isAutoLaunch, setAutoLaunch, migrateLegacyRunKeys } from './autoLaunch.js'
+import { isAutoLaunch, setAutoLaunch, ensureAutoLaunch, migrateLegacyRunKeys } from './autoLaunch.js'
 import { agyResetWindows, getAgyQuotaState, enableAgyQuota, disableAgyQuota, ensureAgyHook, AGY_MIRROR_PATH } from './agyQuota.js'
 import { makeTrayIcon } from './trayIcon.js'
 import { performSync, pullCloudAccount, testCloudSync, normalizeEndpoint, DEFAULT_ENDPOINT } from './core/cloudSync.js'
@@ -103,6 +103,7 @@ async function init() {
   if (process.platform === 'darwin') app.dock?.hide()
   migrateLegacyRunKeys() // one-time: drop the pre-rename com.tokenstatus.app Run value
   ensureConfigFile() // create ~/.tokenstats/config.json template on first run
+  ensureAutoLaunch() // reconcile login item with config.json (defaults to enabled on install)
 
   // UI language: renderer owns the instant switch (localStorage); this persists
   // it for the tray menu and rebroadcasts to every window so all surfaces stay in
@@ -198,6 +199,14 @@ async function init() {
   ipcMain.on('quit-app', () => { app.isQuitting = true; app.quit() })
   ipcMain.on('open-report', () => openReport())
   ipcMain.on('open-settings', () => openSettings())
+
+  // Auto-launch ("Start at login") toggle — shared by the tray menu and Settings.
+  ipcMain.handle('autolaunch:get', () => ({ enabled: isAutoLaunch() }))
+  ipcMain.handle('autolaunch:set', (_e, on) => {
+    const enabled = setAutoLaunch(!!on)
+    notifyReportUpdated()
+    return { enabled }
+  })
 
   // Antigravity (agy) live-quota integration — installs/removes a statusLine
   // hook in agy's own settings (see agyQuota.js). Broadcasting after a change
@@ -1091,7 +1100,15 @@ function createTray() {
       { label: tray_t('refresh'), click: async () => { await store.scanAllLocal(); await store.refreshNetworkParsers({ force: true }); await Promise.all(store.pollers.map((p) => store.forcePoll(p.cli))); ingestNow(); broadcastSnapshot() } },
       { label: tray_t('editSources'), click: () => { ensureConfigFile(); shell.openPath(CONFIG_FILE) } },
       { type: 'separator' },
-      { label: tray_t('startAtLogin'), type: 'checkbox', checked: isAutoLaunch(), click: (item) => setAutoLaunch(item.checked) },
+      {
+        label: tray_t('startAtLogin'),
+        type: 'checkbox',
+        checked: isAutoLaunch(),
+        click: (item) => {
+          setAutoLaunch(item.checked)
+          notifyReportUpdated()
+        },
+      },
       { type: 'separator' },
       { label: tray_t('quit'), click: () => { app.isQuitting = true; app.quit() } },
     ])
