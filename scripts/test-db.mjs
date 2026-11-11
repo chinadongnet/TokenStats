@@ -865,5 +865,27 @@ try {
 
 console.log('multi-device account overview, cross-device LiteLLM dedupe, keyAlias attribution & concurrent sync guard verified')
 
+// Verify hourly-cloud-refresh-v1 upgrades legacy 10m/15m intervals once on existing DBs
+{
+  const migPath = path.join(os.tmpdir(), 'aimon-test-hourly-mig.sqlite')
+  fs.rmSync(migPath, { force: true })
+  try {
+    const legacyDb = await new UsageDb({ dbPath: migPath }).open()
+    legacyDb.saveCloudSync({ endpoint: 'https://token.chinadong.net', apiKey: 'ts_mig', enabled: true, syncMinutes: 10 })
+    const lp = legacyDb.upsertLitellmProvider({ name: 'LegacyProxy', baseUrl: 'https://p.example.com', apiKey: 'k', syncMinutes: 15 })
+    const upgraded = await new UsageDb({ dbPath: migPath }).open()
+    if (upgraded.getCloudSync().syncMinutes !== 60 || upgraded.getLitellmProvider(lp.id).syncMinutes !== 60) {
+      throw new Error(`Expected legacy syncMinutes to upgrade to 60, got cloud=${upgraded.getCloudSync().syncMinutes}, litellm=${upgraded.getLitellmProvider(lp.id).syncMinutes}`)
+    }
+    upgraded.saveCloudSync({ endpoint: 'https://token.chinadong.net', apiKey: 'ts_mig', enabled: true, syncMinutes: 30 })
+    const reopenedCustom = await new UsageDb({ dbPath: migPath }).open()
+    if (reopenedCustom.getCloudSync().syncMinutes !== 30) {
+      throw new Error(`Expected user-customized syncMinutes (30) after migration to be preserved, got ${reopenedCustom.getCloudSync().syncMinutes}`)
+    }
+  } finally {
+    fs.rmSync(migPath, { force: true })
+  }
+}
+
 fs.rmSync(dbPath, { force: true })
 console.log('\nOK (temp db removed)')

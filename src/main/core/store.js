@@ -178,12 +178,12 @@ export class Store extends EventEmitter {
 
   // Runs every poller once and stores its full record set under a synthetic
   // key, the same shape as a file entry so allRecords()/dedupedRecords() pick
-  // it up unchanged. Each poller throttles/caches its own network calls, so
-  // calling this often (e.g. on a timer) is cheap.
-  async pollAll() {
+  // it up unchanged. Pass { force: true } (e.g. on app open / manual refresh)
+  // to bypass each poller's interval throttle.
+  async pollAll({ force = false, slackMs = 0 } = {}) {
     let changed = false
     for (const p of this.pollers) {
-      const records = await p.poll()
+      const records = await (force && p.forceRefresh ? p.forceRefresh() : p.poll({ slackMs }))
       const key = `poller:${p.cli}`
       const prev = this.files.get(key)
       if (!prev || prev.records !== records) changed = true
@@ -681,45 +681,10 @@ export class Store extends EventEmitter {
   // ---- live watching -------------------------------------------------------
 
   async start() {
-    // Local usage must never wait behind Cursor's HTTP export.
+    // Only local files are watched and swept in real time. Network-backed
+    // parsers (Cursor) and remote proxy pollers (LiteLLM) are refreshed by the
+    // main process on app open, once per hour, and on manual refresh.
     await this.scanAllLocal()
-    this.refreshNetworkParsers().then((changed) => {
-      if (changed) this.emit('update', this.snapshot())
-    }).catch((err) => console.warn('network refresh failed:', err.message))
-    this.pollAll().then((changed) => {
-      if (changed) this.emit('update', this.snapshot())
-    }).catch((err) => console.warn('provider refresh failed:', err.message))
-    // Always run the poll-check timer, even if there are zero pollers right
-    // now — LiteLLM providers can be added later via the Settings UI (via
-    // setPollers()), and this timer must already be running for a newly
-    // added provider's configurable sync-minutes interval to actually fire
-    // repeatedly rather than only once (from the save-provider handler's
-    // immediate forcePoll()). Each poller throttles its own network calls to
-    // its configured syncMinutes (see litellm.js); this timer just needs to
-    // fire more often than the shortest configured interval so a fresh fetch
-    // is picked up promptly once it's due.
-    const timer = setInterval(async () => {
-      try {
-        if (await this.pollAll()) this.emit('update', this.snapshot())
-      } catch (err) {
-        console.warn('provider refresh failed:', err.message)
-      }
-    }, 60 * 1000)
-    this._pollTimers.push(timer)
-    // Network requests have their own throttle/backoff and never block local
-    // scans. Token extraction uses bounded reads rather than loading the DB.
-    const netTimer = setInterval(async () => {
-      if (this._refreshingNetwork) return
-      this._refreshingNetwork = true
-      try {
-        if (await this.refreshNetworkParsers()) this.emit('update', this.snapshot())
-      } catch (err) {
-        console.warn('network refresh failed:', err.message)
-      } finally {
-        this._refreshingNetwork = false
-      }
-    }, 10000)
-    this._pollTimers.push(netTimer)
     // Stat-sweep fallback for writers the fs-event path goes deaf on. Codex
     // holds its rollout file open for the whole session and appends without
     // the mtime ever changing: the OS event does fire, but chokidar stats the
@@ -741,7 +706,7 @@ export class Store extends EventEmitter {
     }, SWEEP_MS)
     this._pollTimers.push(sweepTimer)
     const chokidar = (await import('chokidar')).default
-    const roots = [...new Set(PARSERS.flatMap((p) => p.roots))]
+    const roots = [...new Set(PARSERS.filter((p) => !p.network).flatMap((p) => p.roots))]
     for (const root of roots) {
       if (!fs.existsSync(root)) continue
       const watcher = chokidar.watch(root, {

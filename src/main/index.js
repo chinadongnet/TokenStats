@@ -15,7 +15,7 @@ import { migrateLegacyLitellmConfig } from './core/migrateLitellm.js'
 import { isAutoLaunch, setAutoLaunch, ensureAutoLaunch, migrateLegacyRunKeys } from './autoLaunch.js'
 import { agyResetWindows, getAgyQuotaState, enableAgyQuota, disableAgyQuota, ensureAgyHook, AGY_MIRROR_PATH } from './agyQuota.js'
 import { makeTrayIcon } from './trayIcon.js'
-import { performSync, pullCloudAccount, testCloudSync, normalizeEndpoint, DEFAULT_ENDPOINT } from './core/cloudSync.js'
+import { performSync, testCloudSync, normalizeEndpoint, DEFAULT_ENDPOINT } from './core/cloudSync.js'
 import { checkForUpdate, downloadUpdate, launchInstaller, UPDATE_REPO, RELEASES_URL } from './updater.js'
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url))
@@ -155,9 +155,7 @@ async function init() {
   store.on('update', (snap) => {
     lastSnapshot = snap
     if (!scheduleIngest()) {
-      const eff = buildEffectiveSnapshot(snap)
-      if (win && !win.isDestroyed()) win.webContents.send('snapshot', eff)
-      updateTray(eff)
+      sendPopupSnapshot(snap)
     }
   })
 
@@ -175,15 +173,8 @@ async function init() {
   })
   ipcMain.handle('devices:refresh', async () => {
     if (!db) return null
-    if (store) {
-      await store.scanAllLocal()
-      await store.refreshNetworkParsers({ force: true })
-      await Promise.all(store.pollers.map((p) => store.forcePoll(p.cli)))
-    }
-    ingestNow()
-    await runCloudSync().catch(() => {})
-    broadcastSnapshot()
-    broadcastDeviceView()
+    if (store) await store.scanAllLocal()
+    await triggerCloudRefresh({ force: true })
     return db.getDeviceViewState()
   })
   ipcMain.handle('open-data-dir', (_e, cli) => {
@@ -449,7 +440,7 @@ async function init() {
   watchAgyMirror() // pick up quota-only refreshes (agy rewrites the mirror without any new usage)
   refreshLitellmPollers() // populate store.pollers before the initial scan/poll
   await store.start()
-  ingestNow() // first full ingest after the initial scan
+  ingestNow() // first full ingest after the initial local scan
   const migratedAgy = [
     db?.markMigration('agy-output-cost-and-response-id-v1'),
     db?.markMigration('agy-desktop-conversations-v1'),
@@ -459,33 +450,10 @@ async function init() {
     // can lie outside the normal 7-day sync window.
     db.updateCloudSyncState({ fullResync: true })
   }
-  startCloudSyncTimer() // pushes to tokenstat-web when enabled (Settings → 云同步)
-  // Pull multi-device account data immediately on startup if not cached yet,
-  // and run the first full sync pass shortly after startup.
-  if (db && db.getCloudSync().enabled && db.listCloudDevices().length === 0) {
-    pullCloudAccount({ db })
-      .then((r) => {
-        if (r?.ok) {
-          ingestNow()
-          broadcastDeviceView()
-        }
-      })
-      .catch(() => {})
-  }
-  setTimeout(() => runCloudSync(), 5000)
-  // Prime Claude's live plan-quota (spawns `claude -p /usage` once) so the
-  // popup's Quota-windows section can show it without waiting for the first
-  // 15-min refresh. Fire-and-forget; a snapshot after it lands shows the data.
-  primeClaudeLimits()
-    .then(() => {
-      const snap = currentBaseSnapshot()
-      if (win && !win.isDestroyed() && snap) {
-        win.webContents.send('snapshot', buildEffectiveSnapshot(snap))
-      }
-    })
-    .catch(() => {})
-  refreshAgyLimits()
-  setInterval(() => refreshAgyLimits(), 20000)
+  startCloudRefreshTimer() // hourly cloud/network refresh when idle
+  // Run one initial cloud refresh on startup; afterwards cloud/network sources
+  // refresh only once per hour, when opening an app window, or on manual refresh.
+  triggerCloudRefresh({ force: true })
   setInterval(() => {
     const todayStart = floorDayLocal(Date.now())
     if (todayStart !== lastDayStart) {
@@ -499,14 +467,28 @@ async function init() {
   if ('AIMON_SET_AUTOLAUNCH' in process.env) setAutoLaunch(process.env.AIMON_SET_AUTOLAUNCH === '1') // headless toggle
 }
 
-function refreshAgyLimits(force = false) {
-  if (!getAgyQuotaState().enabled) return
-  primeAgyLimits({ force })
+function sendPopupSnapshot(snap = currentBaseSnapshot()) {
+  if (!snap) return
+  const eff = buildEffectiveSnapshot(snap)
+  if (win && !win.isDestroyed() && win.isVisible()) {
+    win.webContents.send('snapshot', eff)
+  }
+  updateTray(eff)
+}
+
+function refreshClaudeLimits(force = false) {
+  return primeClaudeLimits({ force })
     .then(() => {
-      const snap = currentBaseSnapshot()
-      if (win && !win.isDestroyed() && snap) {
-        win.webContents.send('snapshot', buildEffectiveSnapshot(snap))
-      }
+      sendPopupSnapshot()
+    })
+    .catch(() => {})
+}
+
+function refreshAgyLimits(force = false) {
+  if (!getAgyQuotaState().enabled) return Promise.resolve()
+  return primeAgyLimits({ force })
+    .then(() => {
+      sendPopupSnapshot()
     })
     .catch(() => {})
 }
@@ -584,14 +566,86 @@ function runCloudSync(opts = {}) {
   return cloudSyncInFlight
 }
 
-// Check once a minute whether the configured interval elapsed — same pattern
-// as the store's poll-check timer: the timer is cheap, the network is gated.
-function startCloudSyncTimer() {
-  setInterval(() => {
+const HOURLY_CLOUD_REFRESH_MS = 60 * 60 * 1000
+const OPEN_REFRESH_COOLDOWN_MS = 30 * 1000
+let cloudRefreshInFlight = null
+let lastFullCloudRefreshAt = 0
+
+// Unified coordinator for all cloud/network-backed refreshes (Cursor cloud CSV
+// & quota, LiteLLM proxy pollers, Claude/AGY live quota CLIs, and tokenstat-web
+// cloud sync). Triggered on startup, once per hour, when opening an app window,
+// and on explicit manual refresh — never on background local file writes.
+function triggerCloudRefresh({ force = false, respectIntervals = false } = {}) {
+  if (cloudRefreshInFlight) return cloudRefreshInFlight
+  const now = Date.now()
+  if (!force && now - lastFullCloudRefreshAt < OPEN_REFRESH_COOLDOWN_MS) {
+    return Promise.resolve({ ok: true, skipped: true })
+  }
+  lastFullCloudRefreshAt = now
+  cloudRefreshInFlight = (async () => {
+    try {
+      const claudeTask = refreshClaudeLimits(true)
+      const agyTask = refreshAgyLimits(true)
+      if (store) {
+        const [netChanged, pollChanged] = await Promise.all([
+          store.refreshNetworkParsers({ force: true }).catch((err) => {
+            console.warn('network parser refresh failed:', err?.message || err)
+            return false
+          }),
+          (respectIntervals ? store.pollAll({ slackMs: 5000 }) : store.pollAll({ force: true })).catch((err) => {
+            console.warn('poller refresh failed:', err?.message || err)
+            return false
+          }),
+        ])
+        if (netChanged || pollChanged) {
+          ingestNow()
+        }
+      }
+      // Give live quota CLIs a short window to settle before pushing status to
+      // cloud sync, without stalling sync if an external CLI is slow or absent.
+      await Promise.race([
+        Promise.allSettled([claudeTask, agyTask]),
+        new Promise((r) => setTimeout(r, 6000)),
+      ])
+      ingestNow()
+      if (db) {
+        const cfg = db.getCloudSync()
+        const syncDue =
+          !respectIntervals ||
+          Date.now() >= cloudSyncLastAttempt + Math.max(1, cfg.syncMinutes) * 60000 - 5000
+        if (cfg.enabled && cfg.apiKey && cfg.endpoint && syncDue) {
+          await runCloudSync().catch(() => {})
+        }
+      }
+      broadcastDeviceView()
+      return { ok: true }
+    } finally {
+      cloudRefreshInFlight = null
+    }
+  })()
+  return cloudRefreshInFlight
+}
+
+// Check once a minute whether the hourly cloud refresh (or a user-configured
+// custom syncMinutes interval) has elapsed. Zero network traffic when idle.
+function startCloudRefreshTimer() {
+  setInterval(async () => {
+    const now = Date.now()
+    if (now - lastFullCloudRefreshAt >= HOURLY_CLOUD_REFRESH_MS) {
+      await triggerCloudRefresh({ force: true, respectIntervals: true })
+      return
+    }
+    if (store && store.pollers.length > 0) {
+      try {
+        if (await store.pollAll({ slackMs: 5000 })) ingestNow()
+      } catch (err) {
+        console.warn('poller check failed:', err?.message || err)
+      }
+    }
     if (!db) return
     const cfg = db.getCloudSync()
     if (!cfg.enabled || !cfg.apiKey || !cfg.endpoint) return
-    const due = cloudSyncLastAttempt + Math.max(1, cfg.syncMinutes) * 60000
+    const due = cloudSyncLastAttempt + Math.max(1, cfg.syncMinutes) * 60000 - 5000
     if (Date.now() >= due) runCloudSync()
   }, 60000)
 }
@@ -617,13 +671,10 @@ function ingestNow() {
     db.ingest(store.dedupedRecords())
     const snap = currentBaseSnapshot()
     if (snap) {
-      const eff = buildEffectiveSnapshot(snap)
-      if (win && !win.isDestroyed()) win.webContents.send('snapshot', eff)
-      updateTray(eff)
+      sendPopupSnapshot(snap)
       sent = true
     }
     notifyReportUpdated()
-    scheduleCloudSync()
   } catch (e) {
     console.error('ingest failed:', e)
   }
@@ -668,8 +719,7 @@ function refreshLitellmPollers() {
 function watchAgyMirror() {
   fs.watchFile(AGY_MIRROR_PATH, { interval: 20000 }, (cur, prev) => {
     if (cur.mtimeMs === prev.mtimeMs) return
-    const snap = currentBaseSnapshot()
-    if (win && !win.isDestroyed() && snap) win.webContents.send('snapshot', buildEffectiveSnapshot(snap))
+    sendPopupSnapshot()
   })
 }
 
@@ -857,14 +907,9 @@ function computeResetsForView(deviceId = null) {
 function broadcastDeviceView() {
   const state = db ? db.getDeviceViewState() : null
   for (const w of BrowserWindow.getAllWindows()) {
-    if (!w.isDestroyed()) w.webContents.send('device-view', state)
+    if (!w.isDestroyed() && (w !== win || w.isVisible())) w.webContents.send('device-view', state)
   }
-  const snap = currentBaseSnapshot()
-  if (snap) {
-    const eff = buildEffectiveSnapshot(snap)
-    if (win && !win.isDestroyed()) win.webContents.send('snapshot', eff)
-    updateTray(eff)
-  }
+  sendPopupSnapshot()
   notifyReportUpdated()
 }
 
@@ -875,9 +920,7 @@ function broadcastSnapshot() {
   if (!store) return
   const s = currentBaseSnapshot()
   if (!scheduleIngest()) {
-    const eff = buildEffectiveSnapshot(s)
-    if (win && !win.isDestroyed()) win.webContents.send('snapshot', eff)
-    updateTray(eff)
+    sendPopupSnapshot(s)
   }
 }
 
@@ -919,11 +962,14 @@ function createWindow() {
 
 function openReport() {
   if (reportWin && !reportWin.isDestroyed()) {
+    const wasVisible = reportWin.isVisible() && !reportWin.isMinimized()
     if (!ingestNow()) notifyReportUpdated()
     reportWin.show()
     reportWin.focus()
+    if (!wasVisible) triggerCloudRefresh()
     return
   }
+  triggerCloudRefresh()
   reportWin = new BrowserWindow({
     width: 940,
     height: 760,
@@ -956,10 +1002,13 @@ function openReport() {
 
 function openSettings() {
   if (settingsWin && !settingsWin.isDestroyed()) {
+    const wasVisible = settingsWin.isVisible() && !settingsWin.isMinimized()
     settingsWin.show()
     settingsWin.focus()
+    if (!wasVisible) triggerCloudRefresh()
     return
   }
+  triggerCloudRefresh()
   settingsWin = new BrowserWindow({
     width: 720,
     height: 720,
@@ -988,11 +1037,14 @@ function openSettings() {
 
 function openCycles() {
   if (cyclesWin && !cyclesWin.isDestroyed()) {
+    const wasVisible = cyclesWin.isVisible() && !cyclesWin.isMinimized()
     if (!ingestNow()) notifyReportUpdated()
     cyclesWin.show()
     cyclesWin.focus()
+    if (!wasVisible) triggerCloudRefresh()
     return
   }
+  triggerCloudRefresh()
   cyclesWin = new BrowserWindow({
     width: 1180,
     height: 820,
@@ -1097,7 +1149,13 @@ function createTray() {
       { label: tray_t('cycles'), click: () => openCycles() },
       { label: tray_t('settings'), click: () => openSettings() },
       { type: 'separator' },
-      { label: tray_t('refresh'), click: async () => { await store.scanAllLocal(); await store.refreshNetworkParsers({ force: true }); await Promise.all(store.pollers.map((p) => store.forcePoll(p.cli))); ingestNow(); broadcastSnapshot() } },
+      {
+        label: tray_t('refresh'),
+        click: async () => {
+          if (store) await store.scanAllLocal()
+          await triggerCloudRefresh({ force: true })
+        },
+      },
       { label: tray_t('editSources'), click: () => { ensureConfigFile(); shell.openPath(CONFIG_FILE) } },
       { type: 'separator' },
       {
@@ -1134,6 +1192,7 @@ function toggleWindow() {
 }
 
 function showWindow() {
+  const wasVisible = !!(win && !win.isDestroyed() && win.isVisible())
   const snap = currentBaseSnapshot()
   if (snap) {
     const eff = buildEffectiveSnapshot(snap)
@@ -1144,6 +1203,7 @@ function showWindow() {
   positionWindow()
   win.show()
   win.focus()
+  if (!wasVisible) triggerCloudRefresh()
 }
 
 // Re-assert the fixed content size, but cap the height to the current display's
