@@ -4,7 +4,7 @@ import { fmtCount, t, useLang, LANGS } from './i18n.js'
 // Mirrors paths.js's LITELLM_DEFAULT_COLOR / parsers/litellm.js's DEFAULT_SYNC_MINUTES —
 // the renderer can't import from the main process, so these literals stay in sync by hand.
 const DEFAULT_COLOR = '#f59e0b'
-const DEFAULT_SYNC_MINUTES = 15
+const DEFAULT_SYNC_MINUTES = 60
 
 // The 5 fixed built-in CLIs a subscription can bind to (mirrors Report.jsx's FIXED_CLI).
 const FIXED_SOURCES = [
@@ -453,7 +453,7 @@ export default function Settings() {
     if (!agy.enabled) return t('set.agyQuotaHint')
     if (agy.mirrorAgeMs == null) return t('set.agyEnabledWaiting')
     const mins = Math.max(0, Math.round(agy.mirrorAgeMs / 60000))
-    return t(agy.mirrorAgeMs > 60000 ? 'set.agyEnabledStale' : 'set.agyEnabledFresh', { mins })
+    return t(agy.mirrorAgeMs > 2 * 3600000 ? 'set.agyEnabledStale' : 'set.agyEnabledFresh', { mins })
   })()
   const agyDisabled = agyBusy || !agy || !agy.agyFound || (agy.foreign && !agy.enabled)
 
@@ -704,7 +704,7 @@ function CloudSyncCard() {
       enabled: !!c?.enabled,
       endpoint: c?.endpoint || c?.defaultEndpoint || '',
       apiKey: c?.apiKey || '',
-      syncMinutes: c?.syncMinutes || 10,
+      syncMinutes: c?.syncMinutes || 60,
     })
   }
   useEffect(() => { load() }, [])
@@ -731,7 +731,7 @@ function CloudSyncCard() {
         enabled: draft.enabled,
         endpoint: draft.endpoint.trim(),
         apiKey: draft.apiKey.trim(),
-        syncMinutes: Number(draft.syncMinutes) || 10,
+        syncMinutes: Number(draft.syncMinutes) || 60,
       })
       setCfg((c) => ({ ...c, ...saved }))
       setDirty(false)

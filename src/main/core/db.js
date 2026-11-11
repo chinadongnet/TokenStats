@@ -55,7 +55,7 @@ CREATE TABLE IF NOT EXISTS litellm_providers (
   base_url     TEXT    NOT NULL,
   api_key      TEXT    NOT NULL,
   color        TEXT    NOT NULL DEFAULT '#f59e0b',
-  sync_minutes INTEGER NOT NULL DEFAULT 15,
+  sync_minutes INTEGER NOT NULL DEFAULT 60,
   enabled      INTEGER NOT NULL DEFAULT 1,
   created_at   INTEGER NOT NULL,
   updated_at   INTEGER NOT NULL
@@ -113,7 +113,7 @@ CREATE TABLE IF NOT EXISTS cloud_sync (
   endpoint     TEXT    NOT NULL DEFAULT '',
   api_key      TEXT    NOT NULL DEFAULT '',
   enabled      INTEGER NOT NULL DEFAULT 0,
-  sync_minutes INTEGER NOT NULL DEFAULT 10,
+  sync_minutes INTEGER NOT NULL DEFAULT 60,
   full_resync  INTEGER NOT NULL DEFAULT 1,  -- next sync pushes ALL hours (set on config change)
   last_sync_at INTEGER,
   last_error   TEXT,
@@ -244,6 +244,11 @@ export class UsageDb {
     this.db.run(SCHEMA)
     migrateSchema(this.db)
     if (bytes) {
+      if (!this.hasMigration('hourly-cloud-refresh-v1')) {
+        this.db.run('UPDATE cloud_sync SET sync_minutes = 60 WHERE sync_minutes < 60')
+        this.db.run('UPDATE litellm_providers SET sync_minutes = 60 WHERE sync_minutes < 60')
+        this.markMigration('hourly-cloud-refresh-v1')
+      }
       const hasStaleRootRows =
         this.rows("SELECT 1 FROM usage_root_hourly WHERE cli != 'agy' AND root NOT LIKE 'alias:%' LIMIT 1").length > 0
       if (hasStaleRootRows) {
@@ -486,7 +491,7 @@ export class UsageDb {
       baseUrl,
       apiKey,
       color: color || '#f59e0b',
-      syncMinutes: Number(syncMinutes) > 0 ? Number(syncMinutes) : 15,
+      syncMinutes: Number(syncMinutes) > 0 ? Number(syncMinutes) : 60,
       enabled: enabled !== false ? 1 : 0,
     }
     if (existing) {
@@ -618,7 +623,7 @@ export class UsageDb {
       endpoint: r.endpoint || '',
       apiKey: r.api_key || '',
       enabled: !!r.enabled,
-      syncMinutes: r.sync_minutes > 0 ? r.sync_minutes : 10,
+      syncMinutes: r.sync_minutes > 0 ? r.sync_minutes : 60,
       fullResync: !!r.full_resync,
       lastSyncAt: r.last_sync_at ?? null,
       lastError: r.last_error || null,
@@ -646,12 +651,12 @@ export class UsageDb {
         this.db.run('DELETE FROM cloud_usage_hourly')
         this.db.run(
           "UPDATE cloud_sync SET endpoint=?, api_key=?, enabled=?, sync_minutes=?, full_resync=1, last_sync_at=NULL, last_error=NULL, subs_base_hash=NULL, subs_conflict_json=NULL, selected_device='account' WHERE id=1",
-          [nextEndpoint, nextApiKey, enabled ? 1 : 0, Number(syncMinutes) > 0 ? Number(syncMinutes) : 10]
+          [nextEndpoint, nextApiKey, enabled ? 1 : 0, Number(syncMinutes) > 0 ? Number(syncMinutes) : 60]
         )
       } else {
         this.db.run(
           'UPDATE cloud_sync SET endpoint=?, api_key=?, enabled=?, sync_minutes=?, full_resync=1, last_error=NULL WHERE id=1',
-          [nextEndpoint, nextApiKey, enabled ? 1 : 0, Number(syncMinutes) > 0 ? Number(syncMinutes) : 10]
+          [nextEndpoint, nextApiKey, enabled ? 1 : 0, Number(syncMinutes) > 0 ? Number(syncMinutes) : 60]
         )
       }
       this.db.run('COMMIT')

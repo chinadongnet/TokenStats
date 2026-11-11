@@ -31,7 +31,7 @@
 
 const LOOKBACK_DAYS = 35
 const MAX_PAGES = 40
-export const DEFAULT_SYNC_MINUTES = 15 // matches the old hardcoded MIN_FETCH_INTERVAL_MS
+export const DEFAULT_SYNC_MINUTES = 60
 
 function isoDate(d) {
   return d.toISOString().slice(0, 10)
@@ -215,6 +215,7 @@ export function createLitellmPoller({
   // synthetic (noon UTC of the usage day — the API has no per-request times),
   // so the store's "live" indicator uses this real sync time instead.
   let lastChange = null
+  let inFlight = null
 
   function reapply() {
     cache.applied = applyModelSettings(cache.raw, getModelSettings ? getModelSettings() : null)
@@ -222,49 +223,62 @@ export function createLitellmPoller({
   }
 
   async function refreshRaw() {
+    if (inFlight) return inFlight
     cache.fetchedAt = Date.now() // set before awaiting so overlapping triggers don't pile up calls
-    try {
-      const { dayResults, startDate } = await fetchRawRecords(baseUrl, apiKey)
-      const fetched = flatten(dayResults, id)
-      if (cache.hasBaseline) {
-        // Which bucket grew? Prefer the newest usage day, then the biggest jump.
-        const prevTotals = new Map(cache.raw.map((r) => [r.dedupKey, r.total]))
-        let best = null
-        for (const r of fetched) {
-          const delta = r.total - (prevTotals.get(r.dedupKey) || 0)
-          if (delta <= 0) continue
-          if (!best || r.ts > best.ts || (r.ts === best.ts && delta > best.delta)) best = { ...r, delta }
+    inFlight = (async () => {
+      try {
+        const { dayResults, startDate } = await fetchRawRecords(baseUrl, apiKey)
+        const fetched = flatten(dayResults, id)
+        if (cache.hasBaseline) {
+          // Which bucket grew? Prefer the newest usage day, then the biggest jump.
+          const prevTotals = new Map(cache.raw.map((r) => [r.dedupKey, r.total]))
+          let best = null
+          for (const r of fetched) {
+            const delta = r.total - (prevTotals.get(r.dedupKey) || 0)
+            if (delta <= 0) continue
+            if (!best || r.ts > best.ts || (r.ts === best.ts && delta > best.delta)) best = { ...r, delta }
+          }
+          if (best) lastChange = { ts: Date.now(), model: best.model, project: best.project }
         }
-        if (best) lastChange = { ts: Date.now(), model: best.model, project: best.project }
-      }
-      // The fetch is authoritative for its own window and nothing else: days
-      // before it are kept from the archive (that's the only place they exist),
-      // days inside it are replaced wholesale so a bucket deleted server-side
-      // disappears here too instead of being frozen forever.
-      const archived = cache.raw.filter((r) => new Date(r.ts).toISOString().slice(0, 10) < startDate)
-      cache.raw = [...archived, ...fetched]
-      cache.hasBaseline = true // the first fetch only sets the comparison baseline
-      if (saveArchive) {
-        try {
-          saveArchive(fetched.map(bucketFromRecord), startDate)
-        } catch {
-          // persistence is best-effort; the in-memory set is still correct
+        // The fetch is authoritative for its own window and nothing else: days
+        // before it are kept from the archive (that's the only place they exist),
+        // days inside it are replaced wholesale so a bucket deleted server-side
+        // disappears here too instead of being frozen forever.
+        const archived = cache.raw.filter((r) => new Date(r.ts).toISOString().slice(0, 10) < startDate)
+        cache.raw = [...archived, ...fetched]
+        cache.hasBaseline = true // the first fetch only sets the comparison baseline
+        if (saveArchive) {
+          try {
+            saveArchive(fetched.map(bucketFromRecord), startDate)
+          } catch {
+            // persistence is best-effort; the in-memory set is still correct
+          }
         }
+      } catch {
+        // undocumented internal admin API: keep the previous cache on error
       }
-    } catch {
-      // undocumented internal admin API: keep the previous cache on error
-    }
-    reapply()
+      reapply()
+    })().finally(() => { inFlight = null })
+    return inFlight
   }
 
-  async function poll() {
-    if (Date.now() - cache.fetchedAt >= intervalMs) await refreshRaw()
+  async function poll({ slackMs = 0 } = {}) {
+    if (inFlight) {
+      await inFlight
+      return cache.applied
+    }
+    if (cache.fetchedAt === 0 || Date.now() - cache.fetchedAt + slackMs >= intervalMs) await refreshRaw()
     return cache.applied
   }
 
   async function forceRefresh() {
+    if (inFlight) {
+      await inFlight
+      return cache.applied
+    }
     cache.fetchedAt = 0
-    return poll()
+    await refreshRaw()
+    return cache.applied
   }
 
   // Re-applies live visibility/rename settings against the already-cached raw
