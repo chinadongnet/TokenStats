@@ -637,8 +637,21 @@ function runCloudSync(opts = {}) {
 
 const HOURLY_CLOUD_REFRESH_MS = 60 * 60 * 1000
 const OPEN_REFRESH_COOLDOWN_MS = 30 * 1000
+const POLLER_REFRESH_TIMEOUT_MS = 45 * 1000
 let cloudRefreshInFlight = null
 let lastFullCloudRefreshAt = 0
+
+function withTimeout(promise, ms, label) {
+  let timer = null
+  return Promise.race([
+    promise,
+    new Promise((_, reject) => {
+      timer = setTimeout(() => reject(new Error(`${label} timed out after ${ms}ms`)), ms)
+    }),
+  ]).finally(() => {
+    if (timer) clearTimeout(timer)
+  })
+}
 
 // Unified coordinator for all cloud/network-backed refreshes (Cursor cloud CSV
 // & quota, LiteLLM proxy pollers, Claude/AGY live quota CLIs, and tokenstat-web
@@ -661,7 +674,11 @@ function triggerCloudRefresh({ force = false, respectIntervals = false } = {}) {
             console.warn('network parser refresh failed:', err?.message || err)
             return false
           }),
-          (respectIntervals ? store.pollAll({ slackMs: 5000 }) : store.pollAll({ force: true })).catch((err) => {
+          withTimeout(
+            respectIntervals ? store.pollAll({ slackMs: 5000 }) : store.pollAll({ force: true }),
+            POLLER_REFRESH_TIMEOUT_MS,
+            'poller refresh'
+          ).catch((err) => {
             console.warn('poller refresh failed:', err?.message || err)
             return false
           }),

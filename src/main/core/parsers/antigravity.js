@@ -131,7 +131,7 @@ function modelStepTimes(db) {
     stmt = db.prepare('SELECT step_type, metadata FROM steps ORDER BY idx')
     while (stmt.step()) {
       const [type, blob] = stmt.get()
-      if (!blob) {
+      if (!(blob instanceof Uint8Array)) {
         if (type === 15) byIndex.push(null)
         continue
       }
@@ -157,7 +157,7 @@ function workspaceOf(db) {
     stmt = db.prepare('SELECT data FROM trajectory_metadata_blob LIMIT 1')
     if (!stmt.step()) return null
     const [blob] = stmt.get()
-    if (!blob) return null
+    if (!(blob instanceof Uint8Array)) return null
     const m = Buffer.from(blob.buffer, blob.byteOffset, blob.byteLength)
       .toString('utf8')
       .match(/file:\/\/\/([A-Za-z0-9._~:/%@&+=,;!$'()*-]+)/)
@@ -208,7 +208,7 @@ export const antigravity = {
         stmt = db.prepare('SELECT idx, data FROM gen_metadata ORDER BY idx')
         while (stmt.step()) {
           const [idx, blob] = stmt.get()
-          if (!blob) continue
+          if (!(blob instanceof Uint8Array)) continue
           const top = decodeProto(Buffer.from(blob.buffer, blob.byteOffset, blob.byteLength))
           const gen = top && sub(top, 1)
           const usage = gen && sub(gen, 4)

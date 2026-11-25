@@ -312,6 +312,8 @@ export class UsageDb {
     const nextDb = bytes ? new this.SQL.Database(bytes) : new this.SQL.Database()
     this._mutationSeq = (this._mutationSeq || 0) + 1
     this._lastIngestMutationSeq = -1
+    this._lastIngestedInputRef = null
+    this._lastRootBucketsSig = null
     this._attachDb(nextDb)
     this.db.run(SCHEMA)
     migrateSchema(this.db)
@@ -427,6 +429,11 @@ export class UsageDb {
         this._lastCompactAt = Date.now()
         this.persist()
       }
+    } else if (!this.hasMigration('hourly-cloud-refresh-v1')) {
+      // Fresh DB: mark the legacy-interval migration as applied in-memory (no
+      // eager disk write) so custom <60m intervals configured on a new install
+      // are never overwritten to 60 on the next launch.
+      this.db.run('INSERT OR IGNORE INTO applied_migrations (name) VALUES (?)', ['hourly-cloud-refresh-v1'])
     }
     return this
   }
@@ -443,6 +450,7 @@ export class UsageDb {
       this._lastIngestMutationSeq === this._mutationSeq &&
       this._lastIngestTzKey === tzKey
     ) {
+      if (persist && this._dirty) this.flushPersist()
       return this._lastIngestBucketCount || 0
     }
     this._lastIngestedInputRef = Array.isArray(records) ? records : null
@@ -570,6 +578,7 @@ export class UsageDb {
       this._lastRootBucketsSig === rootBucketsSig &&
       this._lastIngestCurDevId === (curDev?.id || null)
     ) {
+      if (persist && this._dirty) this.flushPersist()
       this._lastIngestBucketCount = buckets.size
       return buckets.size
     }

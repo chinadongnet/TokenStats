@@ -31,6 +31,8 @@
 
 const LOOKBACK_DAYS = 35
 const MAX_PAGES = 40
+const PAGE_TIMEOUT_MS = 15000
+const FETCH_TOTAL_TIMEOUT_MS = 45000
 export const DEFAULT_SYNC_MINUTES = 60
 
 function isoDate(d) {
@@ -41,11 +43,35 @@ function localIsoDate(d) {
   return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`
 }
 
-async function fetchPage(baseUrl, apiKey, startDate, endDate, page) {
+// Wrap both fetch() and res.json() in an explicit timer race so a stalled
+// proxy response stream cannot wedge the shared cloud refresh coordinator.
+async function fetchPage(baseUrl, apiKey, startDate, endDate, page, timeoutMs = PAGE_TIMEOUT_MS) {
   const url = `${baseUrl}/user/daily/activity?start_date=${startDate}&end_date=${endDate}&page=${page}`
-  const res = await fetch(url, { headers: { Authorization: `Bearer ${apiKey}` } })
-  if (!res.ok) throw new Error(`litellm daily activity HTTP ${res.status}`)
-  return res.json()
+  const ctrl = new AbortController()
+  let timer = null
+  const boundedMs = Math.max(1000, timeoutMs)
+  const timeoutPromise = new Promise((_, reject) => {
+    timer = setTimeout(() => {
+      ctrl.abort()
+      const err = new Error(`litellm request timed out after ${boundedMs}ms`)
+      err.code = 'ETIMEDOUT'
+      reject(err)
+    }, boundedMs)
+  })
+  try {
+    return await Promise.race([
+      (async () => {
+        const res = await fetch(url, { headers: { Authorization: `Bearer ${apiKey}` }, signal: ctrl.signal })
+        if (!res.ok) throw new Error(`litellm daily activity HTTP ${res.status}`)
+        const json = await res.json()
+        if (ctrl.signal.aborted) throw new Error('litellm response aborted on timeout')
+        return json
+      })(),
+      timeoutPromise,
+    ])
+  } finally {
+    if (timer) clearTimeout(timer)
+  }
 }
 
 // Fetches every page across the lookback window and returns the raw per-day
@@ -61,10 +87,17 @@ async function fetchRawRecords(baseUrl, apiKey) {
   const locEnd = localIsoDate(end)
   const endDate = locEnd > utcEnd ? locEnd : utcEnd
 
+  const deadline = Date.now() + FETCH_TOTAL_TIMEOUT_MS
   const dayResults = []
   let page = 1
   while (page <= MAX_PAGES) {
-    const body = await fetchPage(baseUrl, apiKey, startDate, endDate, page)
+    const remaining = deadline - Date.now()
+    if (remaining <= 0) {
+      const err = new Error(`litellm fetch timed out after ${FETCH_TOTAL_TIMEOUT_MS}ms`)
+      err.code = 'ETIMEDOUT'
+      throw err
+    }
+    const body = await fetchPage(baseUrl, apiKey, startDate, endDate, page, Math.min(PAGE_TIMEOUT_MS, remaining))
     dayResults.push(...(body.results || []))
     if (!body.metadata?.has_more) break
     page++

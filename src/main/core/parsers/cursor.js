@@ -563,13 +563,13 @@ async function getCloudRecords(token) {
       }
       const merged = [...byKey.values()].sort((a, b) => a.ts - b.ts)
       const records = tagUser(merged, nextBackfill)
-      const changed = !recordsEqual(entry.records, records)
-      entry.records = records
-      entry.backfillBeforeMs = nextBackfill
-      entry.coveredUntilMs = fetchStartedAt
+      const changed = entry.backfillBeforeMs !== nextBackfill || !recordsEqual(entry.records, records)
       if (changed) {
+        entry.records = records
         cursor.revision++
       }
+      entry.backfillBeforeMs = nextBackfill
+      entry.coveredUntilMs = fetchStartedAt
       archive.save?.(userId, entry.records, nextBackfill)
       entry.fetchedAt = Date.now()
       entry.retryAt = 0

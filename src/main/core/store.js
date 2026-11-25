@@ -205,13 +205,19 @@ export class Store extends EventEmitter {
   // to bypass each poller's interval throttle.
   async pollAll({ force = false, slackMs = 0 } = {}) {
     let changed = false
-    for (const p of this.pollers) {
-      const records = await (force && p.forceRefresh ? p.forceRefresh() : p.poll({ slackMs }))
-      const key = `poller:${p.cli}`
-      const prev = this.files.get(key)
-      if (!prev || prev.records !== records) changed = true
-      this.files.set(key, { parser: p, size: 0, mtimeMs: Date.now(), state: {}, records })
-    }
+    await Promise.all(
+      this.pollers.map(async (p) => {
+        try {
+          const records = await (force && p.forceRefresh ? p.forceRefresh() : p.poll({ slackMs }))
+          const key = `poller:${p.cli}`
+          const prev = this.files.get(key)
+          if (!prev || prev.records !== records) changed = true
+          this.files.set(key, { parser: p, size: 0, mtimeMs: Date.now(), state: {}, records })
+        } catch (err) {
+          console.warn(`poller ${p.cli} failed:`, err?.message || err)
+        }
+      })
+    )
     return changed
   }
 
@@ -799,7 +805,9 @@ export class Store extends EventEmitter {
         }
         if (changed) this.emit('update', this.snapshot())
         if (deferred.length) {
+          const hadImmediate = this._pending.size > 0
           for (const f of deferred) this._pending.add(f)
+          if (hadImmediate) deferredDelay = null
           break
         }
       }
