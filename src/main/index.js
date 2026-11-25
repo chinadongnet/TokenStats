@@ -4,7 +4,7 @@ import fs from 'node:fs'
 import { fileURLToPath } from 'node:url'
 import { Store } from './core/store.js'
 import { UsageDb, floorDayLocal } from './core/db.js'
-import { CLI_META, ensureConfigFile, CONFIG_FILE, loadLanguage, saveLanguage } from './core/paths.js'
+import { CLI_META, CONFIG_DIR, ensureConfigFile, CONFIG_FILE, loadLanguage, saveLanguage } from './core/paths.js'
 import { createLitellmPoller, listModels } from './core/parsers/litellm.js'
 import { codexResetWindows } from './core/parsers/codex.js'
 import { cursor, cursorResetWindows, configureCursorArchive } from './core/parsers/cursor.js'
@@ -15,7 +15,7 @@ import { migrateLegacyLitellmConfig } from './core/migrateLitellm.js'
 import { isAutoLaunch, setAutoLaunch, ensureAutoLaunch, migrateLegacyRunKeys } from './autoLaunch.js'
 import { agyResetWindows, getAgyQuotaState, enableAgyQuota, disableAgyQuota, ensureAgyHook, AGY_MIRROR_PATH } from './agyQuota.js'
 import { makeTrayIcon } from './trayIcon.js'
-import { performSync, pullCloudAccount, testCloudSync, normalizeEndpoint, DEFAULT_ENDPOINT } from './core/cloudSync.js'
+import { performSync, testCloudSync, normalizeEndpoint, DEFAULT_ENDPOINT } from './core/cloudSync.js'
 import { checkForUpdate, downloadUpdate, launchInstaller, UPDATE_REPO, RELEASES_URL } from './updater.js'
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url))
@@ -36,6 +36,51 @@ let lastSnapshot = null
 let lastDayStart = floorDayLocal(Date.now())
 let lastIngest = 0
 let ingestTimer = null
+let lastTrayTooltip = ''
+let lastTrayColor = ''
+let agyMirrorWatched = false
+
+const MAIN_ERROR_LOG = path.join(CONFIG_DIR, 'main-error.log')
+const MAX_ERROR_LOG_BYTES = 256 * 1024
+
+function formatError(err) {
+  if (err instanceof Error) return err.stack || `${err.name}: ${err.message}`
+  if (typeof err === 'string') return err
+  try {
+    return JSON.stringify(err)
+  } catch {
+    return String(err)
+  }
+}
+
+function logMainError(context, err) {
+  const detail = formatError(err)
+  console.error(`[tokenstats] ${context}:`, detail)
+  try {
+    fs.mkdirSync(CONFIG_DIR, { recursive: true })
+    try {
+      const st = fs.statSync(MAIN_ERROR_LOG)
+      if (st.size > MAX_ERROR_LOG_BYTES) {
+        const tail = fs.readFileSync(MAIN_ERROR_LOG, 'utf8').slice(-Math.floor(MAX_ERROR_LOG_BYTES / 2))
+        fs.writeFileSync(MAIN_ERROR_LOG, tail, 'utf8')
+      }
+    } catch {
+      // file does not exist yet
+    }
+    const m = process.memoryUsage()
+    const mem = `rss=${(m.rss / 1e6).toFixed(1)}MB heap=${(m.heapUsed / 1e6).toFixed(1)}MB ext=${(m.external / 1e6).toFixed(1)}MB`
+    fs.appendFileSync(MAIN_ERROR_LOG, `[${new Date().toISOString()}] [${context}] (${mem})\n${detail}\n\n`, 'utf8')
+  } catch {
+    // logging must never throw
+  }
+}
+
+// Replace Electron's default uncaughtException listener (which pops up a
+// blocking modal dialog and formats non-Error throws like sql.js strings as
+// "Uncaught Exception: undefined: undefined") with structured logging.
+process.removeAllListeners('uncaughtException')
+process.on('uncaughtException', (err) => logMainError('uncaughtException', err))
+process.on('unhandledRejection', (reason) => logMainError('unhandledRejection', reason))
 // Label/color for active LiteLLM provider pseudo-CLI ids (litellm:<id>), kept
 // in sync by refreshLitellmPollers() — used wherever a static CLI_META lookup
 // alone wouldn't know about a dynamic provider (tray recolor, open-data-dir).
@@ -105,22 +150,10 @@ async function init() {
   ensureConfigFile() // create ~/.tokenstats/config.json template on first run
   ensureAutoLaunch() // reconcile login item with config.json (defaults to enabled on install)
 
-  // UI language: renderer owns the instant switch (localStorage); this persists
-  // it for the tray menu and rebroadcasts to every window so all surfaces stay in
-  // sync even if a cross-window storage event is missed. Registered BEFORE the
-  // window loads: a renderer with no stored choice invokes 'get-language'
-  // immediately, and anything registered after createWindow() can lose that race.
-  ipcMain.handle('get-language', () => lang)
-  ipcMain.handle('set-language', (_e, l) => {
-    lang = saveLanguage(l)
-    for (const w of BrowserWindow.getAllWindows()) w.webContents.send('language', lang)
-    // The right-click menu is rebuilt on demand, but the tooltip string is not —
-    // without this it keeps the old language until the next store snapshot.
-    const snap = currentBaseSnapshot()
-    if (snap) updateTray(buildEffectiveSnapshot(snap))
-    return lang
-  })
-
+  // Register all IPC handlers BEFORE creating the BrowserWindow so the renderer
+  // can never race a missing handler while UsageDb.open() (and any startup
+  // VACUUM) is still running. Every handler safely tolerates null db/store.
+  registerIpcHandlers()
   createWindow()
   createTray()
 
@@ -137,7 +170,7 @@ async function init() {
     db = await new UsageDb({ dbPath: process.env.AIMON_DB_PATH }).open()
     migrateLegacyLitellmConfig(db) // one-time config.json -> DB import, no-op after the first run
   } catch (e) {
-    console.error('usage db failed to open:', e)
+    logMainError('db.open', e)
   }
 
   store = new Store()
@@ -155,14 +188,65 @@ async function init() {
   store.on('update', (snap) => {
     lastSnapshot = snap
     if (!scheduleIngest()) {
-      const eff = buildEffectiveSnapshot(snap)
-      if (win && !win.isDestroyed()) win.webContents.send('snapshot', eff)
-      updateTray(eff)
+      sendPopupSnapshot(snap)
     }
   })
 
-  // Register IPC before the (slow) initial scan so the renderer never races a
-  // missing handler. snapshot() safely returns whatever has been parsed so far.
+  ensureAgyHook() // re-assert the agy statusLine hook file if the user enabled it
+  watchAgyMirror() // pick up quota-only refreshes (agy rewrites the mirror without any new usage)
+  refreshLitellmPollers() // populate store.pollers before the initial scan/poll
+  await store.start()
+  ingestNow({ persist: true }) // first full ingest after the initial local scan
+  broadcastDeviceView()
+  const migratedAgy = [
+    db?.markMigration('agy-output-cost-and-response-id-v1'),
+    db?.markMigration('agy-desktop-conversations-v1'),
+  ].some(Boolean)
+  if (migratedAgy) {
+    // Corrected historical AGY costs or newly indexed desktop AGY conversations
+    // can lie outside the normal 7-day sync window.
+    db.updateCloudSyncState({ fullResync: true })
+  }
+  startCloudRefreshTimer() // hourly cloud/network refresh when idle
+  // Run one initial cloud refresh on startup; afterwards cloud/network sources
+  // refresh only once per hour, when opening an app window, or on manual refresh.
+  triggerCloudRefresh({ force: true })
+  setInterval(() => {
+    const todayStart = floorDayLocal(Date.now())
+    if (todayStart !== lastDayStart) {
+      lastDayStart = todayStart
+      broadcastSnapshot()
+      notifyReportUpdated()
+    }
+  }, 15000)
+  if (process.env.AIMON_AUTO_REPORT) openReport() // dev/test convenience
+  if (process.env.AIMON_AUTO_CYCLES) openCycles()
+  if ('AIMON_SET_AUTOLAUNCH' in process.env) setAutoLaunch(process.env.AIMON_SET_AUTOLAUNCH === '1') // headless toggle
+}
+
+function registerIpcHandlers() {
+  // UI language: renderer owns the instant switch (localStorage); this persists
+  // it for the tray menu and rebroadcasts to every window so all surfaces stay in
+  // sync even if a cross-window storage event is missed.
+  ipcMain.handle('get-language', () => lang)
+  ipcMain.handle('set-language', (_e, l) => {
+    lang = saveLanguage(l)
+    for (const w of BrowserWindow.getAllWindows()) {
+      if (!w.isDestroyed()) w.webContents.send('language', lang)
+    }
+    // The right-click menu is rebuilt on demand, but the tooltip string is not —
+    // without this it keeps the old language until the next store snapshot.
+    const snap = currentBaseSnapshot()
+    if (snap) {
+      try {
+        updateTray(buildEffectiveSnapshot(snap))
+      } catch (err) {
+        logMainError('set-language.updateTray', err)
+      }
+    }
+    return lang
+  })
+
   ipcMain.handle('get-snapshot', () => buildEffectiveSnapshot(currentBaseSnapshot()))
   ipcMain.handle('devices:get', () =>
     db ? db.getDeviceViewState() : { selectedDevice: 'local', hasCloudData: false, currentKeyId: null, devices: [] }
@@ -175,15 +259,8 @@ async function init() {
   })
   ipcMain.handle('devices:refresh', async () => {
     if (!db) return null
-    if (store) {
-      await store.scanAllLocal()
-      await store.refreshNetworkParsers({ force: true })
-      await Promise.all(store.pollers.map((p) => store.forcePoll(p.cli)))
-    }
-    ingestNow()
-    await runCloudSync().catch(() => {})
-    broadcastSnapshot()
-    broadcastDeviceView()
+    if (store) await store.scanAllLocal()
+    await triggerCloudRefresh({ force: true })
     return db.getDeviceViewState()
   })
   ipcMain.handle('open-data-dir', (_e, cli) => {
@@ -195,7 +272,7 @@ async function init() {
     const meta = CLI_META[cli]
     if (meta) shell.openPath(meta.root)
   })
-  ipcMain.on('hide-window', () => win && win.hide())
+  ipcMain.on('hide-window', () => win && !win.isDestroyed() && win.hide())
   ipcMain.on('quit-app', () => { app.isQuitting = true; app.quit() })
   ipcMain.on('open-report', () => openReport())
   ipcMain.on('open-settings', () => openSettings())
@@ -308,7 +385,7 @@ async function init() {
     // the cloud needs a full push. Ingest synchronously first so the full
     // pass can't capture pre-change rows through the 4s ingest throttle.
     if (!!prev?.enabled !== !!saved.enabled) {
-      ingestNow()
+      ingestNow({ persist: true })
       db.updateCloudSyncState({ fullResync: true })
       runCloudSync()
     }
@@ -323,7 +400,7 @@ async function init() {
     // cloud only replaces a rolling recent window per sync — do that ingest
     // NOW (past the 4s throttle) and schedule a full push so its older rows
     // don't linger on tokenstat-web forever.
-    ingestNow()
+    ingestNow({ persist: true })
     db.updateCloudSyncState({ fullResync: true })
     runCloudSync()
   })
@@ -440,73 +517,47 @@ async function init() {
     // would keep showing the old name (or a hidden model's rows) beyond it.
     // Ingest synchronously first so the full pass can't capture pre-change
     // rows through the 4s ingest throttle.
-    ingestNow()
+    ingestNow({ persist: true })
     db.updateCloudSyncState({ fullResync: true })
     runCloudSync()
   })
+}
 
-  ensureAgyHook() // re-assert the agy statusLine hook file if the user enabled it
-  watchAgyMirror() // pick up quota-only refreshes (agy rewrites the mirror without any new usage)
-  refreshLitellmPollers() // populate store.pollers before the initial scan/poll
-  await store.start()
-  ingestNow() // first full ingest after the initial scan
-  const migratedAgy = [
-    db?.markMigration('agy-output-cost-and-response-id-v1'),
-    db?.markMigration('agy-desktop-conversations-v1'),
-  ].some(Boolean)
-  if (migratedAgy) {
-    // Corrected historical AGY costs or newly indexed desktop AGY conversations
-    // can lie outside the normal 7-day sync window.
-    db.updateCloudSyncState({ fullResync: true })
+function sendPopupSnapshot(snap = currentBaseSnapshot()) {
+  if (!snap) return
+  let eff = snap
+  try {
+    eff = buildEffectiveSnapshot(snap)
+  } catch (err) {
+    logMainError('sendPopupSnapshot.buildEffectiveSnapshot', err)
   }
-  startCloudSyncTimer() // pushes to tokenstat-web when enabled (Settings → 云同步)
-  // Pull multi-device account data immediately on startup if not cached yet,
-  // and run the first full sync pass shortly after startup.
-  if (db && db.getCloudSync().enabled && db.listCloudDevices().length === 0) {
-    pullCloudAccount({ db })
-      .then((r) => {
-        if (r?.ok) {
-          ingestNow()
-          broadcastDeviceView()
-        }
-      })
-      .catch(() => {})
+  if (win && !win.isDestroyed() && win.isVisible()) {
+    try {
+      win.webContents.send('snapshot', eff)
+    } catch (err) {
+      logMainError('sendPopupSnapshot.send', err)
+    }
   }
-  setTimeout(() => runCloudSync(), 5000)
-  // Prime Claude's live plan-quota (spawns `claude -p /usage` once) so the
-  // popup's Quota-windows section can show it without waiting for the first
-  // 15-min refresh. Fire-and-forget; a snapshot after it lands shows the data.
-  primeClaudeLimits()
+  try {
+    updateTray(eff)
+  } catch (err) {
+    logMainError('sendPopupSnapshot.updateTray', err)
+  }
+}
+
+function refreshClaudeLimits(force = false) {
+  return primeClaudeLimits({ force })
     .then(() => {
-      const snap = currentBaseSnapshot()
-      if (win && !win.isDestroyed() && snap) {
-        win.webContents.send('snapshot', buildEffectiveSnapshot(snap))
-      }
+      sendPopupSnapshot()
     })
     .catch(() => {})
-  refreshAgyLimits()
-  setInterval(() => refreshAgyLimits(), 20000)
-  setInterval(() => {
-    const todayStart = floorDayLocal(Date.now())
-    if (todayStart !== lastDayStart) {
-      lastDayStart = todayStart
-      broadcastSnapshot()
-      notifyReportUpdated()
-    }
-  }, 15000)
-  if (process.env.AIMON_AUTO_REPORT) openReport() // dev/test convenience
-  if (process.env.AIMON_AUTO_CYCLES) openCycles()
-  if ('AIMON_SET_AUTOLAUNCH' in process.env) setAutoLaunch(process.env.AIMON_SET_AUTOLAUNCH === '1') // headless toggle
 }
 
 function refreshAgyLimits(force = false) {
-  if (!getAgyQuotaState().enabled) return
-  primeAgyLimits({ force })
+  if (!getAgyQuotaState().enabled) return Promise.resolve()
+  return primeAgyLimits({ force })
     .then(() => {
-      const snap = currentBaseSnapshot()
-      if (win && !win.isDestroyed() && snap) {
-        win.webContents.send('snapshot', buildEffectiveSnapshot(snap))
-      }
+      sendPopupSnapshot()
     })
     .catch(() => {})
 }
@@ -584,15 +635,111 @@ function runCloudSync(opts = {}) {
   return cloudSyncInFlight
 }
 
-// Check once a minute whether the configured interval elapsed — same pattern
-// as the store's poll-check timer: the timer is cheap, the network is gated.
-function startCloudSyncTimer() {
-  setInterval(() => {
-    if (!db) return
-    const cfg = db.getCloudSync()
-    if (!cfg.enabled || !cfg.apiKey || !cfg.endpoint) return
-    const due = cloudSyncLastAttempt + Math.max(1, cfg.syncMinutes) * 60000
-    if (Date.now() >= due) runCloudSync()
+const HOURLY_CLOUD_REFRESH_MS = 60 * 60 * 1000
+const OPEN_REFRESH_COOLDOWN_MS = 30 * 1000
+const POLLER_REFRESH_TIMEOUT_MS = 45 * 1000
+let cloudRefreshInFlight = null
+let lastFullCloudRefreshAt = 0
+
+function withTimeout(promise, ms, label) {
+  let timer = null
+  return Promise.race([
+    promise,
+    new Promise((_, reject) => {
+      timer = setTimeout(() => reject(new Error(`${label} timed out after ${ms}ms`)), ms)
+    }),
+  ]).finally(() => {
+    if (timer) clearTimeout(timer)
+  })
+}
+
+// Unified coordinator for all cloud/network-backed refreshes (Cursor cloud CSV
+// & quota, LiteLLM proxy pollers, Claude/AGY live quota CLIs, and tokenstat-web
+// cloud sync). Triggered on startup, once per hour, when opening an app window,
+// and on explicit manual refresh — never on background local file writes.
+function triggerCloudRefresh({ force = false, respectIntervals = false } = {}) {
+  if (cloudRefreshInFlight) return cloudRefreshInFlight
+  const now = Date.now()
+  if (!force && now - lastFullCloudRefreshAt < OPEN_REFRESH_COOLDOWN_MS) {
+    return Promise.resolve({ ok: true, skipped: true })
+  }
+  lastFullCloudRefreshAt = now
+  cloudRefreshInFlight = (async () => {
+    try {
+      const claudeTask = refreshClaudeLimits(true)
+      const agyTask = refreshAgyLimits(true)
+      if (store) {
+        const [netChanged, pollChanged] = await Promise.all([
+          store.refreshNetworkParsers({ force: true }).catch((err) => {
+            console.warn('network parser refresh failed:', err?.message || err)
+            return false
+          }),
+          withTimeout(
+            respectIntervals ? store.pollAll({ slackMs: 5000 }) : store.pollAll({ force: true }),
+            POLLER_REFRESH_TIMEOUT_MS,
+            'poller refresh'
+          ).catch((err) => {
+            console.warn('poller refresh failed:', err?.message || err)
+            return false
+          }),
+        ])
+        if (netChanged || pollChanged) {
+          ingestNow()
+        }
+      }
+      // Give live quota CLIs a short window to settle before pushing status to
+      // cloud sync, without stalling sync if an external CLI is slow or absent.
+      await Promise.race([
+        Promise.allSettled([claudeTask, agyTask]),
+        new Promise((r) => setTimeout(r, 6000)),
+      ])
+      ingestNow()
+      if (db) {
+        const cfg = db.getCloudSync()
+        const syncDue =
+          !respectIntervals ||
+          Date.now() >= cloudSyncLastAttempt + Math.max(1, cfg.syncMinutes) * 60000 - 5000
+        if (cfg.enabled && cfg.apiKey && cfg.endpoint && syncDue) {
+          await runCloudSync().catch(() => {})
+        }
+      }
+      broadcastDeviceView()
+      return { ok: true }
+    } catch (err) {
+      logMainError('triggerCloudRefresh', err)
+      return { ok: false, error: formatError(err) }
+    } finally {
+      cloudRefreshInFlight = null
+    }
+  })()
+  return cloudRefreshInFlight
+}
+
+// Check once a minute whether the hourly cloud refresh (or a user-configured
+// custom syncMinutes interval) has elapsed. Zero network traffic when idle.
+function startCloudRefreshTimer() {
+  setInterval(async () => {
+    try {
+      const now = Date.now()
+      if (now - lastFullCloudRefreshAt >= HOURLY_CLOUD_REFRESH_MS) {
+        await triggerCloudRefresh({ force: true, respectIntervals: true })
+        return
+      }
+      if (store && store.pollers.length > 0) {
+        try {
+          if (await store.pollAll({ slackMs: 5000 })) ingestNow()
+        } catch (err) {
+          console.warn('poller check failed:', err?.message || err)
+        }
+      }
+      if (!db) return
+      const cfg = db.getCloudSync()
+      if (!cfg.enabled || !cfg.apiKey || !cfg.endpoint) return
+      const due = cloudSyncLastAttempt + Math.max(1, cfg.syncMinutes) * 60000 - 5000
+      if (Date.now() >= due) runCloudSync()
+    } catch (err) {
+      logMainError('cloudRefreshTimer', err)
+    }
   }, 60000)
 }
 
@@ -601,31 +748,28 @@ function scheduleIngest() {
   if (!db || !store) return false
   const since = Date.now() - lastIngest
   if (since >= 4000) {
-    return ingestNow()
+    return ingestNow({ persist: false })
   }
   if (!ingestTimer) {
-    ingestTimer = setTimeout(() => { ingestTimer = null; ingestNow() }, 4000 - since)
+    ingestTimer = setTimeout(() => { ingestTimer = null; ingestNow({ persist: false }) }, 4000 - since)
   }
   return false
 }
 
-function ingestNow() {
+function ingestNow({ persist = false } = {}) {
   if (!db || !store) return false
   lastIngest = Date.now()
   let sent = false
   try {
-    db.ingest(store.dedupedRecords())
+    db.ingest(store.dedupedRecords(), { persist })
     const snap = currentBaseSnapshot()
     if (snap) {
-      const eff = buildEffectiveSnapshot(snap)
-      if (win && !win.isDestroyed()) win.webContents.send('snapshot', eff)
-      updateTray(eff)
+      sendPopupSnapshot(snap)
       sent = true
     }
     notifyReportUpdated()
-    scheduleCloudSync()
   } catch (e) {
-    console.error('ingest failed:', e)
+    logMainError('ingestNow', e)
   }
   return sent
 }
@@ -666,10 +810,11 @@ function refreshLitellmPollers() {
 // popup refetch subs:resets (see App.jsx). Cheap: one stat every 20s, and no
 // snapshot recompute.
 function watchAgyMirror() {
+  if (agyMirrorWatched) return
+  agyMirrorWatched = true
   fs.watchFile(AGY_MIRROR_PATH, { interval: 20000 }, (cur, prev) => {
     if (cur.mtimeMs === prev.mtimeMs) return
-    const snap = currentBaseSnapshot()
-    if (win && !win.isDestroyed() && snap) win.webContents.send('snapshot', buildEffectiveSnapshot(snap))
+    sendPopupSnapshot()
   })
 }
 
@@ -855,16 +1000,16 @@ function computeResetsForView(deviceId = null) {
 }
 
 function broadcastDeviceView() {
-  const state = db ? db.getDeviceViewState() : null
+  let state = null
+  try {
+    state = db ? db.getDeviceViewState() : null
+  } catch (err) {
+    logMainError('broadcastDeviceView', err)
+  }
   for (const w of BrowserWindow.getAllWindows()) {
-    if (!w.isDestroyed()) w.webContents.send('device-view', state)
+    if (!w.isDestroyed() && (w !== win || w.isVisible())) w.webContents.send('device-view', state)
   }
-  const snap = currentBaseSnapshot()
-  if (snap) {
-    const eff = buildEffectiveSnapshot(snap)
-    if (win && !win.isDestroyed()) win.webContents.send('snapshot', eff)
-    updateTray(eff)
-  }
+  sendPopupSnapshot()
   notifyReportUpdated()
 }
 
@@ -875,9 +1020,7 @@ function broadcastSnapshot() {
   if (!store) return
   const s = currentBaseSnapshot()
   if (!scheduleIngest()) {
-    const eff = buildEffectiveSnapshot(s)
-    if (win && !win.isDestroyed()) win.webContents.send('snapshot', eff)
-    updateTray(eff)
+    sendPopupSnapshot(s)
   }
 }
 
@@ -919,11 +1062,14 @@ function createWindow() {
 
 function openReport() {
   if (reportWin && !reportWin.isDestroyed()) {
+    const wasVisible = reportWin.isVisible() && !reportWin.isMinimized()
     if (!ingestNow()) notifyReportUpdated()
     reportWin.show()
     reportWin.focus()
+    if (!wasVisible) triggerCloudRefresh()
     return
   }
+  triggerCloudRefresh()
   reportWin = new BrowserWindow({
     width: 940,
     height: 760,
@@ -956,10 +1102,13 @@ function openReport() {
 
 function openSettings() {
   if (settingsWin && !settingsWin.isDestroyed()) {
+    const wasVisible = settingsWin.isVisible() && !settingsWin.isMinimized()
     settingsWin.show()
     settingsWin.focus()
+    if (!wasVisible) triggerCloudRefresh()
     return
   }
+  triggerCloudRefresh()
   settingsWin = new BrowserWindow({
     width: 720,
     height: 720,
@@ -988,11 +1137,14 @@ function openSettings() {
 
 function openCycles() {
   if (cyclesWin && !cyclesWin.isDestroyed()) {
+    const wasVisible = cyclesWin.isVisible() && !cyclesWin.isMinimized()
     if (!ingestNow()) notifyReportUpdated()
     cyclesWin.show()
     cyclesWin.focus()
+    if (!wasVisible) triggerCloudRefresh()
     return
   }
+  triggerCloudRefresh()
   cyclesWin = new BrowserWindow({
     width: 1180,
     height: 820,
@@ -1097,7 +1249,17 @@ function createTray() {
       { label: tray_t('cycles'), click: () => openCycles() },
       { label: tray_t('settings'), click: () => openSettings() },
       { type: 'separator' },
-      { label: tray_t('refresh'), click: async () => { await store.scanAllLocal(); await store.refreshNetworkParsers({ force: true }); await Promise.all(store.pollers.map((p) => store.forcePoll(p.cli))); ingestNow(); broadcastSnapshot() } },
+      {
+        label: tray_t('refresh'),
+        click: async () => {
+          try {
+            if (store) await store.scanAllLocal()
+            await triggerCloudRefresh({ force: true })
+          } catch (err) {
+            logMainError('tray.refresh', err)
+          }
+        },
+      },
       { label: tray_t('editSources'), click: () => { ensureConfigFile(); shell.openPath(CONFIG_FILE) } },
       { type: 'separator' },
       {
@@ -1117,52 +1279,104 @@ function createTray() {
 }
 
 function updateTray(snap) {
-  if (!tray) return
+  if (!tray || tray.isDestroyed()) return
   const today = snap?.totals?.today?.total || 0
   // Build time, not just version: dev iterates without bumping, so the version
   // alone can't tell a fresh install from a stale one.
-  tray.setToolTip(`TokenStats v${__APP_VERSION__} (${__BUILD_TIME__}) — ${tray_t('todayTokens', { n: compact(today) })}`)
+  const tip = `TokenStats v${__APP_VERSION__} (${__BUILD_TIME__}) — ${tray_t('todayTokens', { n: compact(today) })}`
+  if (tip !== lastTrayTooltip) {
+    lastTrayTooltip = tip
+    tray.setToolTip(tip)
+  }
   // Recolour by the most recently active CLI (built-in or a dynamic LiteLLM provider).
   const cli = snap?.live?.cli
   const meta = cli && (CLI_META[cli] || dynamicCliMeta[cli])
-  if (meta) tray.setImage(makeTrayIcon({ color: hexToRgb(meta.color) }))
+  if (meta?.color && meta.color !== lastTrayColor) {
+    lastTrayColor = meta.color
+    tray.setImage(makeTrayIcon({ color: hexToRgb(meta.color) }))
+  }
 }
 
 function toggleWindow() {
+  if (!win || win.isDestroyed()) {
+    showWindow()
+    return
+  }
   if (win.isVisible()) win.hide()
   else showWindow()
 }
 
 function showWindow() {
-  const snap = currentBaseSnapshot()
-  if (snap) {
-    const eff = buildEffectiveSnapshot(snap)
-    if (win && !win.isDestroyed()) win.webContents.send('snapshot', eff)
-    updateTray(eff)
+  try {
+    if (!app.isReady()) return
+    if (!win || win.isDestroyed()) createWindow()
+    const wasVisible = !!(win && !win.isDestroyed() && win.isVisible())
+    const snap = currentBaseSnapshot()
+    if (snap) {
+      let eff = snap
+      try {
+        eff = buildEffectiveSnapshot(snap)
+      } catch (err) {
+        logMainError('showWindow.buildEffectiveSnapshot', err)
+      }
+      if (win && !win.isDestroyed()) win.webContents.send('snapshot', eff)
+      try {
+        updateTray(eff)
+      } catch (err) {
+        logMainError('showWindow.updateTray', err)
+      }
+    }
+    sizeWindow()
+    positionWindow()
+    win.show()
+    win.focus()
+    if (!wasVisible) triggerCloudRefresh()
+  } catch (err) {
+    logMainError('showWindow', err)
+    if (win && !win.isDestroyed()) {
+      try {
+        win.show()
+        win.focus()
+      } catch {}
+    }
   }
-  sizeWindow()
-  positionWindow()
-  win.show()
-  win.focus()
+}
+
+function validTrayBounds() {
+  if (!tray || tray.isDestroyed()) return null
+  try {
+    const tb = tray.getBounds()
+    if (tb && Number.isFinite(tb.x) && Number.isFinite(tb.y) && (tb.width > 0 || tb.height > 0)) {
+      return tb
+    }
+  } catch {
+    // tray bounds unavailable (e.g. taskbar restart / RDP display switch)
+  }
+  return null
 }
 
 // Re-assert the fixed content size, but cap the height to the current display's
 // work area so a low-resolution / high-DPI screen can't push the window off-screen
 // (the renderer scrolls internally when the content is taller than this).
 function sizeWindow() {
-  const display = screen.getDisplayMatching(tray ? tray.getBounds() : win.getBounds())
+  if (!win || win.isDestroyed()) return
+  const tb = validTrayBounds()
+  const display = tb
+    ? screen.getDisplayMatching(tb)
+    : screen.getDisplayMatching(win.getBounds())
   const maxH = Math.max(240, display.workArea.height - 8)
   win.setContentSize(POPUP_W, Math.min(POPUP_H, maxH))
 }
 
 // Anchor the popup to the tray / bottom-right work area.
 function positionWindow() {
-  const tb = tray.getBounds()
-  const display = screen.getDisplayMatching(tb)
+  if (!win || win.isDestroyed()) return
+  const tb = validTrayBounds()
+  const display = tb ? screen.getDisplayMatching(tb) : screen.getPrimaryDisplay()
   const area = display.workArea
   const [w, h] = win.getContentSize()
-  let x = Math.round(tb.x + tb.width / 2 - w / 2)
-  let y = Math.round(tb.y - h - 8)
+  let x = tb ? Math.round(tb.x + tb.width / 2 - w / 2) : area.x + area.width - w - 8
+  let y = tb ? Math.round(tb.y - h - 8) : area.y + area.height - h - 8
   // Keep on-screen; if taskbar is at the bottom, place above it.
   x = Math.min(Math.max(x, area.x + 4), area.x + area.width - w - 4)
   if (y < area.y) y = area.y + 4
@@ -1176,6 +1390,19 @@ app.on('window-all-closed', () => {
 
 app.on('before-quit', async () => {
   app.isQuitting = true
+  if (ingestTimer) {
+    clearTimeout(ingestTimer)
+    ingestTimer = null
+  }
+  if (agyMirrorWatched) {
+    agyMirrorWatched = false
+    try { fs.unwatchFile(AGY_MIRROR_PATH) } catch {}
+  }
+  try {
+    db?.flushPersist()
+  } catch (err) {
+    logMainError('before-quit.flushPersist', err)
+  }
   if (store) await store.stop()
 })
 

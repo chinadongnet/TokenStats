@@ -865,5 +865,148 @@ try {
 
 console.log('multi-device account overview, cross-device LiteLLM dedupe, keyAlias attribution & concurrent sync guard verified')
 
+// Verify hourly-cloud-refresh-v1 preserves custom <60m intervals on fresh DBs
+// and upgrades legacy pre-migration DBs once without clobbering later edits
+{
+  const migPath = path.join(os.tmpdir(), 'aimon-test-hourly-mig.sqlite')
+  fs.rmSync(migPath, { force: true })
+  try {
+    // 1) Fresh DB: user configures custom <60m intervals -> must survive restart
+    const freshDb = await new UsageDb({ dbPath: migPath }).open()
+    freshDb.saveCloudSync({ endpoint: 'https://token.chinadong.net', apiKey: 'ts_mig', enabled: true, syncMinutes: 10 })
+    const lp = freshDb.upsertLitellmProvider({ name: 'FreshProxy', baseUrl: 'https://p.example.com', apiKey: 'k', syncMinutes: 15 })
+    const reopenedFresh = await new UsageDb({ dbPath: migPath }).open()
+    if (reopenedFresh.getCloudSync().syncMinutes !== 10 || reopenedFresh.getLitellmProvider(lp.id).syncMinutes !== 15) {
+      throw new Error(`Expected fresh DB custom intervals (10/15) to survive restart, got cloud=${reopenedFresh.getCloudSync().syncMinutes}, litellm=${reopenedFresh.getLitellmProvider(lp.id).syncMinutes}`)
+    }
+    // 2) Legacy DB (no hourly-cloud-refresh-v1 marker): upgrades <60m to 60 once
+    reopenedFresh.db.run('DELETE FROM applied_migrations WHERE name = ?', ['hourly-cloud-refresh-v1'])
+    reopenedFresh.persist()
+    const upgraded = await new UsageDb({ dbPath: migPath }).open()
+    if (upgraded.getCloudSync().syncMinutes !== 60 || upgraded.getLitellmProvider(lp.id).syncMinutes !== 60) {
+      throw new Error(`Expected legacy syncMinutes to upgrade to 60, got cloud=${upgraded.getCloudSync().syncMinutes}, litellm=${upgraded.getLitellmProvider(lp.id).syncMinutes}`)
+    }
+    upgraded.saveCloudSync({ endpoint: 'https://token.chinadong.net', apiKey: 'ts_mig', enabled: true, syncMinutes: 30 })
+    const reopenedCustom = await new UsageDb({ dbPath: migPath }).open()
+    if (reopenedCustom.getCloudSync().syncMinutes !== 30) {
+      throw new Error(`Expected user-customized syncMinutes (30) after migration to be preserved, got ${reopenedCustom.getCloudSync().syncMinutes}`)
+    }
+  } finally {
+    fs.rmSync(migPath, { force: true })
+  }
+}
+
+// Verify deferred persist, sql.js error normalization, transaction rollback, and export-failure recovery
+{
+  const resPath = path.join(os.tmpdir(), 'aimon-test-resilience.sqlite')
+  fs.rmSync(resPath, { force: true })
+  try {
+    const rdb = await new UsageDb({ dbPath: resPath }).open()
+    const baseHour = Math.floor(Date.now() / 3600000) * 3600000
+    rdb.ingest(
+      [
+        {
+          ts: baseHour,
+          cli: 'codex',
+          model: 'gpt-5',
+          project: 'p1',
+          sessionId: 's1',
+          input: 100,
+          output: 50,
+          cacheRead: 0,
+          cacheCreate: 0,
+          reasoning: 0,
+          total: 150,
+          cost: 0.5,
+          turns: 1,
+        },
+      ],
+      { persist: false }
+    )
+    if (rdb.hourlySince(0).reduce((n, r) => n + r.total, 0) !== 150) {
+      throw new Error('Deferred ingest must update in-memory queries immediately')
+    }
+    if (fs.existsSync(resPath)) {
+      throw new Error('Deferred ingest with { persist: false } must not write synchronously')
+    }
+    rdb.flushPersist()
+    if (!fs.existsSync(resPath)) {
+      throw new Error('flushPersist() must write dirty DB to disk')
+    }
+
+    // Binding undefined must be coerced to NULL rather than throwing a raw sql.js string
+    const coerced = rdb.rows('SELECT ? AS val', [undefined])
+    if (coerced[0]?.val !== null) {
+      throw new Error(`Expected undefined bind parameter to coerce to null, got ${JSON.stringify(coerced)}`)
+    }
+
+    // Bare string throws from sql.js (e.g. empty SQL -> "Nothing to prepare") must become Error instances
+    let emptyErr = null
+    try {
+      rdb.rows('')
+    } catch (e) {
+      emptyErr = e
+    }
+    if (!(emptyErr instanceof Error)) {
+      throw new Error(`Expected sql.js bare-string throw to be normalized into Error, got ${typeof emptyErr}: ${String(emptyErr)}`)
+    }
+
+    // Mid-export crash (closed sqlite handle) must recover cleanly on subsequent queries
+    const origExport = rdb.db.export.bind(rdb.db)
+    rdb.db.export = () => {
+      rdb.SQL._sqlite3_close_v2(rdb.db.db)
+      throw new RangeError('simulated OOM during export')
+    }
+    let exportErr = null
+    try {
+      rdb.persist()
+    } catch (e) {
+      exportErr = e
+    }
+    if (!(exportErr instanceof Error)) {
+      throw new Error('Expected persist() to rethrow Error on simulated export OOM')
+    }
+    // After recovery, queries and new ingests must continue working normally
+    const afterRec = rdb.hourlySince(0).reduce((n, r) => n + r.total, 0)
+    if (afterRec !== 150) {
+      throw new Error(`Expected recovered DB to keep persisted total 150, got ${afterRec}`)
+    }
+    // Ensure a failed ingest rolls back its transaction instead of poisoning future ingests
+    let rollbackErr = null
+    try {
+      rdb.ingest([{ ts: baseHour, cli: null, model: null, input: 1, output: 1, cacheRead: 0, cacheCreate: 0, reasoning: 0, total: 2 }])
+    } catch (e) {
+      rollbackErr = e
+    }
+    if (!(rollbackErr instanceof Error)) {
+      throw new Error('Expected NOT NULL violation during ingest to throw normalized Error')
+    }
+    rdb.ingest([
+      {
+        ts: baseHour,
+        cli: 'codex',
+        model: 'gpt-5',
+        project: 'p1',
+        sessionId: 's1',
+        input: 200,
+        output: 100,
+        cacheRead: 0,
+        cacheCreate: 0,
+        reasoning: 0,
+        total: 300,
+        cost: 1.0,
+        turns: 2,
+      },
+    ])
+    if (rdb.hourlySince(0).reduce((n, r) => n + r.total, 0) !== 300) {
+      throw new Error('Expected ingest() after rolled-back transaction to succeed')
+    }
+    void origExport
+    rdb.close()
+  } finally {
+    fs.rmSync(resPath, { force: true })
+  }
+}
+
 fs.rmSync(dbPath, { force: true })
 console.log('\nOK (temp db removed)')

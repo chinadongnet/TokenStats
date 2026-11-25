@@ -18,6 +18,10 @@ const PARSERS = [claude, codex, geminiJsonl, geminiJson, antigravity, cursor]
 // a real machine, 98% of a day's Codex usage never reached the UI. A warm
 // sweep over ~2.6k files costs ~550ms and is almost entirely fs.stat.
 export const SWEEP_MS = 5 * 1000
+const FULL_SIG_EVERY_SWEEPS = 12 // ~60s full SQLite header check for old inactive DBs
+const RECENT_SIG_WINDOW_MS = 24 * 3600 * 1000
+const LARGE_WATCH_BYTES = 4 * 1024 * 1024
+const LARGE_WATCH_COOLDOWN_MS = 5000
 
 // In-memory index of every parsed file:
 //   path -> { parser, size, mtimeMs, state, records[] }
@@ -96,7 +100,7 @@ export class Store extends EventEmitter {
     }
   }
 
-  async _ingestFile(file, { force = false } = {}) {
+  async _ingestFile(file, { force = false, fullSignature = true } = {}) {
     const parser = this.parserFor(file)
     if (!parser) return false
     let stat
@@ -121,7 +125,24 @@ export class Store extends EventEmitter {
         return `${suffix}:missing`
       }
     }))
-    const signature = sidecars.join('|') + (parser.signature ? await parser.signature(file) : '')
+    const sidecarsSig = sidecars.join('|')
+    const hasLiveSidecar = sidecars.some((s) => !s.endsWith(':missing'))
+    // Skip opening hundreds of old, untouched SQLite DBs on every 5s sweep:
+    // active files (WAL/journal present, stat moved, or modified in last 24h)
+    // still check headers every 5s, while cold historical DBs check every ~60s.
+    if (
+      !force &&
+      !fullSignature &&
+      entry.signature !== undefined &&
+      stat.mtimeMs === entry.mtimeMs &&
+      stat.size === entry.size &&
+      sidecarsSig === entry.sidecarsSig &&
+      !hasLiveSidecar &&
+      Date.now() - stat.mtimeMs > RECENT_SIG_WINDOW_MS
+    ) {
+      return false
+    }
+    const signature = sidecarsSig + (parser.signature ? await parser.signature(file) : '')
     if (!force && stat.mtimeMs === entry.mtimeMs && stat.size === entry.size && signature === entry.signature) return false
 
     try {
@@ -172,23 +193,31 @@ export class Store extends EventEmitter {
     }
     entry.size = stat.size
     entry.mtimeMs = stat.mtimeMs
+    entry.sidecarsSig = sidecarsSig
     entry.signature = signature
+    entry.lastParsedAt = Date.now()
     return true
   }
 
   // Runs every poller once and stores its full record set under a synthetic
   // key, the same shape as a file entry so allRecords()/dedupedRecords() pick
-  // it up unchanged. Each poller throttles/caches its own network calls, so
-  // calling this often (e.g. on a timer) is cheap.
-  async pollAll() {
+  // it up unchanged. Pass { force: true } (e.g. on app open / manual refresh)
+  // to bypass each poller's interval throttle.
+  async pollAll({ force = false, slackMs = 0 } = {}) {
     let changed = false
-    for (const p of this.pollers) {
-      const records = await p.poll()
-      const key = `poller:${p.cli}`
-      const prev = this.files.get(key)
-      if (!prev || prev.records !== records) changed = true
-      this.files.set(key, { parser: p, size: 0, mtimeMs: Date.now(), state: {}, records })
-    }
+    await Promise.all(
+      this.pollers.map(async (p) => {
+        try {
+          const records = await (force && p.forceRefresh ? p.forceRefresh() : p.poll({ slackMs }))
+          const key = `poller:${p.cli}`
+          const prev = this.files.get(key)
+          if (!prev || prev.records !== records) changed = true
+          this.files.set(key, { parser: p, size: 0, mtimeMs: Date.now(), state: {}, records })
+        } catch (err) {
+          console.warn(`poller ${p.cli} failed:`, err?.message || err)
+        }
+      })
+    )
     return changed
   }
 
@@ -217,21 +246,21 @@ export class Store extends EventEmitter {
   // Walks every root and re-ingests anything whose size or mtime moved.
   // Returns true if any file's records changed, so callers (the sweep timer in
   // start(), the tray's "refresh") can decide whether to emit an update.
-  async scanAll({ localOnly = false } = {}) {
+  async scanAll({ localOnly = false, fullSignature = true } = {}) {
     let changed = false
     for (const parser of PARSERS) {
       if (localOnly && parser.network) continue
       for (const root of parser.roots) {
         for (const file of await walk(root, parser.match)) {
-          if (await this.ingestFile(file)) changed = true
+          if (await this.ingestFile(file, { fullSignature })) changed = true
         }
       }
     }
     return changed
   }
 
-  scanAllLocal() {
-    return this.scanAll({ localOnly: true })
+  scanAllLocal(opts = {}) {
+    return this.scanAll({ localOnly: true, ...opts })
   }
 
   // Force-refresh the network-backed file parsers (currently just Cursor, whose
@@ -250,15 +279,22 @@ export class Store extends EventEmitter {
       for (const root of parser.roots) {
         for (const file of await walk(root, parser.match)) {
           const entry = this.files.get(file)
-          const before = JSON.stringify(entry?.records)
+          const beforeRecords = entry?.records
+          const beforeLen = Array.isArray(beforeRecords) ? beforeRecords.length : 0
           const beforeRevision = parser.revision
+          const beforeJson = beforeRevision === undefined ? JSON.stringify(beforeRecords) : null
           if (entry) {
             entry.mtimeMs = 0
             entry.size = 0
           }
           await this.ingestFile(file, { force: true })
-          const after = JSON.stringify(this.files.get(file)?.records)
-          if (after !== before || parser.revision !== beforeRevision) changed = true
+          const afterRecords = this.files.get(file)?.records
+          const afterLen = Array.isArray(afterRecords) ? afterRecords.length : 0
+          if (beforeRevision !== undefined) {
+            if (parser.revision !== beforeRevision || afterLen !== beforeLen) changed = true
+          } else if (JSON.stringify(afterRecords) !== beforeJson) {
+            changed = true
+          }
         }
       }
     }
@@ -551,10 +587,10 @@ export class Store extends EventEmitter {
 
     for (const r of records) {
       const cost = costFor(r)
-      add(perCli[r.cli], r, cost)
+      if (perCli[r.cli]) add(perCli[r.cli], r, cost)
       const dk = dayKey(r.ts)
       const isToday = dk === todayKey
-      if (isToday) add(todayPerCli[r.cli], r, cost)
+      if (isToday && todayPerCli[r.cli]) add(todayPerCli[r.cli], r, cost)
       if (r.ts >= weekStart && weekPerCli[r.cli]) add(weekPerCli[r.cli], r, cost)
       if (r.ts >= monthStart && monthPerCli[r.cli]) add(monthPerCli[r.cli], r, cost)
 
@@ -582,7 +618,7 @@ export class Store extends EventEmitter {
         d = { day: dk, total: 0, ...cliZeroTemplate }
         perDay.set(dk, d)
       }
-      d[r.cli] += r.total
+      if (r.cli in d) d[r.cli] += r.total
       d.total += r.total
 
       const sKey = r.cli + '|' + r.sessionId
@@ -681,45 +717,10 @@ export class Store extends EventEmitter {
   // ---- live watching -------------------------------------------------------
 
   async start() {
-    // Local usage must never wait behind Cursor's HTTP export.
+    // Only local files are watched and swept in real time. Network-backed
+    // parsers (Cursor) and remote proxy pollers (LiteLLM) are refreshed by the
+    // main process on app open, once per hour, and on manual refresh.
     await this.scanAllLocal()
-    this.refreshNetworkParsers().then((changed) => {
-      if (changed) this.emit('update', this.snapshot())
-    }).catch((err) => console.warn('network refresh failed:', err.message))
-    this.pollAll().then((changed) => {
-      if (changed) this.emit('update', this.snapshot())
-    }).catch((err) => console.warn('provider refresh failed:', err.message))
-    // Always run the poll-check timer, even if there are zero pollers right
-    // now — LiteLLM providers can be added later via the Settings UI (via
-    // setPollers()), and this timer must already be running for a newly
-    // added provider's configurable sync-minutes interval to actually fire
-    // repeatedly rather than only once (from the save-provider handler's
-    // immediate forcePoll()). Each poller throttles its own network calls to
-    // its configured syncMinutes (see litellm.js); this timer just needs to
-    // fire more often than the shortest configured interval so a fresh fetch
-    // is picked up promptly once it's due.
-    const timer = setInterval(async () => {
-      try {
-        if (await this.pollAll()) this.emit('update', this.snapshot())
-      } catch (err) {
-        console.warn('provider refresh failed:', err.message)
-      }
-    }, 60 * 1000)
-    this._pollTimers.push(timer)
-    // Network requests have their own throttle/backoff and never block local
-    // scans. Token extraction uses bounded reads rather than loading the DB.
-    const netTimer = setInterval(async () => {
-      if (this._refreshingNetwork) return
-      this._refreshingNetwork = true
-      try {
-        if (await this.refreshNetworkParsers()) this.emit('update', this.snapshot())
-      } catch (err) {
-        console.warn('network refresh failed:', err.message)
-      } finally {
-        this._refreshingNetwork = false
-      }
-    }, 10000)
-    this._pollTimers.push(netTimer)
     // Stat-sweep fallback for writers the fs-event path goes deaf on. Codex
     // holds its rollout file open for the whole session and appends without
     // the mtime ever changing: the OS event does fire, but chokidar stats the
@@ -728,20 +729,23 @@ export class Store extends EventEmitter {
     // was created. ingestFile() compares size as well as mtime, so a plain
     // stat sweep catches exactly what chokidar throws away. Polling mode
     // (usePolling) does NOT help — it makes the same stat comparison.
+    this._sweepCount = 0
     const sweepTimer = setInterval(async () => {
       if (this._sweeping) return // a cold-ish sweep must not stack up
       this._sweeping = true
       try {
-        if (await this.scanAllLocal()) this.emit('update', this.snapshot())
+        this._sweepCount++
+        const fullSignature = this._sweepCount % FULL_SIG_EVERY_SWEEPS === 0
+        if (await this.scanAllLocal({ fullSignature })) this.emit('update', this.snapshot())
       } catch (err) {
-        console.warn('local sweep failed:', err.message)
+        console.warn('local sweep failed:', err?.message || err)
       } finally {
         this._sweeping = false
       }
     }, SWEEP_MS)
     this._pollTimers.push(sweepTimer)
     const chokidar = (await import('chokidar')).default
-    const roots = [...new Set(PARSERS.flatMap((p) => p.roots))]
+    const roots = [...new Set(PARSERS.filter((p) => !p.network).flatMap((p) => p.roots))]
     for (const root of roots) {
       if (!fs.existsSync(root)) continue
       const watcher = chokidar.watch(root, {
@@ -759,23 +763,72 @@ export class Store extends EventEmitter {
     this.emit('update', this.snapshot())
   }
 
-  _queueRescan(file) {
-    // Debounce bursts of fs events into one snapshot emit.
+  _queueRescan(file, delayMs = 400) {
+    // Debounce bursts of fs events into one snapshot emit without stacking
+    // overlapping drains while a large SQLite file is still being parsed.
     this._pending = this._pending || new Set()
     this._pending.add(file)
-    if (this._scanTimer) return
-    this._scanTimer = setTimeout(async () => {
+    if (this._scanTimer || this._drainingPending) return
+    this._scanTimer = setTimeout(() => {
       this._scanTimer = null
-      const files = [...this._pending]
-      this._pending.clear()
-      let changed = false
-      for (const f of files) changed = (await this.ingestFile(f)) || changed
-      if (changed) this.emit('update', this.snapshot())
-    }, 400)
+      this._drainPending()
+    }, delayMs)
+  }
+
+  async _drainPending() {
+    if (this._drainingPending) return
+    this._drainingPending = true
+    let deferredDelay = null
+    try {
+      while (this._pending && this._pending.size > 0) {
+        const files = [...this._pending]
+        this._pending.clear()
+        let changed = false
+        const deferred = []
+        for (const f of files) {
+          const entry = this.files.get(f)
+          if (
+            entry &&
+            entry.parser?.kind === 'path' &&
+            !entry.parser.network &&
+            entry.size >= LARGE_WATCH_BYTES &&
+            entry.lastParsedAt
+          ) {
+            const waitMs = LARGE_WATCH_COOLDOWN_MS - (Date.now() - entry.lastParsedAt)
+            if (waitMs > 0) {
+              deferred.push(f)
+              deferredDelay = deferredDelay == null ? waitMs : Math.min(deferredDelay, waitMs)
+              continue
+            }
+          }
+          changed = (await this.ingestFile(f)) || changed
+        }
+        if (changed) this.emit('update', this.snapshot())
+        if (deferred.length) {
+          const hadImmediate = this._pending.size > 0
+          for (const f of deferred) this._pending.add(f)
+          if (hadImmediate) deferredDelay = null
+          break
+        }
+      }
+    } catch (err) {
+      console.warn('queued rescan failed:', err?.message || err)
+    } finally {
+      this._drainingPending = false
+      if (this._pending && this._pending.size > 0 && !this._scanTimer && this.watchers.length > 0) {
+        const nextDelay = deferredDelay != null ? Math.max(400, deferredDelay) : 400
+        this._scanTimer = setTimeout(() => {
+          this._scanTimer = null
+          this._drainPending()
+        }, nextDelay)
+      }
+    }
   }
 
   async stop() {
     clearTimeout(this._scanTimer)
+    this._scanTimer = null
+    if (this._pending) this._pending.clear()
     for (const w of this.watchers) await w.close()
     this.watchers = []
     for (const t of this._pollTimers) clearInterval(t)

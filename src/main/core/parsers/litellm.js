@@ -31,7 +31,9 @@
 
 const LOOKBACK_DAYS = 35
 const MAX_PAGES = 40
-export const DEFAULT_SYNC_MINUTES = 15 // matches the old hardcoded MIN_FETCH_INTERVAL_MS
+const PAGE_TIMEOUT_MS = 15000
+const FETCH_TOTAL_TIMEOUT_MS = 45000
+export const DEFAULT_SYNC_MINUTES = 60
 
 function isoDate(d) {
   return d.toISOString().slice(0, 10)
@@ -41,11 +43,35 @@ function localIsoDate(d) {
   return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`
 }
 
-async function fetchPage(baseUrl, apiKey, startDate, endDate, page) {
+// Wrap both fetch() and res.json() in an explicit timer race so a stalled
+// proxy response stream cannot wedge the shared cloud refresh coordinator.
+async function fetchPage(baseUrl, apiKey, startDate, endDate, page, timeoutMs = PAGE_TIMEOUT_MS) {
   const url = `${baseUrl}/user/daily/activity?start_date=${startDate}&end_date=${endDate}&page=${page}`
-  const res = await fetch(url, { headers: { Authorization: `Bearer ${apiKey}` } })
-  if (!res.ok) throw new Error(`litellm daily activity HTTP ${res.status}`)
-  return res.json()
+  const ctrl = new AbortController()
+  let timer = null
+  const boundedMs = Math.max(1000, timeoutMs)
+  const timeoutPromise = new Promise((_, reject) => {
+    timer = setTimeout(() => {
+      ctrl.abort()
+      const err = new Error(`litellm request timed out after ${boundedMs}ms`)
+      err.code = 'ETIMEDOUT'
+      reject(err)
+    }, boundedMs)
+  })
+  try {
+    return await Promise.race([
+      (async () => {
+        const res = await fetch(url, { headers: { Authorization: `Bearer ${apiKey}` }, signal: ctrl.signal })
+        if (!res.ok) throw new Error(`litellm daily activity HTTP ${res.status}`)
+        const json = await res.json()
+        if (ctrl.signal.aborted) throw new Error('litellm response aborted on timeout')
+        return json
+      })(),
+      timeoutPromise,
+    ])
+  } finally {
+    if (timer) clearTimeout(timer)
+  }
 }
 
 // Fetches every page across the lookback window and returns the raw per-day
@@ -61,10 +87,17 @@ async function fetchRawRecords(baseUrl, apiKey) {
   const locEnd = localIsoDate(end)
   const endDate = locEnd > utcEnd ? locEnd : utcEnd
 
+  const deadline = Date.now() + FETCH_TOTAL_TIMEOUT_MS
   const dayResults = []
   let page = 1
   while (page <= MAX_PAGES) {
-    const body = await fetchPage(baseUrl, apiKey, startDate, endDate, page)
+    const remaining = deadline - Date.now()
+    if (remaining <= 0) {
+      const err = new Error(`litellm fetch timed out after ${FETCH_TOTAL_TIMEOUT_MS}ms`)
+      err.code = 'ETIMEDOUT'
+      throw err
+    }
+    const body = await fetchPage(baseUrl, apiKey, startDate, endDate, page, Math.min(PAGE_TIMEOUT_MS, remaining))
     dayResults.push(...(body.results || []))
     if (!body.metadata?.has_more) break
     page++
@@ -215,6 +248,7 @@ export function createLitellmPoller({
   // synthetic (noon UTC of the usage day — the API has no per-request times),
   // so the store's "live" indicator uses this real sync time instead.
   let lastChange = null
+  let inFlight = null
 
   function reapply() {
     cache.applied = applyModelSettings(cache.raw, getModelSettings ? getModelSettings() : null)
@@ -222,49 +256,62 @@ export function createLitellmPoller({
   }
 
   async function refreshRaw() {
+    if (inFlight) return inFlight
     cache.fetchedAt = Date.now() // set before awaiting so overlapping triggers don't pile up calls
-    try {
-      const { dayResults, startDate } = await fetchRawRecords(baseUrl, apiKey)
-      const fetched = flatten(dayResults, id)
-      if (cache.hasBaseline) {
-        // Which bucket grew? Prefer the newest usage day, then the biggest jump.
-        const prevTotals = new Map(cache.raw.map((r) => [r.dedupKey, r.total]))
-        let best = null
-        for (const r of fetched) {
-          const delta = r.total - (prevTotals.get(r.dedupKey) || 0)
-          if (delta <= 0) continue
-          if (!best || r.ts > best.ts || (r.ts === best.ts && delta > best.delta)) best = { ...r, delta }
+    inFlight = (async () => {
+      try {
+        const { dayResults, startDate } = await fetchRawRecords(baseUrl, apiKey)
+        const fetched = flatten(dayResults, id)
+        if (cache.hasBaseline) {
+          // Which bucket grew? Prefer the newest usage day, then the biggest jump.
+          const prevTotals = new Map(cache.raw.map((r) => [r.dedupKey, r.total]))
+          let best = null
+          for (const r of fetched) {
+            const delta = r.total - (prevTotals.get(r.dedupKey) || 0)
+            if (delta <= 0) continue
+            if (!best || r.ts > best.ts || (r.ts === best.ts && delta > best.delta)) best = { ...r, delta }
+          }
+          if (best) lastChange = { ts: Date.now(), model: best.model, project: best.project }
         }
-        if (best) lastChange = { ts: Date.now(), model: best.model, project: best.project }
-      }
-      // The fetch is authoritative for its own window and nothing else: days
-      // before it are kept from the archive (that's the only place they exist),
-      // days inside it are replaced wholesale so a bucket deleted server-side
-      // disappears here too instead of being frozen forever.
-      const archived = cache.raw.filter((r) => new Date(r.ts).toISOString().slice(0, 10) < startDate)
-      cache.raw = [...archived, ...fetched]
-      cache.hasBaseline = true // the first fetch only sets the comparison baseline
-      if (saveArchive) {
-        try {
-          saveArchive(fetched.map(bucketFromRecord), startDate)
-        } catch {
-          // persistence is best-effort; the in-memory set is still correct
+        // The fetch is authoritative for its own window and nothing else: days
+        // before it are kept from the archive (that's the only place they exist),
+        // days inside it are replaced wholesale so a bucket deleted server-side
+        // disappears here too instead of being frozen forever.
+        const archived = cache.raw.filter((r) => new Date(r.ts).toISOString().slice(0, 10) < startDate)
+        cache.raw = [...archived, ...fetched]
+        cache.hasBaseline = true // the first fetch only sets the comparison baseline
+        if (saveArchive) {
+          try {
+            saveArchive(fetched.map(bucketFromRecord), startDate)
+          } catch {
+            // persistence is best-effort; the in-memory set is still correct
+          }
         }
+      } catch {
+        // undocumented internal admin API: keep the previous cache on error
       }
-    } catch {
-      // undocumented internal admin API: keep the previous cache on error
-    }
-    reapply()
+      reapply()
+    })().finally(() => { inFlight = null })
+    return inFlight
   }
 
-  async function poll() {
-    if (Date.now() - cache.fetchedAt >= intervalMs) await refreshRaw()
+  async function poll({ slackMs = 0 } = {}) {
+    if (inFlight) {
+      await inFlight
+      return cache.applied
+    }
+    if (cache.fetchedAt === 0 || Date.now() - cache.fetchedAt + slackMs >= intervalMs) await refreshRaw()
     return cache.applied
   }
 
   async function forceRefresh() {
+    if (inFlight) {
+      await inFlight
+      return cache.applied
+    }
     cache.fetchedAt = 0
-    return poll()
+    await refreshRaw()
+    return cache.applied
   }
 
   // Re-applies live visibility/rename settings against the already-cached raw

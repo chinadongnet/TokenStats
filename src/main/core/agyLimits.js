@@ -3,12 +3,12 @@ import fs from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
 
-const REFRESH_MS = 20000 // between successful scrapes
-const RETRY_BASE_MS = 60 * 1000 // exponential backoff base on failure
-const AUTH_BACKOFF_MS = 5 * 60 * 1000 // minimum cooldown when agy enters login flow
-const MAX_BACKOFF_MS = 15 * 60 * 1000 // cap backoff at 15 minutes
+const REFRESH_MS = 60 * 60 * 1000 // between scheduled scrapes (1 hour)
+const RETRY_BASE_MS = 5 * 60 * 1000 // backoff base on failure for non-forced checks
+const AUTH_BACKOFF_MS = 15 * 60 * 1000 // minimum cooldown when agy enters login flow
+const MAX_BACKOFF_MS = 60 * 60 * 1000 // cap backoff at 1 hour
 const RUN_TIMEOUT_MS = 30 * 1000 // one scrape; high-latency networks can exceed 15s
-const MAX_AGE_MS = 60000
+const MAX_AGE_MS = 2 * 60 * 60 * 1000 // keep live windows valid across hourly refreshes
 
 // When `agy --print /usage` encounters a proxy/network error while verifying
 // stored credentials, agy's internal `waitForAuth` can mistake it for an

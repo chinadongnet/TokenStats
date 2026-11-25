@@ -41,11 +41,10 @@ import fs from 'node:fs'
 //     so a stale 5h window silently vanishes from the popup while the weekly
 //     one keeps showing a stuck percentage, with nothing anywhere saying why.
 
-const REFRESH_MS = 15 * 60 * 1000 // between successful scrapes
-const RETRY_MS = 2 * 60 * 1000 // after a failure, × consecutive failures, capped at REFRESH_MS
+const REFRESH_MS = 60 * 60 * 1000 // between scheduled scrapes (1 hour)
 const RUN_TIMEOUT_MS = 120 * 1000 // one scrape; the CLI got slow, see above
 const WATCHDOG_MS = RUN_TIMEOUT_MS + 15 * 1000 // hard settle guarantee for one run
-const STALE_MS = 45 * 60 * 1000 // stop serving a cache no refresh has renewed
+const STALE_MS = 2 * 60 * 60 * 1000 // stop serving a cache no refresh has renewed within 2 hours
 
 const RUN_ARGS = ['-p', '--output-format', 'text', '--strict-mcp-config']
 
@@ -182,11 +181,11 @@ function refresh() {
       cache = { windows: w, okAt: Date.now() }
       nextAt = Date.now() + REFRESH_MS
     } else {
-      // Keep the windows for now — claudeResetWindows() ages them out — but come
-      // back sooner than a full cycle, backing off if it keeps failing so a
-      // broken/uninstalled CLI isn't re-spawned every couple of minutes.
+      // Keep the windows until STALE_MS ages them out; wait until the next
+      // scheduled hourly tick or next app-open / manual refresh rather than
+      // background-retrying every couple of minutes.
       fails += 1
-      nextAt = Date.now() + Math.min(REFRESH_MS, RETRY_MS * fails)
+      nextAt = Date.now() + REFRESH_MS
       console.error(`[claudeLimits] /usage scrape failed after ${Date.now() - startedAt}ms (${fails}x)`)
     }
     inflight = null
@@ -195,19 +194,19 @@ function refresh() {
   return inflight
 }
 
-// Prime once at startup so the first popup already has data.
-export function primeClaudeLimits() {
+// Refresh Claude's live plan-quota explicitly (on startup, app open, hourly
+// tick, or manual refresh). Never triggered implicitly by reading cached state.
+export function primeClaudeLimits({ force = false } = {}) {
+  if (!force && Date.now() < nextAt) return inflight || Promise.resolve(claudeResetWindows())
   return refresh()
 }
 
-// Newest Claude plan-quota windows, or [] if none is current. Returns the
-// cached value immediately and kicks a background refresh when one is due.
-// Nothing frozen is ever served: a window whose reset time has passed, and a
-// whole cache no refresh has renewed within STALE_MS, are dropped so the popup
-// falls back to the plan's estimate instead of showing a stuck number.
+// Newest Claude plan-quota windows, or [] if none is current. Pure cache read:
+// never spawns the CLI as a side effect. Nothing frozen is ever served: a
+// window whose reset time has passed, and a whole cache no refresh has renewed
+// within STALE_MS, are dropped so the popup falls back to the plan's estimate.
 export function claudeResetWindows() {
   const now = Date.now()
-  if (now >= nextAt) refresh()
   if (!cache.okAt || now - cache.okAt > STALE_MS) return []
   return cache.windows.filter((w) => w.resetsAt == null || w.resetsAt > now)
 }

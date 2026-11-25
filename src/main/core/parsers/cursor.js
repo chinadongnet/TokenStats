@@ -37,8 +37,9 @@ import { CLI_ROOTS, CONFIG_DIR } from '../paths.js'
 //
 // Fetches are cached per account (keyed by the JWT's user id, since an
 // account's usage is identical regardless of which device's token fetched
-// it). Successful requests use a 20-second minimum interval; HTTP 403/429
-// backs off for 15 minutes while keeping the previously archived records.
+// it). Successful requests use a 1-hour minimum interval (bypassed via
+// forceRefresh on app open or manual refresh); HTTP 403/429 backs off for
+// 15 minutes while keeping the previously archived records.
 
 function decodeJwtPart(segment) {
   try {
@@ -403,7 +404,8 @@ async function fetchUsageSummary(token) {
   return parseUsageSummary(json)
 }
 
-const MIN_FETCH_INTERVAL_MS = 20 * 1000
+const MIN_FETCH_INTERVAL_MS = 60 * 60 * 1000
+const ERROR_RETRY_MS = 5 * 60 * 1000
 const cacheByUser = new Map() // userId -> { records, fetchedAt, retryAt }
 let archive = {}
 let activeUserId = null
@@ -452,6 +454,33 @@ async function loadDefaultArchive(userId) {
 let latestWindows = []
 export function cursorResetWindows() {
   return latestWindows
+}
+
+function recordsEqual(a, b) {
+  if (a === b) return true
+  if (!Array.isArray(a) || !Array.isArray(b) || a.length !== b.length) return false
+  for (let i = 0; i < a.length; i++) {
+    const x = a[i]
+    const y = b[i]
+    if (x === y) continue
+    if (
+      !x ||
+      !y ||
+      x.dedupKey !== y.dedupKey ||
+      x.ts !== y.ts ||
+      x.model !== y.model ||
+      x.total !== y.total ||
+      x.input !== y.input ||
+      x.output !== y.output ||
+      x.cacheRead !== y.cacheRead ||
+      x.cacheCreate !== y.cacheCreate ||
+      x.userId !== y.userId ||
+      x.backfillBeforeMs !== y.backfillBeforeMs
+    ) {
+      return false
+    }
+  }
+  return true
 }
 
 async function getCloudRecords(token) {
@@ -508,7 +537,8 @@ async function getCloudRecords(token) {
     }
     const resumeAnchor = Math.max(latestCloudTs, entry.coveredUntilMs || 0)
     const twoDaysAgo = Date.now() - 2 * 86400000
-    const resumeBase = resumeAnchor > 0 ? Math.min(twoDaysAgo, resumeAnchor - 2 * 3600000) : twoDaysAgo
+    const recentFloor = entry.coveredUntilMs > 0 ? Date.now() - 2 * 3600000 : twoDaysAgo
+    const resumeBase = resumeAnchor > 0 ? Math.min(recentFloor, resumeAnchor - 2 * 3600000) : twoDaysAgo
     const backfillBeforeMs = Number(entry.backfillBeforeMs) > 0 ? Number(entry.backfillBeforeMs) : 0
     const recentFromMs =
       entry.records.length || backfillBeforeMs > 0
@@ -533,19 +563,19 @@ async function getCloudRecords(token) {
       }
       const merged = [...byKey.values()].sort((a, b) => a.ts - b.ts)
       const records = tagUser(merged, nextBackfill)
-      const prevJson = JSON.stringify(entry.records)
-      entry.records = records
-      entry.backfillBeforeMs = nextBackfill
-      entry.coveredUntilMs = fetchStartedAt
-      if (JSON.stringify(records) !== prevJson) {
+      const changed = entry.backfillBeforeMs !== nextBackfill || !recordsEqual(entry.records, records)
+      if (changed) {
+        entry.records = records
         cursor.revision++
       }
+      entry.backfillBeforeMs = nextBackfill
+      entry.coveredUntilMs = fetchStartedAt
       archive.save?.(userId, entry.records, nextBackfill)
       entry.fetchedAt = Date.now()
       entry.retryAt = 0
     } else {
       const err = usage.reason
-      entry.retryAt = Date.now() + ([403, 429].includes(err?.status) ? 15 * 60000 : MIN_FETCH_INTERVAL_MS)
+      entry.retryAt = Date.now() + ([403, 429].includes(err?.status) ? 15 * 60000 : ERROR_RETRY_MS)
       console.warn('Cursor usage refresh failed; retaining history:', err?.message || err)
     }
     if (summary.status === 'fulfilled' && JSON.stringify(latestWindows) !== JSON.stringify(summary.value)) {

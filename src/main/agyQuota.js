@@ -1,7 +1,7 @@
 // Antigravity (agy) live-quota integration.
 //
 // Current agy exposes quota through its built-in `/usage` JSON command; the
-// main process refreshes it every 20s while this integration is enabled.
+// main process refreshes it on app open and once per hour while enabled.
 // The opt-in statusLine mirror remains a fallback, accepted only when fresh.
 // Headless AGY sessions don't render statusLine, so mirror-only reads can freeze
 // indefinitely. Never label an expired mirror or quota window as live.
@@ -206,13 +206,15 @@ export function agyResetWindows() {
     return []
   }
   let d
+  let mtimeMs
   try {
     const live = agyLiveWindows()
     if (live.length) return live
-    if (Date.now() - fs.statSync(AGY_MIRROR_PATH).mtimeMs > 60000) return []
+    mtimeMs = fs.statSync(AGY_MIRROR_PATH).mtimeMs
+    if (Date.now() - mtimeMs > 2 * 60 * 60 * 1000) return []
     d = JSON.parse(fs.readFileSync(AGY_MIRROR_PATH, 'utf8'))
   } catch {
     return []
   }
-  return parseAgyQuota(d, fs.statSync(AGY_MIRROR_PATH).mtimeMs)
+  return parseAgyQuota(d, mtimeMs).filter((w) => w.resetsAt > Date.now())
 }

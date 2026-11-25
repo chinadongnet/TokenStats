@@ -112,6 +112,27 @@ try {
   assert.equal(records.length, 4, 'archived 6d record + 4d/3d/1d records must all be retained')
   assert.equal(savedRecords?.length, 4)
 
+  // Subsequent in-session refresh: throttled without forceRefresh, and once forced
+  // (app-open / hourly), only rewinds ~2h instead of re-fetching 48h of CSV.
+  let extraFetches = 0
+  globalThis.fetch = async (url) => {
+    const u = String(url)
+    if (u.includes('/api/usage-summary')) return new Response('{}', { status: 200 })
+    extraFetches++
+    requestedStartDate = Number(new URL(u).searchParams.get('startDate'))
+    return new Response(
+      'Date,Kind,Model,Input (w/ Cache Write),Input (w/o Cache Write),Cache Read,Output Tokens,Total Tokens',
+      { status: 200 }
+    )
+  }
+  await cursor.parseFile(sqliteFile)
+  assert.equal(extraFetches, 0, 'non-forced parseFile within 1h must use cached records')
+  cursor.forceRefresh()
+  const refreshed = await cursor.parseFile(sqliteFile)
+  assert.equal(extraFetches, 1, 'forceRefresh must fetch once')
+  assert.ok(requestedStartDate >= now - 3 * 3600000, 'subsequent session refresh must only rewind ~2h')
+  assert.equal(refreshed.length, 4, 'narrow recent window must retain all 4 archived records')
+
   // Cold-start fallback backfill: if the initial full-history (startDate=0) export
   // fails and falls back to 30-day chunks, subsequent refreshes (including after
   // restarting from the saved archive) must continue backfilling older history.
