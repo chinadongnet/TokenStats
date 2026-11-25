@@ -1,9 +1,11 @@
 import fsp from 'node:fs/promises'
 
+const MAX_WAL_SNAPSHOT_BYTES = 1024 * 1024 * 1024 // 1 GiB safety cap
+
 // sql.js cannot open a WAL beside a database. Overlay only checksum-valid,
 // committed frames onto a private copy; never checkpoint or write to CLI data.
 // Format: https://www.sqlite.org/fileformat2.html#walformat
-export function applyWal(database, wal) {
+export function applyWal(database, wal, { inPlace = false } = {}) {
   if (!wal || wal.length < 32) return database
   const magic = wal.readUInt32BE(0)
   if (![0x377f0682, 0x377f0683].includes(magic)) throw new Error('Invalid SQLite WAL header')
@@ -35,8 +37,19 @@ export function applyWal(database, wal) {
     if (size) { committed = frames.length; pages = size }
   }
   if (!committed) return database
-  const snapshot = Buffer.alloc(pages * pageSize)
-  database.copy(snapshot)
+  const targetBytes = pages * pageSize
+  if (!Number.isSafeInteger(targetBytes) || targetBytes <= 0 || targetBytes > MAX_WAL_SNAPSHOT_BYTES) {
+    throw new Error(`Invalid WAL snapshot size: ${targetBytes}`)
+  }
+  // When the caller owns `database` exclusively (readSqliteSnapshot) and the
+  // page count matches, overlay frames in place to avoid duplicating huge DBs.
+  let snapshot
+  if (inPlace && targetBytes === database.length) {
+    snapshot = database
+  } else {
+    snapshot = Buffer.alloc(targetBytes)
+    database.copy(snapshot, 0, 0, Math.min(database.length, targetBytes))
+  }
   for (const { page, offset } of frames.slice(0, committed)) {
     if (page <= pages) wal.copy(snapshot, (page - 1) * pageSize, offset + 24, offset + 24 + pageSize)
   }
@@ -89,7 +102,7 @@ export async function readSqliteSnapshot(file) {
     let wal = null
     try { wal = await fsp.readFile(file + '-wal') } catch (err) { if (err.code !== 'ENOENT') throw err }
     const after = await Promise.all(paths.map(stamp))
-    if (before.every((s, i) => s === after[i])) return applyWal(database, wal)
+    if (before.every((s, i) => s === after[i])) return applyWal(database, wal, { inPlace: true })
   }
   throw new Error('SQLite source changed during snapshot; retry on next sweep')
 }

@@ -456,6 +456,33 @@ export function cursorResetWindows() {
   return latestWindows
 }
 
+function recordsEqual(a, b) {
+  if (a === b) return true
+  if (!Array.isArray(a) || !Array.isArray(b) || a.length !== b.length) return false
+  for (let i = 0; i < a.length; i++) {
+    const x = a[i]
+    const y = b[i]
+    if (x === y) continue
+    if (
+      !x ||
+      !y ||
+      x.dedupKey !== y.dedupKey ||
+      x.ts !== y.ts ||
+      x.model !== y.model ||
+      x.total !== y.total ||
+      x.input !== y.input ||
+      x.output !== y.output ||
+      x.cacheRead !== y.cacheRead ||
+      x.cacheCreate !== y.cacheCreate ||
+      x.userId !== y.userId ||
+      x.backfillBeforeMs !== y.backfillBeforeMs
+    ) {
+      return false
+    }
+  }
+  return true
+}
+
 async function getCloudRecords(token) {
   const payload = decodeJwt(token)
   const userId = payload?.sub ? String(payload.sub) : 'unknown'
@@ -536,11 +563,11 @@ async function getCloudRecords(token) {
       }
       const merged = [...byKey.values()].sort((a, b) => a.ts - b.ts)
       const records = tagUser(merged, nextBackfill)
-      const prevJson = JSON.stringify(entry.records)
+      const changed = !recordsEqual(entry.records, records)
       entry.records = records
       entry.backfillBeforeMs = nextBackfill
       entry.coveredUntilMs = fetchStartedAt
-      if (JSON.stringify(records) !== prevJson) {
+      if (changed) {
         cursor.revision++
       }
       archive.save?.(userId, entry.records, nextBackfill)

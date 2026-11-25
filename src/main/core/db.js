@@ -217,12 +217,184 @@ function migrateSchema(db) {
   }
 }
 
+function normalizeSqlError(err) {
+  if (err instanceof Error) return err
+  if (typeof err === 'string') return new Error(err)
+  if (err && typeof err === 'object' && typeof err.message === 'string') return new Error(err.message)
+  return new Error(String(err))
+}
+
+function sanitizeBindParams(params) {
+  if (Array.isArray(params)) {
+    let needsCopy = false
+    for (let i = 0; i < params.length; i++) {
+      if (params[i] === undefined) {
+        needsCopy = true
+        break
+      }
+    }
+    return needsCopy ? params.map((v) => (v === undefined ? null : v)) : params
+  }
+  if (params && typeof params === 'object') {
+    const out = {}
+    for (const [k, v] of Object.entries(params)) out[k] = v === undefined ? null : v
+    return out
+  }
+  return params
+}
+
 export class UsageDb {
   constructor({ dbPath, wasmPath } = {}) {
     this.dbPath = dbPath || path.join(CONFIG_DIR, 'usage.sqlite')
     this.wasmPath = wasmPath || path.join(path.dirname(require.resolve('sql.js')), 'sql-wasm.wasm')
     this.db = null
     this.SQL = null
+    this._rawRun = null
+    this._dirty = false
+    this._persistTimer = null
+    this._lastCompactAt = 0
+  }
+
+  _attachDb(database) {
+    this.db = database
+    const origRun = database.run.bind(database)
+    const origExec = database.exec.bind(database)
+    const origPrepare = database.prepare.bind(database)
+    this._rawRun = origRun
+    database.run = (sql, params) => {
+      this._mutationSeq = (this._mutationSeq || 0) + 1
+      try {
+        return params !== undefined ? origRun(sql, sanitizeBindParams(params)) : origRun(sql)
+      } catch (err) {
+        throw normalizeSqlError(err)
+      }
+    }
+    database.exec = (sql, params, config) => {
+      try {
+        return params !== undefined ? origExec(sql, sanitizeBindParams(params), config) : origExec(sql)
+      } catch (err) {
+        throw normalizeSqlError(err)
+      }
+    }
+    database.prepare = (sql, params) => {
+      try {
+        return params !== undefined ? origPrepare(sql, sanitizeBindParams(params)) : origPrepare(sql)
+      } catch (err) {
+        throw normalizeSqlError(err)
+      }
+    }
+  }
+
+  _ensureOpen() {
+    if (!this.db || !this.db.db) {
+      if (!this.SQL) throw new Error('UsageDb is not open')
+      this._reopenFromDisk()
+    }
+  }
+
+  _reopenFromDisk() {
+    const prev = this.db
+    this.db = null
+    this._rawRun = null
+    if (prev) {
+      try {
+        prev.close()
+      } catch {
+        // ignore close failures on a broken handle
+      }
+    }
+    let bytes = null
+    try {
+      bytes = fs.readFileSync(this.dbPath)
+    } catch {
+      // no existing db yet
+    }
+    const nextDb = bytes ? new this.SQL.Database(bytes) : new this.SQL.Database()
+    this._mutationSeq = (this._mutationSeq || 0) + 1
+    this._lastIngestMutationSeq = -1
+    this._attachDb(nextDb)
+    this.db.run(SCHEMA)
+    migrateSchema(this.db)
+  }
+
+  _recoverAfterExportFailure() {
+    try {
+      if (this.db && this.db.db) {
+        this.db.exec('SELECT 1')
+        return
+      }
+    } catch {
+      // handle is closed or poisoned after failed export()
+    }
+    try {
+      this._reopenFromDisk()
+    } catch (reopenErr) {
+      console.error('usage db recovery failed:', reopenErr)
+    }
+  }
+
+  _runTransaction(fn) {
+    this._ensureOpen()
+    this.db.run('BEGIN')
+    try {
+      const res = fn()
+      this.db.run('COMMIT')
+      return res
+    } catch (err) {
+      try {
+        this.db?.run('ROLLBACK')
+      } catch {
+        // ignore rollback error if handle/transaction already closed
+      }
+      throw normalizeSqlError(err)
+    }
+  }
+
+  _clearPersistTimer() {
+    if (this._persistTimer) {
+      clearTimeout(this._persistTimer)
+      this._persistTimer = null
+    }
+  }
+
+  schedulePersist(delayMs = 60000) {
+    this._dirty = true
+    if (this._persistTimer) return
+    this._persistTimer = setTimeout(() => {
+      this._persistTimer = null
+      if (!this._dirty) return
+      try {
+        this.persist({ bumpSeq: false })
+      } catch (err) {
+        console.error('deferred db persist failed:', err)
+      }
+    }, Math.max(1000, Number(delayMs) || 60000))
+    this._persistTimer.unref?.()
+  }
+
+  flushPersist() {
+    this._clearPersistTimer()
+    if (!this._dirty || !this.db) return false
+    this.persist({ bumpSeq: false })
+    return true
+  }
+
+  close() {
+    try {
+      this.flushPersist()
+    } catch (err) {
+      console.error('usage db flush on close failed:', err)
+    }
+    this._clearPersistTimer()
+    if (this.db) {
+      try {
+        this.db.close()
+      } catch {
+        // ignore
+      }
+      this.db = null
+      this._rawRun = null
+    }
   }
 
   async open() {
@@ -234,13 +406,8 @@ export class UsageDb {
     } catch {
       // no existing db yet
     }
-    this.db = bytes ? new this.SQL.Database(bytes) : new this.SQL.Database()
     this._mutationSeq = 1
-    const origRun = this.db.run.bind(this.db)
-    this.db.run = (...args) => {
-      this._mutationSeq = (this._mutationSeq || 0) + 1
-      return origRun(...args)
-    }
+    this._attachDb(bytes ? new this.SQL.Database(bytes) : new this.SQL.Database())
     this.db.run(SCHEMA)
     migrateSchema(this.db)
     if (bytes) {
@@ -257,14 +424,16 @@ export class UsageDb {
       const fl = this.rows('PRAGMA freelist_count')[0]?.freelist_count || 0
       if (hasStaleRootRows || fl > 1000) {
         this.db.run('VACUUM')
+        this._lastCompactAt = Date.now()
         this.persist()
       }
     }
     return this
   }
 
-  // Rebuild the hourly table from the full record set, then persist to disk.
-  ingest(records) {
+  // Rebuild the hourly table from the full record set, then persist to disk
+  // (or defer the disk write when { persist: false } is passed on the hot loop).
+  ingest(records, { persist = true } = {}) {
     const tzKey = currentTzKey()
     if (
       Array.isArray(records) &&
@@ -405,42 +574,55 @@ export class UsageDb {
       return buckets.size
     }
 
-    this.db.run('BEGIN')
-    this.db.run('DELETE FROM usage_hourly')
-    const stmt = this.db.prepare(
-      'INSERT INTO usage_hourly (hour,cli,model,input,output,cache_read,cache_create,reasoning,total,cost,turns) VALUES (?,?,?,?,?,?,?,?,?,?,?)'
-    )
-    for (const b of buckets.values()) {
-      stmt.run([b.hour, b.cli, b.model, b.input, b.output, b.cacheRead, b.cacheCreate, b.reasoning, b.total, b.cost, b.turns])
-    }
-    stmt.free()
-    this.db.run('DELETE FROM usage_root_hourly')
-    const rootStmt = this.db.prepare(
-      'INSERT INTO usage_root_hourly (hour,cli,root,model,input,output,cache_read,cache_create,reasoning,total,cost,turns,parts_json) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)'
-    )
-    for (const rb of rootBuckets.values()) {
-      rootStmt.run([rb.hour, rb.cli, rb.root, rb.model, rb.input, rb.output, rb.cacheRead, rb.cacheCreate, rb.reasoning, rb.total, rb.cost, rb.turns, rb.parts.length ? JSON.stringify(rb.parts) : null])
-    }
-    rootStmt.free()
-    // Keep the current device's rows in cloud_usage_hourly in sync with local
-    // ingests so "all devices (account)" and "this device" views immediately
-    // reflect new local usage even between cloud sync passes.
-    if (curDev?.id) {
-      this.db.run('DELETE FROM cloud_usage_hourly WHERE key_id = ?', [curDev.id])
-      const cStmt = this.db.prepare(
-        'INSERT INTO cloud_usage_hourly (key_id,hour,cli,model,input,output,cache_read,cache_create,reasoning,total,cost,turns) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)'
+    this._runTransaction(() => {
+      this.db.run('DELETE FROM usage_hourly')
+      const stmt = this.db.prepare(
+        'INSERT INTO usage_hourly (hour,cli,model,input,output,cache_read,cache_create,reasoning,total,cost,turns) VALUES (?,?,?,?,?,?,?,?,?,?,?)'
       )
-      for (const b of buckets.values()) {
-        cStmt.run([curDev.id, b.hour, b.cli, b.model, b.input, b.output, b.cacheRead, b.cacheCreate, b.reasoning, b.total, b.cost, b.turns])
+      try {
+        for (const b of buckets.values()) {
+          stmt.run(sanitizeBindParams([b.hour, b.cli, b.model, b.input, b.output, b.cacheRead, b.cacheCreate, b.reasoning, b.total, b.cost, b.turns]))
+        }
+      } finally {
+        try { stmt.free() } catch {}
       }
-      cStmt.free()
+      this.db.run('DELETE FROM usage_root_hourly')
+      const rootStmt = this.db.prepare(
+        'INSERT INTO usage_root_hourly (hour,cli,root,model,input,output,cache_read,cache_create,reasoning,total,cost,turns,parts_json) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)'
+      )
+      try {
+        for (const rb of rootBuckets.values()) {
+          rootStmt.run(sanitizeBindParams([rb.hour, rb.cli, rb.root, rb.model, rb.input, rb.output, rb.cacheRead, rb.cacheCreate, rb.reasoning, rb.total, rb.cost, rb.turns, rb.parts.length ? JSON.stringify(rb.parts) : null]))
+        }
+      } finally {
+        try { rootStmt.free() } catch {}
+      }
+      // Keep the current device's rows in cloud_usage_hourly in sync with local
+      // ingests so "all devices (account)" and "this device" views immediately
+      // reflect new local usage even between cloud sync passes.
+      if (curDev?.id) {
+        this.db.run('DELETE FROM cloud_usage_hourly WHERE key_id = ?', [curDev.id])
+        const cStmt = this.db.prepare(
+          'INSERT INTO cloud_usage_hourly (key_id,hour,cli,model,input,output,cache_read,cache_create,reasoning,total,cost,turns) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)'
+        )
+        try {
+          for (const b of buckets.values()) {
+            cStmt.run(sanitizeBindParams([curDev.id, b.hour, b.cli, b.model, b.input, b.output, b.cacheRead, b.cacheCreate, b.reasoning, b.total, b.cost, b.turns]))
+          }
+        } finally {
+          try { cStmt.free() } catch {}
+        }
+      }
+      if (historicalChanged) {
+        this.fullResyncGen = (this.fullResyncGen || 0) + 1
+        this.db.run('UPDATE cloud_sync SET full_resync = 1 WHERE id = 1')
+      }
+    })
+    if (persist) {
+      this.persist()
+    } else {
+      this.schedulePersist()
     }
-    if (historicalChanged) {
-      this.fullResyncGen = (this.fullResyncGen || 0) + 1
-      this.db.run('UPDATE cloud_sync SET full_resync = 1 WHERE id = 1')
-    }
-    this.db.run('COMMIT')
-    this.persist()
     this._lastRootBucketsSig = rootBucketsSig
     this._lastIngestCurDevId = curDev?.id || null
     this._lastIngestBucketCount = buckets.size
@@ -449,9 +631,36 @@ export class UsageDb {
     return buckets.size
   }
 
-  persist() {
-    this._mutationSeq = (this._mutationSeq || 0) + 1
-    const data = Buffer.from(this.db.export())
+  _maybeCompact() {
+    try {
+      const fl = this.rows('PRAGMA freelist_count')[0]?.freelist_count || 0
+      if (fl > 4000 || (fl > 2000 && Date.now() - this._lastCompactAt > 10 * 60 * 1000)) {
+        this._rawRun?.('VACUUM')
+        this._lastCompactAt = Date.now()
+      }
+    } catch {
+      // compaction is best-effort
+    }
+  }
+
+  persist({ bumpSeq = true } = {}) {
+    this._ensureOpen()
+    this._clearPersistTimer()
+    if (bumpSeq) this._mutationSeq = (this._mutationSeq || 0) + 1
+    let exported
+    try {
+      this._maybeCompact()
+      exported = this.db.export()
+    } catch (err) {
+      const normalized = normalizeSqlError(err)
+      // sql.js export() closes sqlite3 before copying MEMFS and reopens after.
+      // If it threw in between (e.g. OOM), recover cleanly so this.db is not
+      // left pointing at a closed handle.
+      this._recoverAfterExportFailure()
+      throw normalized
+    }
+    // Zero-copy view over the exported Uint8Array instead of duplicating 43-76 MB.
+    const data = Buffer.from(exported.buffer, exported.byteOffset, exported.byteLength)
     fs.mkdirSync(path.dirname(this.dbPath), { recursive: true })
     const tmpPath = `${this.dbPath}.${process.pid}.tmp`
     fs.writeFileSync(tmpPath, data)
@@ -461,6 +670,7 @@ export class UsageDb {
       fs.writeFileSync(this.dbPath, data)
       try { fs.unlinkSync(tmpPath) } catch {}
     }
+    this._dirty = false
   }
 
   // ---- LiteLLM provider settings (multi-provider Settings UI) -------------
@@ -574,31 +784,34 @@ export class UsageDb {
   // corrected rather than duplicated. Days BEFORE the window are never touched;
   // they only exist here. Omitting `fromDay` upserts without clearing.
   saveLitellmUsage(providerId, buckets, fromDay) {
-    this.db.run('BEGIN')
-    if (fromDay) {
-      this.db.run('DELETE FROM litellm_usage WHERE provider_id = ? AND day >= ?', [providerId, fromDay])
-    }
-    const stmt = this.db.prepare(
-      `INSERT INTO litellm_usage
-         (dedup_key, provider_id, day, ts, model, key_hash, key_alias,
-          input, output, cache_read, cache_create, total, cost, turns)
-       VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)
-       ON CONFLICT(dedup_key) DO UPDATE SET
-         day=excluded.day, ts=excluded.ts, model=excluded.model,
-         key_hash=excluded.key_hash, key_alias=excluded.key_alias,
-         input=excluded.input, output=excluded.output,
-         cache_read=excluded.cache_read, cache_create=excluded.cache_create,
-         total=excluded.total, cost=excluded.cost, turns=excluded.turns`
-    )
-    for (const b of buckets || []) {
-      stmt.run([
-        b.dedupKey, providerId, b.day, b.ts, b.model, b.keyHash ?? null, b.keyAlias ?? null,
-        b.input || 0, b.output || 0, b.cacheRead || 0, b.cacheCreate || 0,
-        b.total || 0, b.cost || 0, b.turns || 0,
-      ])
-    }
-    stmt.free()
-    this.db.run('COMMIT')
+    this._runTransaction(() => {
+      if (fromDay) {
+        this.db.run('DELETE FROM litellm_usage WHERE provider_id = ? AND day >= ?', [providerId, fromDay])
+      }
+      const stmt = this.db.prepare(
+        `INSERT INTO litellm_usage
+           (dedup_key, provider_id, day, ts, model, key_hash, key_alias,
+            input, output, cache_read, cache_create, total, cost, turns)
+         VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+         ON CONFLICT(dedup_key) DO UPDATE SET
+           day=excluded.day, ts=excluded.ts, model=excluded.model,
+           key_hash=excluded.key_hash, key_alias=excluded.key_alias,
+           input=excluded.input, output=excluded.output,
+           cache_read=excluded.cache_read, cache_create=excluded.cache_create,
+           total=excluded.total, cost=excluded.cost, turns=excluded.turns`
+      )
+      try {
+        for (const b of buckets || []) {
+          stmt.run(sanitizeBindParams([
+            b.dedupKey, providerId, b.day, b.ts, b.model, b.keyHash ?? null, b.keyAlias ?? null,
+            b.input || 0, b.output || 0, b.cacheRead || 0, b.cacheCreate || 0,
+            b.total || 0, b.cost || 0, b.turns || 0,
+          ]))
+        }
+      } finally {
+        try { stmt.free() } catch {}
+      }
+    })
     this.persist()
   }
 
@@ -644,8 +857,7 @@ export class UsageDb {
     const nextApiKey = String(apiKey || '').trim()
     const connectionChanged = prev.endpoint !== nextEndpoint || prev.apiKey !== nextApiKey
     this.fullResyncGen = (this.fullResyncGen || 0) + 1
-    this.db.run('BEGIN')
-    try {
+    this._runTransaction(() => {
       if (connectionChanged) {
         this.db.run('DELETE FROM cloud_devices')
         this.db.run('DELETE FROM cloud_usage_hourly')
@@ -659,13 +871,7 @@ export class UsageDb {
           [nextEndpoint, nextApiKey, enabled ? 1 : 0, Number(syncMinutes) > 0 ? Number(syncMinutes) : 60]
         )
       }
-      this.db.run('COMMIT')
-    } catch (err) {
-      try {
-        this.db.run('ROLLBACK')
-      } catch {}
-      throw err
-    }
+    })
     this.persist()
     return this.getCloudSync()
   }
@@ -1141,8 +1347,8 @@ export class UsageDb {
       }
       this.db.run('COMMIT')
     } catch (err) {
-      this.db.run('ROLLBACK')
-      throw err
+      try { this.db.run('ROLLBACK') } catch {}
+      throw normalizeSqlError(err)
     }
     this.persist()
     return this.listSubscriptions()
@@ -1154,16 +1360,11 @@ export class UsageDb {
     const rows = this.listSubscriptions()
     const target = rows.find((s) => s.groupId === targetId)
     if (!target || [...ids].some((id) => !rows.some((s) => s.groupId === id))) throw new Error('Subscription no longer exists')
-    this.db.run('BEGIN')
-    try {
+    this._runTransaction(() => {
       for (const row of rows) if (ids.has(row.groupId)) {
         this.db.run('UPDATE subscriptions SET group_id=?, name=?, updated_at=? WHERE id=?', [targetId, target.name, Date.now(), row.id])
       }
-      this.db.run('COMMIT')
-    } catch (err) {
-      this.db.run('ROLLBACK')
-      throw err
-    }
+    })
     this.persist()
     return this.listSubscriptions()
   }
@@ -1185,30 +1386,32 @@ export class UsageDb {
     for (const s of accountSync.snapshots || []) {
       if (s && s.keyId) snapMap.set(s.keyId, s)
     }
-    this.db.run('BEGIN')
-    try {
+    this._runTransaction(() => {
       this.db.run('DELETE FROM cloud_devices')
       const devStmt = this.db.prepare(
         `INSERT INTO cloud_devices (id, name, tz, app_version, last_sync_at, revoked, is_current, status_json, updated_at)
          VALUES (?,?,?,?,?,?,?,?,?)`
       )
-      for (const d of accountSync.devices) {
-        if (!d || !d.id) continue
-        const snap = snapMap.get(d.id)
-        const isCur = d.isCurrent || (accountSync.currentKeyId && d.id === accountSync.currentKeyId) ? 1 : 0
-        devStmt.run([
-          d.id,
-          String(d.name || d.id),
-          d.tz || null,
-          d.appVersion || null,
-          d.lastSyncAt || null,
-          d.revoked ? 1 : 0,
-          isCur,
-          snap?.status ? JSON.stringify(snap.status) : null,
-          snap?.updatedAt || d.lastSyncAt || null,
-        ])
+      try {
+        for (const d of accountSync.devices) {
+          if (!d || !d.id) continue
+          const snap = snapMap.get(d.id)
+          const isCur = d.isCurrent || (accountSync.currentKeyId && d.id === accountSync.currentKeyId) ? 1 : 0
+          devStmt.run(sanitizeBindParams([
+            d.id,
+            String(d.name || d.id),
+            d.tz || null,
+            d.appVersion || null,
+            d.lastSyncAt || null,
+            d.revoked ? 1 : 0,
+            isCur,
+            snap?.status ? JSON.stringify(snap.status) : null,
+            snap?.updatedAt || d.lastSyncAt || null,
+          ]))
+        }
+      } finally {
+        try { devStmt.free() } catch {}
       }
-      devStmt.free()
 
       if (Array.isArray(accountSync.hours)) {
         this.db.run('DELETE FROM cloud_usage_hourly')
@@ -1221,24 +1424,27 @@ export class UsageDb {
              cache_create=excluded.cache_create, reasoning=excluded.reasoning,
              total=excluded.total, cost=excluded.cost, turns=excluded.turns`
         )
-        for (const h of accountSync.hours) {
-          if (!h || !h.keyId || !Number.isFinite(Number(h.hour)) || !h.cli || !h.model) continue
-          hStmt.run([
-            h.keyId,
-            Number(h.hour),
-            String(h.cli),
-            String(h.model),
-            Number(h.input) || 0,
-            Number(h.output) || 0,
-            Number(h.cacheRead) || 0,
-            Number(h.cacheCreate) || 0,
-            Number(h.reasoning) || 0,
-            Number(h.total) || 0,
-            Number(h.cost) || 0,
-            Number(h.turns) || 0,
-          ])
+        try {
+          for (const h of accountSync.hours) {
+            if (!h || !h.keyId || !Number.isFinite(Number(h.hour)) || !h.cli || !h.model) continue
+            hStmt.run(sanitizeBindParams([
+              h.keyId,
+              Number(h.hour),
+              String(h.cli),
+              String(h.model),
+              Number(h.input) || 0,
+              Number(h.output) || 0,
+              Number(h.cacheRead) || 0,
+              Number(h.cacheCreate) || 0,
+              Number(h.reasoning) || 0,
+              Number(h.total) || 0,
+              Number(h.cost) || 0,
+              Number(h.turns) || 0,
+            ]))
+          }
+        } finally {
+          try { hStmt.free() } catch {}
         }
-        hStmt.free()
 
         // If local usage was ingested, renamed, hidden, or deleted while
         // /api/sync was in flight, the returned accountSync snapshot still
@@ -1259,23 +1465,26 @@ export class UsageDb {
                  (key_id, hour, cli, model, input, output, cache_read, cache_create, reasoning, total, cost, turns)
                VALUES (?,?,?,?,?,?,?,?,?,?,?,?)`
             )
-            for (const r of localRows) {
-              lStmt.run([
-                curDev.id,
-                r.hour,
-                r.cli,
-                r.model,
-                r.input,
-                r.output,
-                r.cache_read,
-                r.cache_create,
-                r.reasoning,
-                r.total,
-                r.cost,
-                r.turns,
-              ])
+            try {
+              for (const r of localRows) {
+                lStmt.run(sanitizeBindParams([
+                  curDev.id,
+                  r.hour,
+                  r.cli,
+                  r.model,
+                  r.input,
+                  r.output,
+                  r.cache_read,
+                  r.cache_create,
+                  r.reasoning,
+                  r.total,
+                  r.cost,
+                  r.turns,
+                ]))
+              }
+            } finally {
+              try { lStmt.free() } catch {}
             }
-            lStmt.free()
           } else if (opts?.authoritativeLocal) {
             this.db.run('DELETE FROM cloud_usage_hourly WHERE key_id = ?', [curDev.id])
           } else {
@@ -1296,25 +1505,24 @@ export class UsageDb {
             const delStmt = this.db.prepare(
               'DELETE FROM cloud_usage_hourly WHERE key_id = ? AND hour = ? AND cli = ? AND model = ?'
             )
-            for (const er of existingCurRows) {
-              const fullKey = `${er.hour}|${er.cli}|${er.model}`
-              if (
-                this._locallyRemovedKeys?.has(fullKey) ||
-                this._deletedLitellmClis?.has(er.cli) ||
-                invalidLitellmModels.has(`${er.cli}|${er.model}`)
-              ) {
-                delStmt.run([curDev.id, er.hour, er.cli, er.model])
+            try {
+              for (const er of existingCurRows) {
+                const fullKey = `${er.hour}|${er.cli}|${er.model}`
+                if (
+                  this._locallyRemovedKeys?.has(fullKey) ||
+                  this._deletedLitellmClis?.has(er.cli) ||
+                  invalidLitellmModels.has(`${er.cli}|${er.model}`)
+                ) {
+                  delStmt.run(sanitizeBindParams([curDev.id, er.hour, er.cli, er.model]))
+                }
               }
+            } finally {
+              try { delStmt.free() } catch {}
             }
-            delStmt.free()
           }
         }
       }
-      this.db.run('COMMIT')
-    } catch (err) {
-      this.db.run('ROLLBACK')
-      throw err
-    }
+    })
     this.persist()
   }
 
@@ -2210,12 +2418,21 @@ export class UsageDb {
   // ---- queries for the report ---------------------------------------------
 
   rows(sql, params = []) {
-    const stmt = this.db.prepare(sql)
-    stmt.bind(params)
-    const out = []
-    while (stmt.step()) out.push(stmt.getAsObject())
-    stmt.free()
-    return out
+    this._ensureOpen()
+    let stmt = null
+    try {
+      stmt = this.db.prepare(sql)
+      if (params && params.length) stmt.bind(sanitizeBindParams(params))
+      const out = []
+      while (stmt.step()) out.push(stmt.getAsObject())
+      return out
+    } catch (err) {
+      throw normalizeSqlError(err)
+    } finally {
+      if (stmt) {
+        try { stmt.free() } catch {}
+      }
+    }
   }
 
   // Per-hour-per-model rows for one local day (dayStart = local midnight ms).

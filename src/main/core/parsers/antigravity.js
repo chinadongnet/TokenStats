@@ -22,16 +22,37 @@ const require = createRequire(import.meta.url)
 // file:// URI. Whole-file re-parse on change (SQLite pages get rewritten in
 // place, so there is no stable append offset to tail).
 
-// sql.js is initialized once and shared; loading the wasm by path keeps this
-// module pure-Node (testable via npm run test:parsers) and packager-safe.
+// sql.js is initialized lazily and recycled after large databases or errors so
+// WASM linear memory (which cannot shrink) and any orphaned MEMFS buffers are
+// periodically released back to the OS instead of staying pinned at peak.
+let wasmBinaryCache = null
 let sqlPromise = null
+let sqlUseCount = 0
+let activeDbs = 0
+const RECYCLE_AFTER_BYTES = 32 * 1024 * 1024
+const RECYCLE_AFTER_USES = 200
+
 function getSql() {
   if (!sqlPromise) {
     const initSqlJs = require('sql.js')
-    const wasmPath = path.join(path.dirname(require.resolve('sql.js')), 'sql-wasm.wasm')
-    sqlPromise = initSqlJs({ wasmBinary: fs.readFileSync(wasmPath) })
+    if (!wasmBinaryCache) {
+      const wasmPath = path.join(path.dirname(require.resolve('sql.js')), 'sql-wasm.wasm')
+      wasmBinaryCache = fs.readFileSync(wasmPath)
+    }
+    sqlUseCount = 0
+    sqlPromise = initSqlJs({ wasmBinary: wasmBinaryCache }).catch((err) => {
+      sqlPromise = null
+      throw err instanceof Error ? err : new Error(String(err))
+    })
   }
   return sqlPromise
+}
+
+function resetSqlInstance() {
+  if (activeDbs === 0) {
+    sqlPromise = null
+    sqlUseCount = 0
+  }
 }
 
 // Minimal protobuf wire-format walker: returns [field, wireType, value] tuples
@@ -101,13 +122,20 @@ function timestamp(msg) {
 }
 
 function modelStepTimes(db) {
+  let stmt = null
   try {
     // Join generation usage to step completion by response ID. Positional
     // fallback is only for old rows without IDs; retries can shift step order.
     const byResponse = new Map()
     const byIndex = []
-    for (const [type, blob] of db.exec('SELECT step_type, metadata FROM steps ORDER BY idx')[0]?.values || []) {
-      const meta = decodeProto(Buffer.from(blob))
+    stmt = db.prepare('SELECT step_type, metadata FROM steps ORDER BY idx')
+    while (stmt.step()) {
+      const [type, blob] = stmt.get()
+      if (!blob) {
+        if (type === 15) byIndex.push(null)
+        continue
+      }
+      const meta = decodeProto(Buffer.from(blob.buffer, blob.byteOffset, blob.byteLength))
       const ts = timestamp(sub(meta, 8)) || timestamp(sub(meta, 7)) || timestamp(sub(meta, 6)) || timestamp(sub(meta, 1))
       const responseId = first(sub(meta, 9), 11)
       if (Buffer.isBuffer(responseId) && ts) byResponse.set(responseId.toString('utf8'), ts)
@@ -116,19 +144,31 @@ function modelStepTimes(db) {
     return { byResponse, byIndex }
   } catch {
     return { byResponse: new Map(), byIndex: [] }
+  } finally {
+    if (stmt) {
+      try { stmt.free() } catch {}
+    }
   }
 }
 
 function workspaceOf(db) {
+  let stmt = null
   try {
-    const res = db.exec('SELECT data FROM trajectory_metadata_blob LIMIT 1')
-    const blob = res[0]?.values?.[0]?.[0]
+    stmt = db.prepare('SELECT data FROM trajectory_metadata_blob LIMIT 1')
+    if (!stmt.step()) return null
+    const [blob] = stmt.get()
     if (!blob) return null
-    const m = Buffer.from(blob).toString('utf8').match(/file:\/\/\/([A-Za-z0-9._~:/%@&+=,;!$'()*-]+)/)
+    const m = Buffer.from(blob.buffer, blob.byteOffset, blob.byteLength)
+      .toString('utf8')
+      .match(/file:\/\/\/([A-Za-z0-9._~:/%@&+=,;!$'()*-]+)/)
     if (!m) return null
     return path.basename(decodeURIComponent(m[1]))
   } catch {
     return null
+  } finally {
+    if (stmt) {
+      try { stmt.free() } catch {}
+    }
   }
 }
 
@@ -144,45 +184,76 @@ export const antigravity = {
     const buf = await readSqliteSnapshot(file)
     const fallbackTs = (await fs.promises.stat(file)).mtimeMs
     const SQL = await getSql()
-    let db
-    db = new SQL.Database(buf)
-    const sessionId = path.basename(file, '.db')
-    const records = []
+    const bufBytes = buf?.length || 0
+    let db = null
+    let shouldReset = bufBytes >= RECYCLE_AFTER_BYTES
+    activeDbs++
     try {
+      try {
+        db = new SQL.Database(buf)
+      } catch (err) {
+        // If Database() threw after creating /dbfile_<rand> in MEMFS, drop the
+        // WASM instance so the orphaned buffer cannot leak permanently.
+        shouldReset = true
+        throw err instanceof Error ? err : new Error(String(err))
+      }
+      sqlUseCount++
+      if (sqlUseCount >= RECYCLE_AFTER_USES) shouldReset = true
+      const sessionId = path.basename(file, '.db')
+      const records = []
       const project = workspaceOf(db) || 'antigravity'
       const stepTimes = modelStepTimes(db)
-      const res = db.exec('SELECT idx, data FROM gen_metadata ORDER BY idx')
-      for (const [idx, blob] of res[0]?.values || []) {
-        const top = decodeProto(Buffer.from(blob))
-        const gen = top && sub(top, 1)
-        const usage = gen && sub(gen, 4)
-        if (!usage) continue
-        const input = first(usage, 2) || 0
-        const output = first(usage, 3) || 0
-        const cacheRead = first(usage, 5) || 0
-        const reasoning = first(usage, 9) || 0
-        const responseId = first(usage, 11)?.toString('utf8')
-        const tsMsg = sub(sub(gen, 9) || [], 4)
-        const modelRaw = first(gen, 21) || first(gen, 19)
-        records.push({
-          cli: 'agy',
-          ts: timestamp(tsMsg) || stepTimes.byResponse.get(responseId) || (!responseId && stepTimes.byIndex[idx]) || fallbackTs,
-          model: modelRaw ? modelRaw.toString('utf8') : 'antigravity',
-          sessionId,
-          project,
-          input,
-          output,
-          cacheRead,
-          cacheCreate: 0,
-          reasoning,
-          reasoningIncludedInOutput: true,
-          total: input + output + cacheRead,
-          dedupKey: responseId ? `agy-response:${responseId}` : `agy:${sessionId}:${idx}`,
-        })
+      let stmt = null
+      try {
+        stmt = db.prepare('SELECT idx, data FROM gen_metadata ORDER BY idx')
+        while (stmt.step()) {
+          const [idx, blob] = stmt.get()
+          if (!blob) continue
+          const top = decodeProto(Buffer.from(blob.buffer, blob.byteOffset, blob.byteLength))
+          const gen = top && sub(top, 1)
+          const usage = gen && sub(gen, 4)
+          if (!usage) continue
+          const input = first(usage, 2) || 0
+          const output = first(usage, 3) || 0
+          const cacheRead = first(usage, 5) || 0
+          const reasoning = first(usage, 9) || 0
+          const responseId = first(usage, 11)?.toString('utf8')
+          const tsMsg = sub(sub(gen, 9) || [], 4)
+          const modelRaw = first(gen, 21) || first(gen, 19)
+          records.push({
+            cli: 'agy',
+            ts: timestamp(tsMsg) || stepTimes.byResponse.get(responseId) || (!responseId && stepTimes.byIndex[idx]) || fallbackTs,
+            model: modelRaw ? modelRaw.toString('utf8') : 'antigravity',
+            sessionId,
+            project,
+            input,
+            output,
+            cacheRead,
+            cacheCreate: 0,
+            reasoning,
+            reasoningIncludedInOutput: true,
+            total: input + output + cacheRead,
+            dedupKey: responseId ? `agy-response:${responseId}` : `agy:${sessionId}:${idx}`,
+          })
+        }
+      } catch (err) {
+        throw err instanceof Error ? err : new Error(String(err))
+      } finally {
+        if (stmt) {
+          try { stmt.free() } catch {}
+        }
       }
+      return records
     } finally {
-      db.close()
+      if (db) {
+        try {
+          db.close()
+        } catch {
+          shouldReset = true
+        }
+      }
+      activeDbs--
+      if (shouldReset) resetSqlInstance()
     }
-    return records
   },
 }
